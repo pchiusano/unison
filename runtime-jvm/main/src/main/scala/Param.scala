@@ -94,7 +94,7 @@ object Value {
 
     def underapply(builtins: compilation.Environment)(
                    argCount: Int, substs: Map[Name, Term]): Value.Lambda =
-      decompile match {
+      Term.selfToLetRec(decompile) match {
         case Term.Lam(names, body) =>
           compile(builtins)(
             Term.Lam(names drop argCount: _*)(ABT.substs(substs)(body)),
@@ -105,6 +105,14 @@ object Value {
             case c => sys.error(
               s"compiling a closed Term.Lambda failed to produce a Value.Lambda: $c")
           }
+        case Term.LetRec(List((name,Term.Lam(names,body))), v) =>
+          val c = compile(builtins)(
+            Term.LetRec(
+              name -> Term.Lam(names drop argCount: _*)(ABT.substs(substs)(body))
+            ) { v },
+            Vector.empty, CurrentRec.none, RecursiveVars.empty, IsNotTail
+          )
+          run(c).asInstanceOf[Value.Lambda]
       }
   }
   object Lambda {

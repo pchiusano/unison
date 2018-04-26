@@ -561,7 +561,7 @@ object CompilationTests {
         */
 
         val p = LetRec(
-          ('state, Term.curry { Lam('s0, 'x, 'y, 'action0) {
+          ('state, /*Term.curry*/locally { Lam('s0, 'x, 'y, 'action0) {
             Match('action0)(
               MatchCase(Pattern.EffectPure(Pattern.Wildcard), ABT.Abs('a, 'a)),
               MatchCase(State.Get.pattern(Pattern.Wildcard),
@@ -570,7 +570,7 @@ object CompilationTests {
                         ABT.AbsChain('s2, 'k)(Handle('state.v('s2,'x,'y))('k.v(BuiltinTypes.Unit.term))))
             )
           }}),
-          ('state2, Term.curry { Lam('s1, 'x, 'action1) {
+          ('state2, /*Term.curry*/ locally { Lam('s1, 'x, 'action1) {
             Match('action1)(
               // state s {a} = State.get * s
               MatchCase(Pattern.EffectPure(Pattern.Wildcard),

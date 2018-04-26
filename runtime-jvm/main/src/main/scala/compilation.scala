@@ -14,8 +14,8 @@ package object compilation {
 
   case class CurrentRec(get: Option[(Name, Arity)]) extends AnyVal {
     def isEmpty = get.isEmpty
-    def contains(name: Name): Boolean = false // get.exists(_._1 == name)
-    def contains(name: Name, arity: Arity): Boolean = false // get == Some((name, arity))
+    def contains(name: Name): Boolean = get.exists(_._1 == name)
+    def contains(name: Name, arity: Arity): Boolean = get == Some((name, arity))
 
     /*
      * Knock out the currentRec if appropriate; if it is shadowed,
@@ -691,7 +691,7 @@ package object compilation {
       @annotation.tailrec
       def invokeDynamic(fn: Lambda, args: Array[Computation]): U = {
         if (args.length == fn.arity) {
-          println("invokeDynamic.exact: " + fn.names)
+          // println("invokeDynamic.exact: " + fn.names)
           if (isTail) args.length match {
             case 1 => doTailCall(fn, args(0), r, rec, top,
                                  stackU, x1, x0, stackB, x1b, x0b)
@@ -704,12 +704,12 @@ package object compilation {
             fn, args, r, rec, top, stackU, x1, x0, stackB, x1b, x0b)
         }
         else if (args.length < fn.arity) {
-          println("invokeDynamic.underapply: " + fn.names)
+          // println("invokeDynamic.underapply: " + fn.names)
           val c = compileUnderappliedCall(builtins)(fn, args)
           c(r, rec, top, stackU, x1, x0, stackB, x1b, x0b)
         }
         else {
-          println("invokeDynamic.overapply: " + fn.names)
+          // println("invokeDynamic.overapply: " + fn.names)
           val lam = {
             doFullySaturatedCall(
               fn, args.take(fn.arity), r, rec, top,
