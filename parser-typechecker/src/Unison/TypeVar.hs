@@ -1,4 +1,4 @@
-{-# Language DeriveFunctor #-}
+{-# Language DeriveFunctor, OverloadedStrings #-}
 
 module Unison.TypeVar where
 
@@ -24,4 +24,6 @@ instance Var v => Var (TypeVar v) where
   qualifiedName v = Var.qualifiedName (underlying v)
   freshIn s v = Var.freshIn (Set.map underlying s) <$> v
   freshenId id v = Var.freshenId id <$> v
+  displayName (Existential v) = "'" `mappend` Var.displayName v
+  displayName (Universal v) = Var.displayName v
   clear v = Var.clear <$> v

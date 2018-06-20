@@ -30,6 +30,7 @@ class (Eq v, Ord v) => Var v where
   name :: v -> Text
   clear :: v -> v
   qualifiedName :: v -> Text
+  displayName :: v -> Text
   freshIn :: Set v -> v -> v
   freshenId :: Word -> v -> v
 

@@ -19,6 +19,7 @@ instance Var Symbol where
   name (Symbol _ n) = n
   named n = Symbol 0 n
   clear (Symbol id n) = Symbol id n
+  displayName = qualifiedName
   qualifiedName s =
     if freshId s /= 0 then name s `Text.append` "" `Text.append` (Text.pack (show (freshId s)))
     else name s
