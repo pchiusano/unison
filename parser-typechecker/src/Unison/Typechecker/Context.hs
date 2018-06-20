@@ -635,7 +635,7 @@ synthesize :: Var v => Term v -> M v (Type v)
 synthesize e = scope ("synth: " ++ show e) $ logContext "synthesize" >> go e where
   go :: Var v => Term v -> M v (Type v)
   go (Term.Var' v) = getContext >>= \ctx -> case lookupType ctx v of -- Var
-    Nothing -> fail $ "type not known for term var: " ++ Text.unpack (Var.name v)
+    Nothing -> fail $ "type not known for term var: " ++ show v
     Just t -> pure t
   go Term.Blank' = do
     v <- freshVar
@@ -645,7 +645,7 @@ synthesize e = scope ("synth: " ++ show e) $ logContext "synthesize" >> go e whe
       -- innermost Ref annotation assumed to be correctly provided by `synthesizeClosed`
       pure t
     s | otherwise ->
-      fail $ "type annotation contains free variables " ++ show (map Var.name (Set.toList s))
+      fail $ "type annotation contains free variables " ++ show (Set.toList s)
   go (Term.Ref' h) = fail $ "unannotated reference: " ++ show h
   go (Term.Constructor' r cid) = getConstructorType r cid
   go (Term.Ann' e' t) = t <$ check e' t
@@ -894,7 +894,7 @@ synthesizeClosed' abilities decls term | Set.null (ABT.freeVars term) =
     Left err -> M $ \_ -> Left err
     Right (t,env) -> pure $ generalizeExistentials (ctx env) t
 synthesizeClosed' _abilities _decls term =
-  fail $ "cannot synthesize term with free variables: " ++ show (map Var.name $ Set.toList (ABT.freeVars term))
+  fail $ "cannot synthesize term with free variables: " ++ show (Set.toList (ABT.freeVars term))
 
 synthesizeClosedAnnotated :: (Monad f, Var v)
                           => [Type v]
