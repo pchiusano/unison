@@ -19,9 +19,8 @@ instance Var Symbol where
   name (Symbol _ n) = n
   named n = Symbol 0 n
   clear (Symbol id n) = Symbol id n
-  displayName = qualifiedName
   qualifiedName s =
-    if freshId s /= 0 then name s `Text.append` "" `Text.append` (Text.pack (show (freshId s)))
+    if freshId s /= 0 then name s `Text.append` (Text.pack (show (freshId s)))
     else name s
   freshIn vs s | Set.null vs || Set.notMember s vs = s -- already fresh!
   freshIn vs s@(Symbol i n) = case Set.elemAt (Set.size vs - 1) vs of
@@ -33,8 +32,7 @@ instance Eq Symbol where
 instance Ord Symbol where
   Symbol id1 name1 `compare` Symbol id2 name2 = (id1,name1) `compare` (id2,name2)
 instance Show Symbol where
-  show (Symbol 0 n) = Text.unpack n
-  show (Symbol id n) = Text.unpack n ++ show id
+  show = Text.unpack . qualifiedName
 
 symbol :: Text -> Symbol
 symbol n = Symbol 0 n

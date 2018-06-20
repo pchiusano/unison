@@ -41,7 +41,11 @@ data ABT f v r
 -- a value of type `a`. Variables are of type `v`.
 data Term f v a = Term { freeVars :: Set v, annotation :: a, out :: ABT f v (Term f v a) }
 
-data V v = Free v | Bound v deriving (Eq,Ord,Show,Functor)
+data V v = Free v | Bound v deriving (Eq,Ord,Functor)
+
+instance Show v => Show (V v) where
+  show (Free v) = show v `mappend` "^"
+  show (Bound v) = show v
 
 unvar :: V v -> v
 unvar (Free v) = v
@@ -52,8 +56,6 @@ instance Var v => Var (V v) where
   named txt = Bound (Var.named txt)
   name v = Var.name (unvar v)
   qualifiedName v = Var.qualifiedName (unvar v)
-  displayName (Free v) = Var.displayName v `mappend` "^"
-  displayName (Bound v) = Var.displayName v
   freshIn s v = Var.freshIn (Set.map unvar s) <$> v
   freshenId id v = Var.freshenId id <$> v
   clear v = Var.clear <$> v
