@@ -192,11 +192,17 @@ withoutAbilityCheck m = M (\menv -> runM m $ menv { abilityChecks = False })
 
 abilityCheck' :: Var v => [Type v] -> [Type v] -> M v ()
 abilityCheck' ambient requested = do
-  success <- flip allM requested $ \req ->
-    flip anyM ambient $ \amb -> (True <$ subtype amb req) `orElse` pure False
-  when (not success) $
-    fail $ "Ability check failed. Requested abilities " <> show requested <>
-           " but ambient abilities only included " <> show ambient <> "."
+  let subtypeFail amb req = do
+        logContext $ "ability check subtype fail, ambient = " ++ show amb ++ ", requested = " ++ show req
+        pure False
+  success <-
+    (`allM` requested) $ \req ->
+    (`anyM` ambient)   $ \amb -> (True <$ subtype amb req) `orElse` subtypeFail amb req
+  when (not success) $ do
+    logContext $ "ability check failure, requested = " ++ show requested ++ ", ambient = " ++ show ambient
+    ctx <- getContext
+    fail $ "Ability check failed. Requested abilities " <> show (apply ctx <$> requested) <>
+           " but ambient abilities only included " <> show (apply ctx <$> ambient) <> "."
 
 abilityCheck :: Var v => [Type v] -> M v ()
 abilityCheck requested = do
@@ -474,8 +480,10 @@ subtype tx ty = scope (show tx++" <: "++show ty) $
 -- in the process.
 instantiateL :: Var v => v -> Type v -> M v ()
 instantiateL v t = getContext >>= \ctx -> case Type.monotype t >>= solve ctx v of
-  Just ctx -> setContext ctx -- InstLSolve
-  Nothing -> case t of
+  Just ctx -> do
+    setContext ctx -- InstLSolve
+    logContext ("instantiateL (solve " ++ show v ++ " = " ++ show t ++ " OK)")
+  Nothing -> logContext ("instantiateL (solve " ++ show v ++ " = " ++ show t ++ " failed)") >> case t of
     Type.Existential' v2 | ordered ctx v v2 -> -- InstLReach (both are existential, set v2 = v)
       maybe (fail "InstLReach failed") setContext $
         solve ctx v2 (Type.Monotype (Type.existential v))
@@ -493,6 +501,16 @@ instantiateL v t = getContext >>= \ctx -> case Type.monotype t >>= solve ctx v o
       ctx0 <- getContext
       ctx' <- instantiateL x' (apply ctx0 x) >> getContext
       instantiateL y' (apply ctx' y)
+    Type.Effect' es vt -> do
+      es' <- replicateM (length es) (freshNamed "effect")
+      vt' <- freshNamed "vt"
+      let s = Solved v (Type.Monotype (Type.effect (Type.existential <$> es') (Type.existential vt')))
+      modifyContext' $ replace (Existential v) (context $ (Existential <$> es') ++ [Existential vt', s])
+      Foldable.for_ (es' `zip` es) $ \(e',e) -> do
+        ctx <- getContext
+        instantiateL e' (apply ctx e)
+      ctx <- getContext
+      instantiateL vt' (apply ctx vt)
     Type.Forall' body -> do -- InstLIIL
       v <- extendUniversal =<< ABT.freshen body freshenTypeVar
       instantiateL v (ABT.bind body (Type.universal v))
@@ -588,7 +606,12 @@ check e t = getContext >>= \ctx -> scope ("check: " ++ show e ++ ":   " ++ show 
         [e, i] <- sequence [freshNamed "e", freshNamed "i"]
         appendContext $ context [Existential e, Existential i]
         check h $ Type.effectV (Type.existential e) (Type.existential i) `Type.arrow` t
-        withEffects [Type.existential e] $ check body (Type.effect [Type.existential e] t)
+        it <- apply <$> getContext <*> pure (Type.existential i)
+        et <- apply <$> getContext <*> pure (Type.existential e)
+        withEffects [Type.existential e] $ do
+          -- TODO: this is not quite right, just want to check body value type against
+          -- `it`
+          check body (Type.effect [et] it)
       go _ _ = do -- Sub
         a <- synthesize e; ctx <- getContext
         subtype (apply ctx a) (apply ctx t)
@@ -632,7 +655,7 @@ annotateLetRecBindings letrec = do
 -- | Synthesize the type of the given term, updating the context in the process.
 -- | Figure 11 from the paper
 synthesize :: Var v => Term v -> M v (Type v)
-synthesize e = scope ("synth: " ++ show e) $ logContext "synthesize" >> go e where
+synthesize e = scope ("synth: " ++ show e) $ go e where
   go :: Var v => Term v -> M v (Type v)
   go (Term.Var' v) = getContext >>= \ctx -> case lookupType ctx v of -- Var
     Nothing -> fail $ "type not known for term var: " ++ show v
@@ -827,7 +850,7 @@ patternToTerm pat = case pat of
 -- the process.
 -- e.g. in `(f:t) x` -- finds the type of (f x) given t and x.
 synthesizeApp :: Var v => Type v -> Term v -> M v (Type v)
-synthesizeApp ft arg = scope ("synthesizeApp: " ++ show ft ++ " " ++ show arg) $ go ft where
+synthesizeApp ft arg = scope ("synthesizeApp: " ++ show ft ++ ", " ++ show arg) $ go ft where
   go (Type.Forall' body) = do -- Forall1App
     v <- ABT.freshen body freshenTypeVar
     appendContext (context [Existential v])
