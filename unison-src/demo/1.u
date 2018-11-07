@@ -5,6 +5,6 @@ increment n = n + 1
 replicate : Nat -> a -> [a]
 replicate n a = Stream.toSequence (take n (constant a))
 
-> increment 1
+-- > increment 1
 
--- > replicate 20 "ARI"
+> x -> x

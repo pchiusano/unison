@@ -305,6 +305,7 @@ object Builtins {
   val Sequence_at =
     flp_p("Sequence.at", "n", "seq",
          (n, seq: Sequence[Value]) =>
+           // somehow an `Integer` is making it into the `Sequence`
            if (n >= 0 && n < seq.size) BuiltinTypes.Optional.Some.value(seq(n))
            else BuiltinTypes.Optional.None.value
          )

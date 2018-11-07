@@ -151,9 +151,10 @@ main dir currentBranchName initialFile startRuntime codebase = do
       writeIORef lastTypechecked (Nothing, UF.typecheckedUnisonFile0, mempty)
     -- print prompt and whatever input was on it / at it
     printPrompt :: Name -> IO ()
-    printPrompt branchName = do
+    printPrompt _branchName = do
       incompleteLine <- atomically . peekIncompleteLine $ lineQueue
-      putStr $ "\r" ++ unpack branchName ++ "> " ++ incompleteLine
+      putStr $ "\r> " ++ incompleteLine
+      -- putStr $ "\r" ++ unpack branchName ++ "> " ++ incompleteLine
 
     handleUnisonFile :: Runtime v -> Names v Ann -> FilePath -> Text -> IO ()
     handleUnisonFile runtime names filePath src = do
