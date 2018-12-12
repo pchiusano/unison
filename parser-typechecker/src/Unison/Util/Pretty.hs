@@ -11,22 +11,20 @@ module Unison.Util.Pretty (
    column2,
    commas,
    dashed,
-   flatMap,
    group,
    hang',
    hang,
    hangUngrouped',
    hangUngrouped,
    indent,
-   indentAfterNewline,
    indentN,
-   indentNAfterNewline,
    leftPad,
    lines,
    linesSpaced,
    lit,
    map,
    nest,
+   nestN,
    newline,
    numbered,
    orElse,
@@ -56,7 +54,8 @@ module Unison.Util.Pretty (
   ) where
 
 import           Data.Foldable                  ( toList )
-import           Data.List                      ( foldl' , foldr1, intersperse )
+import           Data.List                      ( foldl' , foldr1)
+import qualified Data.List as List
 import           Data.Sequence                  ( Seq )
 import           Data.String                    ( IsString , fromString )
 import           Data.Text                      ( Text )
@@ -72,11 +71,13 @@ type Width = Int
 data Pretty s = Pretty { delta :: Delta, out :: F s (Pretty s) }
 
 data F s r
-  = Empty | Group r | Lit s | Wrap (Seq r) | OrElse r r | Append (Seq r)
+  = Empty | Newline | Lit s | Group r | OrElse r r
+  | Wrap (Seq r) | Append (Seq r) | Nest r r
   deriving (Show, Foldable, Traversable, Functor)
 
-lit :: (IsString s, LL.ListLike s Char) => s -> Pretty s
-lit s = lit' (foldMap chDelta $ LL.toList s) s
+lit :: IsString s => String -> Pretty s
+lit s = intercalateMap newline go (List.lines s)
+  where go s = lit' (foldMap chDelta s) (fromString s)
 
 lit' :: Delta -> s -> Pretty s
 lit' d s = Pretty d (Lit s)
@@ -111,37 +112,44 @@ toPlain avail p = CT.toPlain (render avail p)
 renderUnbroken :: (Monoid s, IsString s) => Pretty s -> s
 renderUnbroken = render maxBound
 
-render :: (Monoid s, IsString s) => Width -> Pretty s -> s
-render availableWidth p = go mempty [Right p] where
-  go _   []       = mempty
-  go cur (p:rest) = case p of
-    Right p -> -- `p` might fit, let's try it!
-      if p `fits` cur then flow p <> go (cur <> delta p) rest
-      else go cur (Left p : rest) -- nope, switch to breaking mode
-    Left p -> case out p of -- `p` requires breaking
-      Append ps  -> go cur ((Left <$> toList ps) <> rest)
-      Empty      -> go cur rest
-      Group p    -> go cur (Right p : rest)
-      -- Note: literals can't be broken further so they're
-      -- added to output unconditionally
-      Lit l      -> l <> go (cur <> delta p) rest
-      OrElse _ p -> go cur (Right p : rest)
-      Wrap ps    -> go cur ((Right <$> toList ps) <> rest)
+data Mode a = Try a | Break a | PopNest
 
-  flow p = case out p of
-    Append ps -> foldMap flow ps
+render :: (Monoid s, IsString s) => Width -> Pretty s -> s
+render availableWidth p = go mempty mempty [Try p] where
+  go _   _      []       = mempty
+  go cur indent (p:rest) = case p of
+    Try p -> -- `p` might fit, let's try it!
+      if p `fits` cur then flow indent p <> go (cur <> delta p) indent rest
+      else go cur indent (Break p : rest) -- nope, switch to breaking mode
+    Break p -> case out p of -- `p` requires breaking
+      Append ps  -> go cur indent ((Break <$> toList ps) <> rest)
+      Empty      -> go cur indent rest
+      Group p    -> go cur indent (Try p : rest)
+      -- Note: literals can't be broken further; they're added to output unconditionally
+      Lit l      -> l <> go (cur <> delta p) indent rest
+      OrElse _ p -> go cur indent (Try p : rest)
+      Nest by p  -> go cur (by : indent) (Break p : PopNest : rest)
+      Wrap ps    -> go cur indent ((Try <$> toList ps) <> rest)
+      Newline    -> flow indent "\n" <> go (cur <> delta nl) indent rest where
+                    nl = ("\n" <> mconcat (reverse indent))
+    PopNest -> go cur (drop 1 indent) rest
+
+  flow indent p = case out p of
+    Nest by p -> flow (by : indent) p
+    Newline -> "\n" <> foldMap (flow mempty) (reverse indent)
+    Append ps -> foldMap (flow indent) ps
     Empty -> mempty
-    Group p -> flow p
+    Group p -> flow indent p
     Lit s -> s
-    OrElse p _ -> flow p
-    Wrap ps -> foldMap flow ps
+    OrElse p _ -> flow indent p
+    Wrap ps -> foldMap (flow indent) ps
 
   fits p cur =
     let cur' = cur { maxCol = col cur }
     in maxCol (cur' <> delta p) < availableWidth
 
 newline :: IsString s => Pretty s
-newline = lit' (chDelta '\n') (fromString "\n")
+newline = Pretty (chDelta '\n') Newline
 
 spaceIfBreak :: IsString s => Pretty s
 spaceIfBreak = "" `orElse` " "
@@ -188,13 +196,13 @@ lines :: (Foldable f, IsString s) => f (Pretty s) -> Pretty s
 lines = intercalateMap newline id
 
 linesSpaced :: (Foldable f, IsString s) => f (Pretty s) -> Pretty s
-linesSpaced ps = lines (intersperse "" $ toList ps)
+linesSpaced = intercalateMap (newline <> newline) id
 
 bulleted :: (Foldable f, LL.ListLike s Char, IsString s) => f (Pretty s) -> Pretty s
-bulleted = intercalateMap newline (\b -> "* " <> indentAfterNewline "  " b)
+bulleted = intercalateMap newline (\b -> "* " <> nest "  " b)
 
 dashed :: (Foldable f, LL.ListLike s Char, IsString s) => f (Pretty s) -> Pretty s
-dashed = intercalateMap newline (\b -> "- " <> indentAfterNewline "  " b)
+dashed = intercalateMap newline (\b -> "- " <> nest "  " b)
 
 numbered :: (Foldable f, LL.ListLike s Char, IsString s) => (Int -> Pretty s) -> f (Pretty s) -> Pretty s
 numbered num ps = column2 (fmap num [1..] `zip` toList ps)
@@ -212,53 +220,51 @@ rightPad n p =
 column2 :: (LL.ListLike s Char, IsString s) => [(Pretty s, Pretty s)] -> Pretty s
 column2 rows = lines (group <$> alignedRows) where
   maxWidth = foldl' max 0 (preferredWidth . fst <$> rows) + 1
-  alignedRows = [ rightPad maxWidth col0 <> indentNAfterNewline maxWidth col1
+  alignedRows = [ rightPad maxWidth col0 <> nestN maxWidth col1
                 | (col0, col1) <- rows ]
 
 text :: IsString s => Text -> Pretty s
 text t = fromString (Text.unpack t)
 
-hang' :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s -> Pretty s
+hang' :: IsString s => Pretty s -> Pretty s -> Pretty s -> Pretty s
 hang' from by p = group $
   if preferredHeight p > 0 then from <> "\n" <> group (indent by p)
   else (from <> " " <> group p) `orElse`
        (from <> "\n" <> group (indent by p))
 
-hangUngrouped' :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s -> Pretty s
+hangUngrouped' :: IsString s => Pretty s -> Pretty s -> Pretty s -> Pretty s
 hangUngrouped' from by p =
   if preferredHeight p > 0 then from <> "\n" <> indent by p
   else (from <> " " <> p) `orElse`
        (from <> "\n" <> indent by p)
 
-hangUngrouped :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s
+hangUngrouped :: IsString s => Pretty s -> Pretty s -> Pretty s
 hangUngrouped from p = hangUngrouped' from "  " p
 
-hang :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s
+hang :: IsString s => Pretty s -> Pretty s -> Pretty s
 hang from p = hang' from "  " p
 
-nest :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s
-nest by = hang' "" by
+indent :: IsString s => Pretty s -> Pretty s -> Pretty s
+indent by p = by <> nest by p
 
-indent :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s
-indent by p = by <> indentAfterNewline by p
-
-indentN :: (LL.ListLike s Char, IsString s) => Width -> Pretty s -> Pretty s
+indentN :: IsString s => Width -> Pretty s -> Pretty s
 indentN by = indent (fromString $ replicate by ' ')
 
-indentNAfterNewline :: (LL.ListLike s Char, IsString s) => Width -> Pretty s -> Pretty s
-indentNAfterNewline by = indentAfterNewline (fromString $ replicate by ' ')
+nestN :: IsString s => Width -> Pretty s -> Pretty s
+nestN by = nest (fromString $ replicate by ' ')
 
-indentAfterNewline :: (LL.ListLike s Char, IsString s) => Pretty s -> Pretty s -> Pretty s
-indentAfterNewline by p = flatMap f p where
-  f s0 = case LL.break (== '\n') s0 of
-    (hd, s) -> if LL.null s then lit s0
-               -- use `take` and `drop` to preserve annotations or
-               -- or other extra info attached to the original `s`
-               else lit (LL.take (LL.length hd) s0) <>
-                    "\n" <> by <> f (LL.drop 1 s)
+nest :: IsString s => Pretty s -> Pretty s -> Pretty s
+nest by p = Pretty d (Nest by p) where
+  dp = delta p
+  tweak n = n + maxCol dp
+  d = if line dp == 0 then dp
+      -- this is overly pessimistic, would need richer `Delta`
+      -- type to do this more accurately
+      else Delta (line dp) (tweak $ col dp) (tweak $ maxCol dp)
 
 instance IsString s => IsString (Pretty s) where
-  fromString s = lit' (foldMap chDelta s) (fromString s)
+  fromString s = intercalateMap newline go (List.lines s) where
+    go line = lit' (foldMap chDelta s) (fromString line)
 
 instance Semigroup (Pretty s) where (<>) = mappend
 instance Monoid (Pretty s) where
@@ -285,7 +291,7 @@ chDelta '\n' = Delta 1 0 0
 chDelta _ = Delta 0 1 1
 
 preferredWidth :: Pretty s -> Width
-preferredWidth p = col (delta p)
+preferredWidth p = maxCol (delta p)
 
 preferredHeight :: Pretty s -> Width
 preferredHeight p = line (delta p)
@@ -316,29 +322,25 @@ instance Show s => Show (Pretty s) where
 metaPretty :: Show s => Pretty s -> Pretty String
 metaPretty p = go (0::Int) p where
   go prec p = case out p of
+    Newline -> "Newline"
+    Nest by p -> parenthesizeIf (prec > 0) $
+      "Nest" `hang` spaced [go 1 by, go 1 p]
     Lit s -> parenthesizeIf (prec > 0) $ "Lit" `hang` lit (show s)
     Empty -> "Empty"
     Group g -> parenthesizeIf (prec > 0) $ "Group" `hang` go 1 g
     Wrap s -> parenthesizeIf (prec > 0) $ "Wrap" `hang`
-      surroundCommas "[" "]" (go 1 <$> s)
+      surroundCommas "[" "]" (go 0 <$> s)
     OrElse a b -> parenthesizeIf (prec > 0) $
       "OrElse" `hang` spaced [go 1 a, go 1 b]
-    Append s -> surroundCommas "[" "]" (go 1 <$> s)
+    Append s -> surroundCommas "[" "]" (go 0 <$> s)
 
 map :: LL.ListLike s2 Char => (s -> s2) -> Pretty s -> Pretty s2
 map f p = case out p of
+  Newline -> Pretty (delta p) Newline
+  Nest by p -> Pretty (delta p) (Nest (map f by) (map f p))
   Append ps -> foldMap (map f) ps
   Empty -> mempty
   Group p -> group (map f p)
   Lit s -> lit' (foldMap chDelta $ LL.toList s2) s2 where s2 = f s
   OrElse p1 p2 -> orElse (map f p1) (map f p2)
   Wrap p -> wrap_ (map f <$> p)
-
-flatMap :: (s -> Pretty s2) -> Pretty s -> Pretty s2
-flatMap f p = case out p of
-  Append ps -> foldMap (flatMap f) ps
-  Empty -> mempty
-  Group p -> group (flatMap f p)
-  Lit s -> f s
-  OrElse p1 p2 -> orElse (flatMap f p1) (flatMap f p2)
-  Wrap p -> wrap_ (flatMap f <$> p)
