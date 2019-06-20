@@ -80,24 +80,28 @@ newtype Branch m = Branch { _history :: Causal m Raw (Branch0 m) }
 
 type Hash = Causal.RawHash Raw
 type EditHash = Hash.Hash
+type Terms = Star3 NameSegment Referent Metadata.Type Metadata.Value
+type Types = Star3 NameSegment Reference Metadata.Type Metadata.Value
+type DeepTerms = Star3 Name Referent Metadata.Type Metadata.Value
+type DeepTypes = Star3 Name Reference Metadata.Type Metadata.Value
 
 data Branch0 m = Branch0
-  { _terms :: Star3 Referent NameSegment Metadata.Type Metadata.Value
-  , _types :: Star3 Reference NameSegment Metadata.Type Metadata.Value
+  { _terms :: Terms
+  , _types :: Types
   , _children:: Map NameSegment (Hash, Branch m) --todo: can we get rid of this hash
   , _edits :: Map NameSegment (EditHash, m Patch)
   , toNamesSeg :: Names.NamesSeg
   , toNames0 :: Names.Names0
   , deepReferents :: Set Referent
   , deepTypeReferences :: Set Reference
-  , deepTerms :: Star3 Referent Name Metadata.Type Metadata.Value
-  , deepTypes :: Star3 Reference Name Metadata.Type Metadata.Value
+  , deepTerms :: DeepTerms
+  , deepTypes :: DeepTypes
   }
 
 -- The raw Branch
 data Raw = Raw
-  { _termsR :: Star3 Referent NameSegment Metadata.Type Metadata.Value
-  , _typesR :: Star3 Reference NameSegment Metadata.Type Metadata.Value
+  { _termsR :: Terms
+  , _typesR :: Types
   , _childrenR :: Map NameSegment Hash
   , _editsR :: Map NameSegment EditHash
   }
@@ -106,16 +110,16 @@ makeLenses ''Branch
 makeLensesFor [("_edits", "edits")] ''Branch0
 makeLenses ''Raw
 
-terms :: Lens' (Branch0 m) (Star3 Referent NameSegment Metadata.Type Metadata.Value)
+terms :: Lens' (Branch0 m) Terms
 terms = lens _terms (\Branch0{..} x -> branch0 x _types _children _edits)
-types :: Lens' (Branch0 m) (Star3 Reference NameSegment Metadata.Type Metadata.Value)
+types :: Lens' (Branch0 m) Types
 types = lens _types (\Branch0{..} x -> branch0 _terms x _children _edits)
 children :: Lens' (Branch0 m) (Map NameSegment (Hash, Branch m))
 children = lens _children (\Branch0{..} x -> branch0 _terms _types x _edits)
 
 -- creates a Branch0 from the primary fields and derives the others.
-branch0 :: Star3 Referent NameSegment Metadata.Type Metadata.Value
-        -> Star3 Reference NameSegment Metadata.Type Metadata.Value
+branch0 :: Terms
+        -> Types
         -> Map NameSegment (Hash, Branch m)
         -> Map NameSegment (EditHash, m Patch)
         -> Branch0 m
@@ -123,15 +127,15 @@ branch0 terms types children edits =
   Branch0 terms types children edits namesSeg names0 deepRefts deepTypeRefs deepTerms' deepTypes'
   where
   deepTerms' =
-    Star3.mapD1 nameSegToName terms <> foldMap go (Map.toList (snd <$> children))
+    Star3.mapFact nameSegToName terms <> foldMap go (Map.toList (snd <$> children))
     where
-    go (nameSegToName -> n, b) = Star3.mapD1 (Name.joinDot n) (deepTerms $ head b)
+    go (nameSegToName -> n, b) = Star3.mapFact (Name.joinDot n) (deepTerms $ head b)
   deepTypes' =
-    Star3.mapD1 nameSegToName types <> foldMap go (Map.toList (snd <$> children))
+    Star3.mapFact nameSegToName types <> foldMap go (Map.toList (snd <$> children))
     where
-    go (nameSegToName -> n, b) = Star3.mapD1 (Name.joinDot n) (deepTypes $ head b)
-  termsr = R.swap $ Star3.d1 terms
-  typesr = R.swap $ Star3.d1 types
+    go (nameSegToName -> n, b) = Star3.mapFact (Name.joinDot n) (deepTypes $ head b)
+  termsr = Star3.d1 terms
+  typesr = Star3.d1 types
   namesSeg = toNamesSegImpl termsr typesr
   names0 = foldMap toNames0Impl (Map.toList (fmap snd children))
             <> Names (R.mapDom nameSegToName termsr)
@@ -546,23 +550,23 @@ instance Hashable (Branch0 m) where
 -- todo: consider inlining these into Actions2
 addTermName :: Referent -> NameSegment -> Metadata.Metadata -> Branch0 m -> Branch0 m
 addTermName r new md =
-  over terms (Metadata.insertWithMetadata (r,md) . Star3.insertD1 (r,new))
+  over terms (Metadata.insertWithMetadata (new,md) . Star3.insertD1 (new,r))
 
 addTypeName :: Reference -> NameSegment -> Metadata.Metadata -> Branch0 m -> Branch0 m
 addTypeName r new md =
-  over types (Metadata.insertWithMetadata (r,md) . Star3.insertD1 (r,new))
+  over types (Metadata.insertWithMetadata (new,md) . Star3.insertD1 (new,r))
 
 -- addTermNameAt :: Path.Split -> Referent -> Branch0 m -> Branch0 m
 -- addTypeNameAt :: Path.Split -> Reference -> Branch0 m -> Branch0 m
 
 deleteTermName :: Referent -> NameSegment -> Branch0 m -> Branch0 m
-deleteTermName r n b | Star3.memberD1 (r,n) (view terms b)
-                     = over terms (Star3.deletePrimaryD1 (r,n)) $ b
+deleteTermName r n b | Star3.memberD1 (n,r) (view terms b)
+                     = over terms (Star3.delete1Fact n) $ b
 deleteTermName _ _ b = b
 
 deleteTypeName :: Reference -> NameSegment -> Branch0 m -> Branch0 m
-deleteTypeName r n b | Star3.memberD1 (r,n) (view types b)
-                     = over types (Star3.deletePrimaryD1 (r,n)) $ b
+deleteTypeName r n b | Star3.memberD1 (n,r) (view types b)
+                     = over types (Star3.delete1Fact n) $ b
 deleteTypeName _ _ b = b
 
 data RefCollisions =

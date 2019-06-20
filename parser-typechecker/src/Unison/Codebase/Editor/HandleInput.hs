@@ -379,9 +379,9 @@ loop = do
             srclt = toList (getHQ'Types src)
             p@(parent, last) = resolvePath' src
             mdTerms = foldl' Metadata.merge mempty [
-              BranchUtil.getTermMetadataUnder p r root0 | r <- srcle ]
+              BranchUtil.getTermMetadataAt p r root0 | r <- srcle ]
             mdTypes = foldl' Metadata.merge mempty [
-              BranchUtil.getTypeMetadataUnder p r root0 | r <- srclt ]
+              BranchUtil.getTypeMetadataAt p r root0 | r <- srclt ]
             allMd = Metadata.merge mdTerms mdTypes
             allowed = maybe (Map.keysSet allMd) getHQTerms key
         let allMd' = Map.restrictKeys allMd allowed

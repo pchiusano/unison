@@ -20,10 +20,10 @@ inserts :: (Ord a, Ord n) => [(a, Type, Value)] -> Star3 a n Type Value -> Star3
 inserts tups s = foldl' (flip insert) s tups
 
 insertWithMetadata
-  :: (Ord a, Ord n)
+  :: (Ord a, Ord b)
   => (a, Metadata)
-  -> Star3 a n Type Value
-  -> Star3 a n Type Value
+  -> Star3 a b Type Value
+  -> Star3 a b Type Value
 insertWithMetadata (a, md) =
   inserts [ (a, ty, v) | (ty, vs) <- Map.toList md, v <- toList vs ]
 

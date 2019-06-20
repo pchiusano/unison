@@ -15,7 +15,7 @@ module Unison.Codebase.Path
 where
 
 --import Debug.Trace
-import Control.Lens hiding (unsnoc, cons)
+import Control.Lens hiding (unsnoc, cons, snoc)
 import qualified Control.Lens as Lens
 import Data.Either.Combinators (maybeToRight)
 import qualified Data.Foldable as Foldable
@@ -255,6 +255,9 @@ fromName = fromList . fmap NameSegment . Text.splitOn "." . Name.toText
 
 toName :: Path -> Name
 toName = Name.unsafeFromText . toText
+
+splitToName :: Split -> Name
+splitToName (p,seg) = toName (snoc p seg)
 
 -- Returns the nearest common ancestor, along with the
 -- two inputs relativized to that ancestor.

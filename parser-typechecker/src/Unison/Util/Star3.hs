@@ -23,6 +23,15 @@ toList s = [ (f, x, y, z) | f <- Set.toList (fact s)
                           , y <- Set.toList (R.lookupDom f (d2 s))
                           , z <- Set.toList (R.lookupDom f (d3 s)) ]
 
+d1s :: (Ord fact, Ord d1) => Star3 fact d1 d2 d3 -> [d1]
+d1s s = Set.toList $ R.ran (d1 s)
+
+d2s :: (Ord fact, Ord d2) => Star3 fact d1 d2 d3 -> [d2]
+d2s s = Set.toList $ R.ran (d2 s)
+
+d3s :: (Ord fact, Ord d3) => Star3 fact d1 d2 d3 -> [d3]
+d3s s = Set.toList $ R.ran (d3 s)
+
 d23s :: (Ord fact, Ord d2, Ord d3)
      => Star3 fact d1 d2 d3
      -> [(fact, d2, d3)]
@@ -51,6 +60,16 @@ d13s s = [ (f, x, y) | f <- Set.toList (fact s)
                      , x <- Set.toList (R.lookupDom f (d1 s))
                      , y <- Set.toList (R.lookupDom f (d3 s)) ]
 
+mapFact
+  :: (Ord fact, Ord fact2, Ord d1, Ord d2, Ord d3)
+  => (fact -> fact2)
+  -> Star3 fact d1 d2 d3
+  -> Star3 fact2 d1 d2 d3
+mapFact f s = Star3 (Set.map f (fact s))
+                    (R.mapDom f (d1 s))
+                    (R.mapDom f (d2 s))
+                    (R.mapDom f (d3 s))
+
 mapD1 :: (Ord fact, Ord d1, Ord d1a) => (d1 -> d1a) -> Star3 fact d1 d2 d3 -> Star3 fact d1a d2 d3
 mapD1 f s = s { d1 = R.mapRan f (d1 s) }
 
@@ -75,6 +94,27 @@ selectFact fs s = Star3 fact' d1' d2' d3' where
   d2'   = fs R.<| d2 s
   d3'   = fs R.<| d3 s
 
+selectD1
+  :: (Ord fact, Ord d1, Ord d2, Ord d3)
+  => Set d1
+  -> Star3 fact d1 d2 d3
+  -> Star3 fact d1 d2 d3
+selectD1 d1s s = Star3 fact' d1' d2' d3' where
+  d1'   = d1 s R.|> d1s
+  fact' = Set.intersection (fact s) (R.dom d1')
+  d2'   = fact' R.<| d2 s
+  d3'   = fact' R.<| d3 s
+
+delete1Fact
+  :: (Ord fact, Ord d1, Ord d2, Ord d3)
+  => fact
+  -> Star3 fact d1 d2 d3
+  -> Star3 fact d1 d2 d3
+delete1Fact f s = Star3 fact' d1' d2' d3' where
+  fact' = Set.delete f (fact s)
+  d1'   = R.deleteDom f (d1 s)
+  d2'   = R.deleteDom f (d2 s)
+  d3'   = R.deleteDom f (d3 s)
 
 -- Deletes tuples of the form (fact, d1, _, _).
 -- If no other (fact, dk, _, _) tuples exist for any other dk, then
@@ -91,6 +131,16 @@ deletePrimaryD1 (f, x) s = let
 
 lookupD1 :: (Ord fact, Ord d1) => d1 -> Star3 fact d1 d2 d3 -> Set fact
 lookupD1 x s = R.lookupRan x (d1 s)
+
+filterD1
+  :: (Ord fact, Ord d1)
+  => (d1 -> Bool)
+  -> Star3 fact d1 d2 d3
+  -> Star3 fact d1 d2 d3
+filterD1 f s = s { d1 = R.filterRan f (d1 s) }
+
+lookupD1f :: (Ord fact, Ord d1) => fact -> Star3 fact d1 d2 d3 -> Set d1
+lookupD1f x s = R.lookupDom x (d1 s)
 
 insertD1
   :: (Ord fact, Ord d1)

@@ -5,6 +5,7 @@ import qualified Data.Map as Map
 import Unison.Codebase.Path (Path)
 import qualified Unison.Codebase.Path as Path
 import qualified Unison.Codebase.Branch2 as Branch
+import qualified Unison.Codebase.NameSegment as NameSegment
 import Unison.Codebase.Branch2 (Branch, Branch0)
 import qualified Unison.Names2 as Names
 import Unison.Names2 (Names0)
@@ -53,52 +54,44 @@ addFromNames0 names0 = Branch.stepManyAt0 (typeActions <> termActions)
 --   types = Branch._types (Branch.getAt0 p b)
 
 getTerm :: Path.HQSplit -> Branch0 m -> Set Referent
-getTerm (p, hq) b = case hq of
-    NameOnly n -> Star3.lookupD1 n terms
-    HashOnly sh -> filter sh $ Branch.deepReferents b
-    HashQualified n sh -> filter sh $ Star3.lookupD1 n terms
-  where
-  filter sh = Set.filter (\r -> sh `SH.isPrefixOf` Referent.toShortHash r)
-  terms = Branch._terms (Branch.getAt0 p b)
-
--- Only returns metadata for the term at the exact level given
-getTermMetadataAt :: (Path.Path, a) -> Referent -> Branch0 m -> Metadata
-getTermMetadataAt (path,_) r b = Set.fromList <$> List.multimap mdList
-  where
-  mdList :: [(Metadata.Type, Metadata.Value)]
-  mdList = Star3.d23s' . Star3.selectFact (Set.singleton r) $ terms
-  terms = Branch._terms $ Branch.getAt0 path b
-
--- Returns metadata at or below the exact level given
-getTermMetadataUnder :: (Path.Path, a) -> Referent -> Branch0 m -> Metadata
-getTermMetadataUnder (path,_) r b = Set.fromList <$> List.multimap mdList
-  where
-  mdList :: [(Metadata.Type, Metadata.Value)]
-  mdList = Star3.d23s' . Star3.selectFact (Set.singleton r) $ terms
-  terms = Branch.deepTerms $ Branch.getAt0 path b
+getTerm (p, hq) =
+  Set.fromList . Star3.d1s . selectTermHQSplit hq . Branch.deepTerms . Branch.getAt0 p
 
 getType :: Path.HQSplit -> Branch0 m -> Set Reference
-getType (p, hq) b = case hq of
-    NameOnly n -> Star3.lookupD1 n types
-    HashOnly sh -> filter sh $ Branch.deepTypeReferences b
-    HashQualified n sh -> filter sh $ Star3.lookupD1 n types
-  where
-  filter sh = Set.filter (\r -> sh `SH.isPrefixOf` Reference.toShortHash r)
-  types = Branch._types (Branch.getAt0 p b)
+getType (p, hq) =
+  Set.fromList . Star3.d1s . selectTypeHQSplit hq . Branch.deepTypes . Branch.getAt0 p
 
-getTypeMetadataAt :: (Path.Path, a) -> Reference -> Branch0 m -> Metadata
-getTypeMetadataAt (path,_) r b = Set.fromList <$> List.multimap mdList
+getTypeMetadataAt :: Path.HQSplit -> Reference -> Branch0 m -> Metadata
+getTypeMetadataAt (path,hq) r b = Set.fromList <$> List.multimap mdList
   where
   mdList :: [(Metadata.Type, Metadata.Value)]
-  mdList = Star3.d23s' . Star3.selectFact (Set.singleton r) $ types
-  types = Branch._types $ Branch.getAt0 path b
+  mdList = Star3.d23s' . selectTypeHQSplit hq . Star3.selectD1 (Set.singleton r)
+         . Branch.deepTypes $ Branch.getAt0 path b
 
-getTypeMetadataUnder :: (Path.Path, a) -> Reference -> Branch0 m -> Metadata
-getTypeMetadataUnder (path,_) r b = Set.fromList <$> List.multimap mdList
+getTermMetadataAt :: Path.HQSplit -> Referent -> Branch0 m -> Metadata
+getTermMetadataAt (path,hq) r b = Set.fromList <$> List.multimap mdList
   where
   mdList :: [(Metadata.Type, Metadata.Value)]
-  mdList = Star3.d23s' . Star3.selectFact (Set.singleton r) $ types
-  types = Branch.deepTypes $ Branch.getAt0 path b
+  mdList = Star3.d23s' . selectTermHQSplit hq . Star3.selectD1 (Set.singleton r)
+         . Branch.deepTerms $ Branch.getAt0 path b
+
+selectTermHQSplit :: NameSegment.HQSegment -> Branch.DeepTerms -> Branch.DeepTerms
+selectTermHQSplit hq terms = case hq of
+  NameOnly n -> Star3.selectFact (Set.singleton $ NameSegment.toName n) terms
+  HashOnly sh -> filter sh terms
+  HashQualified n sh ->
+    filter sh $ Star3.selectFact (Set.singleton $ NameSegment.toName n) terms
+  where
+    filter sh = Star3.filterD1 (\r -> sh `SH.isPrefixOf` Referent.toShortHash r)
+
+selectTypeHQSplit :: NameSegment.HQSegment -> Branch.DeepTypes -> Branch.DeepTypes
+selectTypeHQSplit hq types = case hq of
+  NameOnly n -> Star3.selectFact (Set.singleton $ NameSegment.toName n) types
+  HashOnly sh -> filter sh types
+  HashQualified n sh ->
+    filter sh $ Star3.selectFact (Set.singleton $ NameSegment.toName n) types
+  where
+    filter sh = Star3.filterD1 (\r -> sh `SH.isPrefixOf` Reference.toShortHash r)
 
 getBranch :: Path.Split -> Branch0 m -> Maybe (Branch m)
 getBranch (p, seg) b = case Path.toList p of

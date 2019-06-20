@@ -609,8 +609,8 @@ getStar3 getF getD1 getD2 getD3 =
 
 putBranch0 :: MonadPut m => Branch0 n -> m ()
 putBranch0 b = do
-  putStar3 putReferent putNameSegment putMetadataType putMetadataValue (Branch._terms b)
-  putStar3 putReference putNameSegment putMetadataType putMetadataValue (Branch._types b)
+  putBranchTerms (Branch._terms b)
+  putBranchTypes (Branch._types b)
   putFoldable (putPair putNameSegment (putHash . unRawHash . fst))
               (Map.toList (Branch._children b))
 
@@ -634,13 +634,6 @@ putNameSegment = putText . NameSegment.toText
 getNameSegment :: MonadGet m => m NameSegment
 getNameSegment = NameSegment <$> getText
 
-putRawBranch :: MonadPut m => Branch.Raw -> m ()
-putRawBranch (Branch.Raw terms types children edits) = do
-  putStar3 putReferent putNameSegment putMetadataType putMetadataValue terms
-  putStar3 putReference putNameSegment putMetadataType putMetadataValue types
-  putMap putNameSegment (putHash . unRawHash) children
-  putMap putNameSegment putHash edits
-
 getMetadataType :: MonadGet m => m Metadata.Type
 getMetadataType = getReferent
 
@@ -653,13 +646,37 @@ getMetadataValue = getReference
 putMetadataValue :: MonadPut m => Metadata.Value -> m ()
 putMetadataValue = putReference
 
+getBranchTerms :: MonadGet m => m Branch.Terms
+getBranchTerms =
+  getStar3 getNameSegment getReferent getMetadataType getMetadataValue
+
+putBranchTerms :: MonadPut m => Branch.Terms -> m ()
+putBranchTerms =
+  putStar3 putNameSegment putReferent putMetadataType putMetadataValue
+
+getBranchTypes :: MonadGet m => m Branch.Types
+getBranchTypes =
+  getStar3 getNameSegment getReference getMetadataType getMetadataValue
+
+putBranchTypes :: MonadPut m => Branch.Types -> m ()
+putBranchTypes =
+  putStar3 putNameSegment putReference putMetadataType putMetadataValue
+
 getRawBranch :: MonadGet m => m Branch.Raw
 getRawBranch =
   Branch.Raw
-    <$> getStar3 getReferent getNameSegment getMetadataType getMetadataValue
-    <*> getStar3 getReference getNameSegment getMetadataType getMetadataValue
+    <$> getBranchTerms
+    <*> getBranchTypes
     <*> getMap getNameSegment (RawHash <$> getHash)
     <*> getMap getNameSegment getHash
+
+putRawBranch :: MonadPut m => Branch.Raw -> m ()
+putRawBranch (Branch.Raw terms types children edits) = do
+  putBranchTerms terms
+  putBranchTypes types
+  putMap putNameSegment (putHash . unRawHash) children
+  putMap putNameSegment putHash edits
+
 
 putDataDeclaration :: (MonadPut m, Ord v)
                    => (v -> m ()) -> (a -> m ())

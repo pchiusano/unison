@@ -303,7 +303,7 @@ writeAllTermsAndTypes putV putA codebase localPath branch = do
       <> " from the codebase while I wasn't looking."
   writeBranch :: Branch.Raw -> m ()
   writeBranch (Branch.Raw terms types _ _) = do
-    for_ (toList $ Star3.fact types) $ \case
+    for_ (Star3.d1s types) $ \case
       Reference.DerivedId i -> do
         alreadyExists <- liftIO . doesPathExist $ termPath localPath i
         unless alreadyExists $ do
@@ -311,7 +311,7 @@ writeAllTermsAndTypes putV putA codebase localPath branch = do
           maybe (calamity i) (putDecl putV putA localPath i) mayDecl
       _ -> pure ()
     -- Write all terms
-    for_ (toList $ Star3.fact terms) $ \case
+    for_ (Star3.d1s terms) $ \case
       Ref r@(Reference.DerivedId i) -> do
         alreadyExists <- liftIO . doesPathExist $ termPath localPath i
         unless alreadyExists $ do
