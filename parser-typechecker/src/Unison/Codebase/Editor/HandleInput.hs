@@ -31,6 +31,7 @@ import qualified Unison.Codebase.Editor.SlurpResult as Slurp
 import Unison.Codebase.Editor.SlurpComponent (SlurpComponent(..))
 import qualified Unison.Codebase.Editor.SlurpComponent as SC
 import Unison.Codebase.Editor.RemoteRepo
+import qualified Unison.Codebase.Editor.RemoteRepo as RemoteRepo
 
 import           Control.Applicative
 import           Control.Lens
@@ -999,6 +1000,9 @@ loop = do
           makePrintNamesFromLabeled' (Patch.labeledDependencies patch)
         respond $ ListEdits patch ppe
 
+      InstallI repo path -> 
+        installRemoteBranchAt input repo path
+
       PullRemoteBranchI mayRepo path -> do
         let p = Path.toAbsolutePath currentPath' path
         case mayRepo of
@@ -1269,6 +1273,34 @@ searchBranchExact len names queries = let
 
 respond :: Output v -> Action m i v ()
 respond output = eval $ Notify output
+
+installRemoteBranchAt
+  :: Monad m => Input -> RemoteRepo -> Path -> Action m i v ()
+installRemoteBranchAt input repo subpath = do
+  cur <- use currentPath
+  before <- getAt cur
+  b <- eval (LoadRemoteRootBranch repo)
+  tempPath <- pure . Path.toAbsolutePath cur 
+                   . Path.fromName 
+                   . Name.unsafeFromText 
+                   $ RemoteRepo.installNamespace repo
+  temp <- getAt tempPath 
+  let destPath = Path.toAbsolutePath cur subpath
+  dest <- getAt installPath
+  case b of
+    Left  e -> eval . Notify $ GitError input e
+    Right remote -> do 
+      if Branch.isEmpty temp then do
+        if Branch.isEmpty dest then do 
+          updateAtM temp (const $ pure remote)
+          subBranch <- pure $ Branch.getAt' subpath remote
+          updateAtM destPath (const $ pure subBranch) 
+          updateAtM temp (const $ pure Branch.empty)
+          after <- getAt cur
+          respond $ ShowDiff input (Branch.namesDiff before after)  
+        else respond $ BadDestinationBranch input destPath 
+      else
+        respond $ BadDestinationBranch input temp
 
 loadRemoteBranchAt
   :: Monad m => Input -> RemoteRepo -> Path.Absolute -> Action m i v ()

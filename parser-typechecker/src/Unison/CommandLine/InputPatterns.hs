@@ -369,6 +369,30 @@ forkLocal = InputPattern "fork" ["copy.namespace"] [(Required, pathArg)
       _ -> Left (I.help forkLocal)
     )
 
+install :: InputPattern
+install = InputPattern
+  "install"
+  []
+  [(Required, gitUrlArg), (Required, pathArg), (Optional, noCompletions)]
+  (P.wrapColumn2
+    [ ("`install url namespace`", 
+       "Adds the given remote namespace locally."),
+      ("`install url namespace commit`", 
+       "Adds the given remote namespace as of the given commit locally.") ]
+  )
+  (\case
+    [url, path] -> do
+      p <- first fromString $ Path.parsePath' path
+      pure $ Input.InstallI (GitRepo (Text.pack url) "master") p
+    [url, path, treeish] -> do
+      p <- first fromString $ Path.parsePath' path
+      pure $ Input.InstallI
+        (GitRepo (Text.pack url) $ Text.pack treeish)
+        p
+    _ -> Left (I.help install)
+  )
+ 
+
 pull :: InputPattern
 pull = InputPattern
   "pull"
@@ -676,6 +700,7 @@ validInputs =
   , names
   , push
   , pull
+  , install
   , cd
   , deleteBranch
   , renameBranch
