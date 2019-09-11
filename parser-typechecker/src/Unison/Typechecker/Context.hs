@@ -866,20 +866,26 @@ synthesize e = scope (InSynthesize e) $
       _ -> failWith $ HandlerOfUnexpectedType (loc h) ht 
   go _e = compilerCrash PatternMatchFailure
 
+-- foo blah = case blah of
+--   [] -> ..
+--   h +: tl -> ...
+--
 checkCase :: forall v loc . (Var v, Ord loc)
           => Type v loc
           -> Type v loc
           -> Term.MatchCase loc (Term v loc)
           -> M v loc ()
 checkCase scrutineeType outputType (Term.MatchCase pat guard rhs) = do
-  scrutineeType <- applyM scrutineeType
-  outputType <- applyM outputType
+  scrutineeType <- applyM scrutineeType -- Request X b
+  outputType <- applyM outputType       -- Optional b
   markThenRetract0 Var.inferOther $ do
     let peel t = case t of
                   ABT.AbsN' vars bod -> (vars, bod)
                   _ -> ([], t)
         (rhsvs, rhsbod) = peel rhs
         mayGuard = snd . peel <$> guard
+    -- first check the pattern against the scrutinee type, 
+    -- this returns some term substitutions
     (substs, remains) <- runStateT (checkPattern scrutineeType pat) rhsvs
     unless (null remains) $ compilerCrash (MalformedPattern pat)
     let subst = ABT.substsInheritAnnotation (second (Term.var ()) <$> substs)
@@ -1008,7 +1014,9 @@ checkPattern scrutineeType0 p =
                                  (loc, Type.existentialp loc v)
       lift $ subtype evt scrutineeType
       ect  <- lift $ getEffectConstructorType ref cid
-      uect <- lift $ ungeneralize ect
+      --- X : forall a . a ->{X} a
+      --  X : a^ ->{X} a^
+      uect <- lift $ wrangle ect
       unless (Type.arity uect == length args)
         . lift
         . failWith
@@ -1166,6 +1174,17 @@ existentializeArrows :: Var v => Type v loc -> M v loc (Type v loc)
 existentializeArrows t = do
   t <- Type.existentializeArrows (extendExistentialTV Var.inferAbility) t
   pure t
+
+wrangle :: (Var v, Ord loc) => Type v loc -> M v loc (Type v loc)
+wrangle t = snd <$> wrangle' t
+
+wrangle' :: (Var v, Ord loc) => Type v loc -> M v loc ([v], Type v loc)
+wrangle' (Type.Forall' t) = do
+  v <- ABT.freshen t freshenTypeVar
+  appendContext $ context [Universal v]
+  t <- pure $ ABT.bindInheritAnnotation t (Type.universal v)
+  first (v:) <$> wrangle' t
+wrangle' t = pure ([], t)
 
 ungeneralize :: (Var v, Ord loc) => Type v loc -> M v loc (Type v loc)
 ungeneralize t = snd <$> ungeneralize' t
