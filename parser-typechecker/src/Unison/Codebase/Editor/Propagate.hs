@@ -228,6 +228,7 @@ propagate errorPPE patch b = case validatePatch patch of
                     )
             doTerm :: Reference -> F m i v (Maybe (Edits v), Set Reference)
             doTerm r = do
+              traceM $ "upgrading term: " <> show (PPE.termName errorPPE (Referent.Ref r))
               componentMap <- unhashTermComponent r
               let componentMap' =
                     over
@@ -379,6 +380,7 @@ propagate errorPPE patch b = case validatePatch patch of
               (Map.toList $ (\(_, tm, _) -> tm) <$> componentMap)
               mempty
         typecheckResult <- eval $ TypecheckFile file []
+        traceShowM typecheckResult
         pure . fmap UF.hashTerms $ runIdentity (
           Result.toMaybe typecheckResult) >>= hush
 

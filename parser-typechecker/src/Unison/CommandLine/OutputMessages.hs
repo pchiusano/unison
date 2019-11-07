@@ -313,22 +313,22 @@ notifyUser dir o = case o of
     formatEntry :: ShallowListEntry v a -> (P.Pretty P.ColorText, P.Pretty P.ColorText)
     formatEntry = \case
       ShallowTermEntry r hq ot ->
-        (P.syntaxToColor . prettyHashQualified' . fmap NameSegment.toName $ hq
-        , P.lit "(" <> maybe "type missing" (TypePrinter.pretty ppe) ot <> P.lit ")" )
+        ( (P.syntaxToColor . prettyHashQualified' . fmap NameSegment.toName $ hq)
+        , P.hiBlack ": " <> maybe (P.red "<type missing>") (TypePrinter.pretty ppe) ot )
       ShallowTypeEntry r hq ->
         (P.syntaxToColor . prettyHashQualified' . fmap NameSegment.toName $ hq
         ,isBuiltin r)
       ShallowBranchEntry ns count ->
         ((P.syntaxToColor . prettyName . NameSegment.toName) ns <> "/"
-        ,case count of
-          1 -> P.lit ("(1 definition)")
-          n -> P.lit "(" <> P.shown count <> P.lit " definitions)")
+        ,P.hiBlack "+ " <> case count of
+          1 -> "1 definition"
+          n -> P.shown count <> " definitions")
       ShallowPatchEntry ns ->
         ((P.syntaxToColor . prettyName . NameSegment.toName) ns
-        ,P.lit "(patch)")
+        ,"▸ patch")
     isBuiltin = \case
-      Reference.Builtin{} -> P.lit "(builtin type)"
-      Reference.DerivedId{} -> P.lit "(type)"
+      Reference.Builtin{} -> P.hiBlack "⍟ " <> "builtin type"
+      Reference.DerivedId{} -> P.hiBlack "⍟ " <> "type"
 
   SlurpOutput input ppe s -> let
     isPast = case input of Input.AddI{} -> True
