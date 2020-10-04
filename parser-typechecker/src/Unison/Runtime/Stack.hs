@@ -76,6 +76,7 @@ import Unsafe.Coerce (unsafeCoerce)
 
 import qualified Crypto.Hash as Hash
 import qualified Crypto.Hash.IO as Hash
+import Data.Bits
 
 newtype Callback = Hook (Stack 'UN -> Stack 'BX -> IO ())
 
@@ -221,7 +222,16 @@ universalHash hashForeign ctx = go
     hashInt (BA.length bs)
     hash bs
   hashWord :: Word64 -> IO ()
-  hashWord _n = undefined -- hash BS.toLazyByteString (BS.word64BE n)
+  hashWord n = hash @BA.Bytes $ BA.pack
+    [ fromIntegral (n `shiftR` 56)
+    , fromIntegral (n `shiftR` 48)
+    , fromIntegral (n `shiftR` 40)
+    , fromIntegral (n `shiftR` 32)
+    , fromIntegral (n `shiftR` 24)
+    , fromIntegral (n `shiftR` 16)
+    , fromIntegral (n `shiftR` 8)
+    , fromIntegral n
+    ]
   hashInt :: Int -> IO ()
   hashInt n = hashInt64 (fromIntegral n)
   hashInt64 :: Int64 -> IO ()
