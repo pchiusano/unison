@@ -120,6 +120,7 @@ data Closure
   | DataG !Reference !Word64 !(Seg 'UN) !(Seg 'BX)
   | Captured !K {-# unpack #-} !(Seg 'UN) !(Seg 'BX)
   | Foreign !Foreign
+  -- | forall e . (HashableIO e, Eq e, Ord e, ReferenceTagged e) => Foreign !Foreign
   | BlackHole
   deriving (Show, Eq, Ord)
 
@@ -195,11 +196,11 @@ universalHash hashForeign ctx = go
   hash = Hash.hashMutableUpdate ctx
   go :: Closure -> IO ()
   go (DataC rf ct us bs)
-    = hashByte 0 *> hashRef rf *> hashCtor ct *> traverse_ hashInt us *> traverse_ go bs
+    = hashByte 0 *> hashRef rf *> hashCtor ct *> hashInts us *> hashClosures bs
   go (PApV (CIx rf _ _) us bs)
-    = hashByte 1 *> hashRef rf *> traverse_ hashInt us *> traverse_ go bs
+    = hashByte 1 *> hashRef rf *> hashInts us *> hashClosures bs
   go (CapV k us bs)
-    = hashByte 2 *> gok k *> traverse_ hashInt us *> traverse_ go bs
+    = hashByte 2 *> gok k *> hashInts us *> hashClosures bs
   go (Foreign f)
     | Just t <- maybeUnwrapForeign Ty.textRef f
     = hashByte 3 *> hashText t
@@ -212,6 +213,10 @@ universalHash hashForeign ctx = go
   gok _k = error "todo - hashing of continuations"
 
   -- formats
+  hashInts :: [Int] -> IO ()
+  hashInts ns = hashInt (length ns) *> traverse_ hashInt ns
+  hashClosures :: [Closure] -> IO ()
+  hashClosures cs = hashInt (length cs) *> traverse_ go cs
   hashByte :: Word8 -> IO ()
   hashByte b = Hash.hashMutableUpdate ctx (BA.singleton b :: BA.Bytes)
   hashCtor :: Word64 -> IO ()
