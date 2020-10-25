@@ -153,6 +153,7 @@ library
     Unison.UnisonFile
     Unison.Util.AnnotatedText
     Unison.Util.Bytes
+    Unison.Util.Array
     Unison.Util.Cache
     Unison.Util.ColorText
     Unison.Util.EnumContainers
@@ -182,6 +183,7 @@ library
     base16 >= 0.2.1.0,
     basement,
     bifunctors,
+    bitvec,
     bytes,
     bytestring,
     cereal,
@@ -210,6 +212,7 @@ library
     io-streams,
     lens,
     ListLike,
+    massiv,
     megaparsec >= 5.0.0 && < 7.0.0,
     memory,
     mmorph,
