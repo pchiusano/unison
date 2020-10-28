@@ -4,10 +4,19 @@
 module Unison.Util.Array where
 
 import qualified Data.Massiv.Array as A
+import Data.Bits as Bits
 import Data.Bit (Bit(..))
 import Data.Word
+import Data.Int
+import Data.Functor
 
 data Array ix a = A !(A.Array A.D ix a) (A.Array A.U ix a)
+
+data Type a where
+  IntT :: Type Int64
+  NatT :: Type Word64
+  FloatT :: Type Double
+  BitT :: Type Bit
 
 force :: (A.Unbox a, A.Index ix) => Array ix a -> Array ix a
 force (A _ !af) = A (delay af) af
@@ -40,46 +49,51 @@ extend ix a arr =
     at i = if i < size arr then unsafeAt i arr else a
     in A arr' (A.compute arr')
 
-ptMin :: (Ord a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptMin (A a1 _) (A a2 _) = let !a3 = A.zipWith min a1 a2 in A a3 (A.compute a3)
+ptMin, ptMax :: (Ord a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix a)
+ptMin = pt min
+ptMax = pt max
 
-ptMax :: (Ord a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptMax (A a1 _) (A a2 _) = let !a3 = A.zipWith max a1 a2 in A a3 (A.compute a3)
+pt :: (A.Index ix, A.Unbox e) => (e1 -> e2 -> e) -> Array ix e1 -> Array ix e2 -> Maybe (Array ix e)
+pt f (A a1 _) (A a2 _) =
+  if A.size a1 == A.size a2 then
+    let !a3 = A.zipWith f a1 a2 in pure (A a3 (A.compute a3))
+  else Nothing
+{-# INLINE pt #-}
 
-ptLt :: (Ord a, A.Index ix) => Array ix a -> Array ix a -> Array ix Bit
-ptLt (A a1 _) (A a2 _) = let !a3 = A.map Bit (A.zipWith (<) a1 a2) in A a3 (A.compute a3)
+ptb :: (A.Index ix) => (e1 -> e2 -> Bool) -> Array ix e1 -> Array ix e2 -> Maybe (Array ix Bit)
+ptb f a a2 = pt (\a b -> Bit (f a b)) a a2
+{-# INLINE ptb #-}
 
-ptLteq :: (Ord a, A.Index ix) => Array ix a -> Array ix a -> Array ix Bit
-ptLteq (A a1 _) (A a2 _) = let !a3 = A.map Bit (A.zipWith (<=) a1 a2) in A a3 (A.compute a3)
+ptLt, ptLteq, ptEq, ptGt, ptGteq
+  :: (Ord a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix Bit)
+ptLt = ptb (<)
+ptLteq = ptb (<=)
+ptEq = ptb (==)
+ptGt = ptb (>)
+ptGteq = ptb (>=)
 
-ptEq :: (Ord a, A.Index ix) => Array ix a -> Array ix a -> Array ix Bit
-ptEq (A a1 _) (A a2 _) = let !a3 = A.map Bit (A.zipWith (==) a1 a2) in A a3 (A.compute a3)
+ptAdd, ptSubtract, ptMultiply
+  :: (Num a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix a)
+ptAdd (A a1 _) (A a2 _) = a1 A..+. a2 <&> \a3 -> A a3 (A.compute a3)
+ptSubtract (A a1 _) (A a2 _) = a1 A..-. a2 <&> \a3 -> A a3 (A.compute a3)
+ptMultiply (A a1 _) (A a2 _) = a1 A..*. a2 <&> \a3 -> A a3 (A.compute a3)
 
-ptGt :: (Ord a, A.Index ix) => Array ix a -> Array ix a -> Array ix Bit
-ptGt (A a1 _) (A a2 _) = let !a3 = A.map Bit (A.zipWith (>) a1 a2) in A a3 (A.compute a3)
+ptGcd, ptLcm, ptQuot, ptDiv, ptMod, ptRem
+  :: (Integral a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix a)
+ptGcd = pt gcd
+ptLcm = pt lcm
+ptQuot = pt quot
+ptDiv = pt div
+ptMod = pt mod
+ptRem = pt rem
 
-ptGteq :: (Ord a, A.Index ix) => Array ix a -> Array ix a -> Array ix Bit
-ptGteq (A a1 _) (A a2 _) = let !a3 = A.map Bit (A.zipWith (>=) a1 a2) in A a3 (A.compute a3)
+ptDivide, ptPow, ptLogBase :: (Floating a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix a)
+ptDivide (A a1 _) (A a2 _) = a1 A../. a2 <&> \a3 -> A a3 (A.compute a3)
+ptPow = pt (**)
+ptLogBase = pt logBase
 
-ptAdd :: (Num a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptAdd (A a1 _) (A a2 _) = let !a3 = A.zipWith (+) a1 a2 in A a3 (A.compute a3)
-
-ptSubtract :: (Num a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptSubtract (A a1 _) (A a2 _) = let !a3 = A.zipWith (-) a1 a2 in A a3 (A.compute a3)
-
-ptMultiply :: (Num a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptMultiply (A a1 _) (A a2 _) = let !a3 = A.zipWith (*) a1 a2 in A a3 (A.compute a3)
-
-ptDivide :: (Fractional a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptDivide (A a1 _) (A a2 _) = let !a3 = A.zipWith (/) a1 a2 in A a3 (A.compute a3)
-
-ptGcd, ptLcm, ptQuot, ptDiv, ptMod, ptRem :: (Integral a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptGcd (A a1 _) (A a2 _) = let !a3 = A.zipWith gcd a1 a2 in A a3 (A.compute a3)
-ptLcm (A a1 _) (A a2 _) = let !a3 = A.zipWith lcm a1 a2 in A a3 (A.compute a3)
-ptQuot (A a1 _) (A a2 _) = let !a3 = A.zipWith quot a1 a2 in A a3 (A.compute a3)
-ptDiv (A a1 _) (A a2 _) = let !a3 = A.zipWith div a1 a2 in A a3 (A.compute a3)
-ptMod (A a1 _) (A a2 _) = let !a3 = A.zipWith mod a1 a2 in A a3 (A.compute a3)
-ptRem (A a1 _) (A a2 _) = let !a3 = A.zipWith rem a1 a2 in A a3 (A.compute a3)
+ptPowi :: (Num a, Integral b, A.Unbox a, A.Index ix) => Array ix a -> Array ix b -> Array ix a
+ptPowi (A a1 _) (A a2 _) = let !a3 = A.zipWith (^) a1 a2 in A a3 (A.compute a3)
 
 ptExp, ptLog, ptSqrt, ptSin, ptCos, ptTan, ptAsin, ptAcos,
   ptAtan, ptSinh, ptCosh, ptTanh, ptAsinh, ptAcosh, ptAtanh
@@ -107,15 +121,32 @@ ptFloor (A a1 _) = let !a' = A.floorA a1 in A a' (A.compute a')
 ptTruncate (A a1 _) = let !a' = A.truncateA a1 in A a' (A.compute a')
 ptRound (A a1 _) = let !a' = A.roundA a1 in A a' (A.compute a')
 
-
-ptPow, ptLogBase :: (Floating a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
-ptPow (A a1 _) (A a2 _) = let !a3 = A.zipWith (**) a1 a2 in A a3 (A.compute a3)
-ptLogBase (A base _) (A a _) = let !a' = A.zipWith logBase base a in A a' (A.compute a')
-
-ptPowi :: (Num a, Integral b, A.Unbox a, A.Index ix) => Array ix a -> Array ix b -> Array ix a
-ptPowi (A a1 _) (A a2 _) = let !a3 = A.zipWith (^) a1 a2 in A a3 (A.compute a3)
-
-choose :: (A.Unbox a, A.Index ix) => Array ix Bit -> Array ix a -> Array ix a -> Array ix a
-choose (A b _) (A a1 _) (A a2 _) =
+mux2 :: (A.Unbox a, A.Index ix) => Array ix Bit -> Array ix a -> Array ix a -> Array ix a
+mux2 (A b _) (A a1 _) (A a2 _) =
   let !a = A.zipWith3 (\(Bit b) a1 a2 -> if b then a2 else a1) b a1 a2
   in A a (A.compute a)
+
+pick :: (A.Manifest A.D ix ix2, A.Unbox a, A.Index ix, A.Index ix2) => Array ix ix2 -> Array ix2 a -> Maybe (Array ix a)
+pick (A inds _) (A _ src) =
+  if A.isEmpty inds then pure $ A A.empty A.empty
+  else let
+    max = A.maximum' inds
+    in if max >= A.unSz (A.size src) then Nothing
+       else let a = A.backpermute' (A.size inds) (A.index' inds) src
+            in pure $ A a (A.compute a)
+
+and, or, xor :: (A.Unbox a, Bits a, A.Index ix) => Array ix a -> Array ix a -> Maybe (Array ix a)
+and = pt (.&.)
+or = pt (.|.)
+xor = pt Bits.xor
+
+complement :: (A.Unbox a, Bits a, A.Index ix) => Array ix a -> Array ix a
+complement (A a _) = let !a' = A.map Bits.complement a in A a' (A.compute a')
+
+popCount :: (A.Unbox a, Bits a, A.Index ix) => Array ix a -> Array ix Word64
+popCount (A a _) = let !a' = A.map (fromIntegral . Bits.popCount) a in A a' (A.compute a')
+
+elemIndices :: (A.Unbox a, Eq a, A.Unbox ix, A.Index ix) => a -> Array ix a -> Array A.Ix1 ix
+elemIndices q (A a _) =
+  let !a' = A.flatten . A.compute . A.imapMaybeS (\i a -> if a == q then Just i else Nothing) $ a
+  in A (delay a') a'
