@@ -84,28 +84,28 @@ ptRem (A a1 _) (A a2 _) = let !a3 = A.zipWith rem a1 a2 in A a3 (A.compute a3)
 ptExp, ptLog, ptSqrt, ptSin, ptCos, ptTan, ptAsin, ptAcos,
   ptAtan, ptSinh, ptCosh, ptTanh, ptAsinh, ptAcosh, ptAtanh
   :: (Floating a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a
-ptExp (A a1 _) = let !a' = A.map exp a1 in A a' (A.compute a')
-ptLog (A a1 _) = let !a' = A.map log a1 in A a' (A.compute a')
-ptSqrt (A a1 _) = let !a' = A.map sqrt a1 in A a' (A.compute a')
-ptSin (A a1 _) = let !a' = A.map sin a1 in A a' (A.compute a')
-ptCos (A a1 _) = let !a' = A.map cos a1 in A a' (A.compute a')
-ptTan (A a1 _) = let !a' = A.map tan a1 in A a' (A.compute a')
-ptAsin (A a1 _) = let !a' = A.map asin a1 in A a' (A.compute a')
-ptAcos (A a1 _) = let !a' = A.map acos a1 in A a' (A.compute a')
-ptAtan (A a1 _) = let !a' = A.map atan a1 in A a' (A.compute a')
-ptSinh (A a1 _) = let !a' = A.map sinh a1 in A a' (A.compute a')
-ptCosh (A a1 _) = let !a' = A.map cosh a1 in A a' (A.compute a')
-ptTanh (A a1 _) = let !a' = A.map tanh a1 in A a' (A.compute a')
-ptAsinh (A a1 _) = let !a' = A.map asinh a1 in A a' (A.compute a')
-ptAcosh (A a1 _) = let !a' = A.map acosh a1 in A a' (A.compute a')
-ptAtanh (A a1 _) = let !a' = A.map atanh a1 in A a' (A.compute a')
+ptExp (A a1 _) = let !a' = A.expA a1 in A a' (A.compute a')
+ptLog (A a1 _) = let !a' = A.logA a1 in A a' (A.compute a')
+ptSqrt (A a1 _) = let !a' = A.sqrtA a1 in A a' (A.compute a')
+ptSin (A a1 _) = let !a' = A.sinA a1 in A a' (A.compute a')
+ptCos (A a1 _) = let !a' = A.cosA a1 in A a' (A.compute a')
+ptTan (A a1 _) = let !a' = A.tanA a1 in A a' (A.compute a')
+ptAsin (A a1 _) = let !a' = A.asinA a1 in A a' (A.compute a')
+ptAcos (A a1 _) = let !a' = A.acosA a1 in A a' (A.compute a')
+ptAtan (A a1 _) = let !a' = A.atanA a1 in A a' (A.compute a')
+ptSinh (A a1 _) = let !a' = A.sinhA a1 in A a' (A.compute a')
+ptCosh (A a1 _) = let !a' = A.coshA a1 in A a' (A.compute a')
+ptTanh (A a1 _) = let !a' = A.tanhA a1 in A a' (A.compute a')
+ptAsinh (A a1 _) = let !a' = A.asinhA a1 in A a' (A.compute a')
+ptAcosh (A a1 _) = let !a' = A.acoshA a1 in A a' (A.compute a')
+ptAtanh (A a1 _) = let !a' = A.atanhA a1 in A a' (A.compute a')
 
 ptCeiling, ptFloor, ptTruncate, ptRound
   :: (RealFrac a, A.Unbox a, Integral b, A.Unbox b, A.Index ix) => Array ix a -> Array ix b
-ptCeiling (A a1 _) = let !a' = A.map ceiling a1 in A a' (A.compute a')
-ptFloor (A a1 _) = let !a' = A.map floor a1 in A a' (A.compute a')
-ptTruncate (A a1 _) = let !a' = A.map truncate a1 in A a' (A.compute a')
-ptRound (A a1 _) = let !a' = A.map round a1 in A a' (A.compute a')
+ptCeiling (A a1 _) = let !a' = A.ceilingA a1 in A a' (A.compute a')
+ptFloor (A a1 _) = let !a' = A.floorA a1 in A a' (A.compute a')
+ptTruncate (A a1 _) = let !a' = A.truncateA a1 in A a' (A.compute a')
+ptRound (A a1 _) = let !a' = A.roundA a1 in A a' (A.compute a')
 
 
 ptPow, ptLogBase :: (Floating a, A.Unbox a, A.Index ix) => Array ix a -> Array ix a -> Array ix a
