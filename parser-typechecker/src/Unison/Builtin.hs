@@ -163,6 +163,7 @@ builtinTypesSrc =
   , B' "ThreadId" CT.Data, Rename' "ThreadId" "io2.ThreadId"
   , B' "MVar" CT.Data, Rename' "MVar" "io2.MVar"
   , B' "crypto.HashAlgorithm" CT.Data
+  , B' "Array" CT.Data
   ]
 
 -- rename these to "builtin" later, when builtin means intrinsic as opposed to
@@ -335,6 +336,47 @@ builtinsSrc =
   , B "Float.min" $ float --> float --> float
   , B "Float.toText" $ float --> text
   , B "Float.fromText" $ text --> optionalt float
+
+  , B "Floats.fromList" $ list float --> array nat float
+
+  -- Arrays
+  , B "Floats.+" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix float)
+  , B "Floats.-" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix float)
+  , B "Floats.*" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix float)
+  , B "Floats./" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix float)
+  , B "Floats.gt" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix boolean)
+  , B "Floats.gteq" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix boolean)
+  , B "Floats.eq" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix boolean)
+  , B "Floats.lteq" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix boolean)
+  , B "Floats.lt" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix boolean)
+
+  , B "Floats.acos" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.asin" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.atan" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.atan2" $ forall1 "ix" (\ix -> array ix float --> array ix float --> array ix float)
+  , B "Floats.cos" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.sin" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.tan" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.acosh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.asinh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.atanh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.cosh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.sinh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+  , B "Floats.tanh" $ forall1 "ix" (\ix -> array ix float --> array ix float)
+
+  -- Generic array functions
+  , B "Array.toList" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> list a))
+  , B "Array.at" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> optionalt a))
+  , B "Array.unsafeAt" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> a))
+  , B "Array.size" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> ix))
+  , B "Array.sort" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> array ix a))
+  , B "Array.reverse" $ forall1 "ix" (\ix -> forall1 "a" (\a -> array ix a --> array ix a))
+  , B "Array.take" $ forall1 "a" (\a -> nat --> array nat a --> array nat a)
+  , B "Array.drop" $ forall1 "a" (\a -> nat --> array nat a --> array nat a)
+  , B "Array.fill" $ forall1 "a" (\a -> nat --> a --> array nat a)
+  , B "Array.fill2" $ forall1 "a" (\a -> nat --> nat --> a --> array nat a)
+  , B "Array.fill3" $ forall1 "a" (\a -> nat --> nat --> nat --> a --> array nat a)
+  , B "Array.fill4" $ forall1 "a" (\a -> nat --> nat --> nat --> nat --> a --> array nat a)
 
   , B "Universal.==" $ forall1 "a" (\a -> a --> a --> boolean)
   -- Don't we want a Universal.!= ?
@@ -556,4 +598,7 @@ text = Type.text ()
 boolean = Type.boolean ()
 float = Type.float ()
 char = Type.char ()
+
+array :: Ord v => Type v -> Type v -> Type v
+array = Type.array ()
 

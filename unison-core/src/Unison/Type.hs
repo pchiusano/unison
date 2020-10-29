@@ -232,6 +232,9 @@ mvarRef = Reference.Builtin "MVar"
 hashAlgorithmRef :: Reference
 hashAlgorithmRef = Reference.Builtin "crypto.HashAlgorithm"
 
+arrayRef :: Reference
+arrayRef = Reference.Builtin "Array"
+
 builtin :: Ord v => a -> Text -> Type v a
 builtin a = ref a . Reference.Builtin
 
@@ -267,6 +270,9 @@ socket a = ref a socketRef
 
 vector :: Ord v => a -> Type v a
 vector a = ref a vectorRef
+
+array :: Ord v => a -> Type v a -> Type v a -> Type v a
+array a ix e = app a (app a (ref a arrayRef) ix) e
 
 bytes :: Ord v => a -> Type v a
 bytes a = ref a bytesRef
