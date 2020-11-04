@@ -1,13 +1,18 @@
 {-# Language GADTs #-}
 {-# Language BangPatterns #-}
+{-# Language TypeOperators #-}
 
 module Unison.Util.Array where
 
+import Prelude hiding (Float)
+import Control.Applicative
 import qualified Data.Massiv.Array as A
-import qualified Data.Massiv.Core.Operations as A
+-- import qualified Data.Massiv.Core.Operations as A
 import Data.Bit (Bit(..))
 import Data.Word
 import Data.Int
+import Control.Monad.State.Strict
+import Control.Monad.Reader
 
 type Array ix a = A.Array A.U ix a
 
@@ -16,7 +21,99 @@ data Type a where
   NatT :: Type Word64
   FloatT :: Type Double
   BitT :: Type Bit
+  -- ByteT :: Type Word8
+  -- Float32T :: Type Float
+  -- Float16T :: Type Half
 
+data (:::) a b = !a ::: !b
+
+type Float = Double
+
+data Ix ix a where
+  Ix :: (A.Index ix, A.Unbox a) => Type a -> A.Array A.U ix a -> Ix ix a
+  Offset :: Num ix => ix -> a -> Ix ix a -> Ix ix a
+
+-- Arr ix a a = (ix -> Maybe a, Maybe (Size ix)) where the Maybe ix is the
+data A ix a r where
+  At :: Ix ix a -> A ix a r
+  Self :: ix -> A ix r r
+  -- Fix :: A ix r r -> A ix r x
+  -- Let :: A v ix a r -> A (S v) ix a r -> A v ix a r
+  -- data Exp v arr r where
+  --   At :: Ix ix a -> Exp (arr ix a r)
+  --   Fix :: arr ix r r -> Exp (arr ix r x)
+  --   Self :: ix -> Exp (arr ix r r)
+  --   Let :: Exp v arr a -> Exp (S a v) arr b -> Exp v arr b
+  --   Var :: Exp (v a) arr a -> Exp v arr a
+  F :: Float -> A ix Float r
+  Plusf :: A ix Float r -> A ix Float r -> A ix Float r
+  Skip :: A ix r r
+  Cons :: a -> A ix a r -> A ix a r
+  If :: A ix Bool r -> A ix a r -> A ix a r -> A ix a r
+  Lt :: Ord a => A ix a r -> A ix a r -> A ix Bool r
+
+infixr 0 `Cons`
+
+fib :: A A.Ix1 Float Float
+fib = 0.0 `Cons` 1.0 `Cons` (prev1 `Plusf` prev2)
+
+prev1 :: A A.Ix1 a a
+prev1 = Self (-1)
+
+prev2 :: A A.Ix1 a a
+prev2 = Self (-2)
+
+runIx :: (Eq ix, Num ix, MonadReader ix m) => Ix ix a -> m (Maybe a)
+runIx = \case
+  Ix _ arr -> ask >>= \ix -> pure $ A.index arr ix
+  Offset by def ix -> do
+    a <- local (+ by) $ runIx ix
+    pure $ case a of
+      Nothing -> Just def
+      _ -> a
+
+-- `A ix a r` denotes a `[(ix,r)] -> ix -> ([(ix,r)], Maybe a)`
+--
+-- ([(ix,r)] -> ix -> [(ix,r)],
+run :: forall ix m r . (Eq ix, Num ix, MonadReader ix m, MonadState [(ix,r)] m)
+   => A ix r r -> m (Maybe r)
+run = go where
+  go :: (MonadReader ix m, MonadState [(ix,r)] m) => A ix a r -> m (Maybe a)
+  go = \case
+    At ix -> runIx ix
+    Self offset -> do
+      ix <- ask
+      sofar <- get
+      let ix' = ix + offset
+      pure (lookup ix' sofar)
+    F a -> pure (Just a)
+    Plusf a b -> pt (+) a b
+    Skip -> pure Nothing
+    Cons h t -> do
+      i <- ask
+      if i == 0 then pure $ Just h
+      else go t
+    If cond t f -> do
+      cond <- go cond
+      t <- go t
+      f <- go f
+      case cond of
+        Nothing -> pure Nothing
+        Just True -> pure t
+        Just False -> pure f
+    Lt a b -> pt (<) a b
+    where
+    pt :: (a -> b -> c) -> A ix a r -> A ix b r -> m (Maybe c)
+    pt f a b = (liftA2 $ liftA2 f) (go a) (go b)
+
+{-
+toList :: Int -> A ix r r -> [(ix,r)]
+toList n a = let
+  ar = run a
+  [ runReader
+-}
+
+{-
 size :: (A.Unbox a, A.Index ix) => Array ix a -> ix
 size a = A.unSz $ A.size a
 {-# INLINE size #-}
@@ -122,3 +219,4 @@ tally a =
   let (a', n) = A.unzip (A.computeAs A.U $ A.tally a)
   in A.compute $ A.zip a' (A.map fromIntegral n)
 {-# INLINE tally #-}
+-}
