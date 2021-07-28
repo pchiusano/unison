@@ -382,6 +382,16 @@ builtinsSrc =
 
   , B "Boolean.not" $ boolean --> boolean
 
+  , B "Regex.bytes" $ text --> regexOf bytes
+  , B "Regex.text" $ text --> regexOf text
+  , B "Regex.many" $ forall1 "a" (\a -> regexOf a --> regexOf a)
+  , B "Regex.few" $ forall1 "a" (\a -> regexOf a --> regexOf a)
+  , B "Regex.or" $ forall1 "a" (\a -> regexOf a --> regexOf a --> regexOf a)
+  , B "Regex.append" $ forall1 "a" (\a -> regexOf a --> regexOf a --> regexOf a)
+  , B "Regex.fail" $ forall1 "a" (\a -> regexOf a)
+  , B "Regex.capture" $ forall1 "a" (\a -> regexOf a --> regexOf a)
+  , B "Text.matches" $ regexOf text --> text --> optionalt (list text)
+
   , B "Text.empty" text
   , B "Text.++" $ text --> text --> text
   , B "Text.take" $ nat --> text --> text
@@ -400,6 +410,7 @@ builtinsSrc =
   , B "Text.fromCharList" $ list char --> text
   , B "Text.toUtf8" $ text --> bytes
   , B "Text.fromUtf8.impl.v3" $ bytes --> eithert failure text
+
   , B "Char.toNat" $ char --> nat
   , B "Char.toText" $ char --> text
   , B "Char.fromNat" $ nat --> char
@@ -686,6 +697,9 @@ text = Type.text ()
 boolean = Type.boolean ()
 float = Type.float ()
 char = Type.char ()
+
+regexOf :: Var v => Type v -> Type v
+regexOf = Type.regexOf ()
 
 anyt, code, value, termLink :: Var v => Type v
 anyt = Type.ref() Type.anyRef

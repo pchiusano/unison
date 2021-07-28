@@ -207,7 +207,7 @@ derivedBase32Hex r a = ref a r
 -- derivedBase58' :: Text -> Reference
 -- derivedBase58' base58 = Reference.derivedBase58 base58 0 1
 
-intRef, natRef, floatRef, booleanRef, textRef, charRef, listRef, bytesRef, effectRef, termLinkRef, typeLinkRef :: Reference
+intRef, natRef, floatRef, booleanRef, textRef, charRef, listRef, bytesRef, effectRef, termLinkRef, typeLinkRef, regexRef :: Reference
 intRef = Reference.Builtin "Int"
 natRef = Reference.Builtin "Nat"
 floatRef = Reference.Builtin "Float"
@@ -219,6 +219,7 @@ bytesRef = Reference.Builtin "Bytes"
 effectRef = Reference.Builtin "Effect"
 termLinkRef = Reference.Builtin "Link.Term"
 typeLinkRef = Reference.Builtin "Link.Type"
+regexRef = Reference.Builtin "Regex"
 
 builtinIORef, fileHandleRef, filePathRef, threadIdRef, socketRef :: Reference
 builtinIORef = Reference.Builtin "IO"
@@ -285,6 +286,18 @@ boolean a = ref a booleanRef
 
 text :: Ord v => a -> Type v a
 text a = ref a textRef
+
+regex :: Ord v => a -> Type v a
+regex a = ref a regexRef
+
+regexOf :: Ord v => a -> Type v a -> Type v a
+regexOf a txt = app a (regex a) txt
+
+textRegex :: Ord v => a -> Type v a
+textRegex a = regexOf a (text a)
+
+bytesRegex :: Ord v => a -> Type v a
+bytesRegex a = regexOf a (bytes a)
 
 char :: Ord v => a -> Type v a
 char a = ref a charRef
