@@ -1,20 +1,81 @@
+{-# Language BangPatterns, PatternSynonyms, ViewPatterns #-}
+
 module Unison.Runtime.Regex where
 
 import Prelude hiding (or,and)
 import Data.Word
+import Data.Bits (shiftL, shiftR)
 import qualified Data.Vector as V
+import qualified Data.Sequence as Seq
+import Data.Sequence (Seq)
 
--- Machine = More (Word8 -> Machine) | Done Status
--- Done Int Int
--- it's just a Moore machine
--- and is pretty clear, just extend the accept states, converting them to failures
--- or calls both continuations, and if both say keep going, or those
-data Regex
-  = Fail
-  | Ok Int Int
-  | More IsOk (Word8 -> Regex)
+--  , B "Regex.bytes" $ text --> regexOf bytes
+--  , B "Regex.text" $ text --> regexOf text
+--  , B "Regex.many" $ forall1 "a" (\a -> regexOf a --> regexOf a)
+--  , B "Regex.few" $ forall1 "a" (\a -> regexOf a --> regexOf a)
+--  , B "Regex.or" $ forall1 "a" (\a -> regexOf a --> regexOf a --> regexOf a)
+--  , B "Regex.append" $ forall1 "a" (\a -> regexOf a --> regexOf a --> regexOf a)
+--  , B "Regex.fail" $ forall1 "a" (\a -> regexOf a)
+--  , B "Regex.capture" $ forall1 "a" (\a -> regexOf a --> regexOf a)
 
-type IsOk = Bool
+data Compiled
+  = More {-# unpack #-} !Status (Int -> Word8 -> Compiled)
+
+type Status = Int
+pattern Waiting_s = 0
+pattern Ok_s = 1
+pattern Fail_s = 2
+pattern Capture_s start <- (uncapture_s -> start)
+{-# COMPLETE Waiting_s, Ok_s, Fail_s, Capture_s #-}
+
+-- when interpreter encounters a capture, it should repeat the same
+-- index for the continuation
+
+uncapture_s :: Status -> Int
+uncapture_s s = s `shiftR` 2
+
+capture_s :: Int -> Status
+capture_s from = from `shiftL` 2
+
+ok_c, fail_c :: Compiled
+ok_c = More Ok_s (\_ _ -> ok_c)
+fail_c = More Fail_s (\_ _ -> fail_c)
+
+bytes_c :: [Word8] -> Compiled
+bytes_c [] = ok_c
+bytes_c (h:t) =
+  let ct = bytes_c t
+  in More Waiting_s (\_ w -> if w == h then ct else fail_c)
+
+many_c :: Compiled -> Compiled
+many_c c = mr
+  where
+  mr = go c
+  go (More Ok_s _) = mr
+  go (More Fail_s _) = fail_c
+  go (More Waiting_s k) = More Waiting_s (\i b -> go (k i b))
+  go (More capture k) = More capture (\i b -> go (k i b))
+
+or_c :: Compiled -> Compiled -> Compiled
+or_c (More Ok_s _) _ = ok_c
+or_c _ (More Ok_s _) = ok_c
+or_c (More Fail_s _) c = c
+or_c c (More Fail_s _) = c
+or_c (More Waiting_s k1) (More s k2) = More s (\i b -> k1 i b `or_c` k2 i b)
+or_c (More s k1) (More Waiting_s k2) = More s (\i b -> k1 i b `or_c` k2 i b)
+or_c (More (Capture_s from1) k1) (More (Capture_s from2) k2) =
+  More (capture_s (from1 `min` from2))
+       (\i b -> k1 i b `or_c` k2 i b)
+
+{-
+data Regex txt
+  = Fail Compiled
+  | Concat Compiled (Seq (Regex txt))
+  | Many Compiled (Regex txt)
+  | Lit Compiled txt
+  | Or Compiled (Regex txt) (Regex txt)
+  | Capture Compiled (Regex txt)
+
 
 or Fail r = r
 or Ok (More _ k) = More True k
@@ -64,4 +125,4 @@ many :: Regex -> Regex
 many Fail = Fail
 many Succeed = Succeed
 many (Or bs) = _hmm
-
+-}
