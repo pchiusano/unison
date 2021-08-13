@@ -1,13 +1,12 @@
 {-# Language BangPatterns, PatternSynonyms, ViewPatterns #-}
-
-module Unison.Runtime.Regex where
+module Unison.Util.Regex where
 
 import Prelude hiding (or,and)
-import Data.Word
-import Data.Bits (shiftL, shiftR)
-import qualified Data.Vector as V
-import qualified Data.Sequence as Seq
+
 import Data.Sequence (Seq)
+import Unison.Util.Bytes (Bytes)
+import qualified Data.Sequence as Sequence
+import qualified Unison.Util.Bytes as Bytes
 
 --  , B "Regex.bytes" $ text --> regexOf bytes
 --  , B "Regex.text" $ text --> regexOf text
@@ -18,44 +17,37 @@ import Data.Sequence (Seq)
 --  , B "Regex.fail" $ forall1 "a" (\a -> regexOf a)
 --  , B "Regex.capture" $ forall1 "a" (\a -> regexOf a --> regexOf a)
 
-data Compiled
-  = More {-# unpack #-} !Status (Int -> Word8 -> Compiled)
+data Compiled txt
+  = Fail
+  | Ok (Seq txt) -- captures
+  | More {-# unpack #-} !Int !(Maybe txt -> Compiled txt)
 
-type Status = Int
-pattern Waiting_s = 0
-pattern Ok_s = 1
-pattern Fail_s = 2
-pattern Capture_s start <- (uncapture_s -> start)
-{-# COMPLETE Waiting_s, Ok_s, Fail_s, Capture_s #-}
+bytes_c :: Bytes -> Compiled Bytes
+bytes_c bs | Bytes.null bs = Ok
+bytes_c bs =
+  More (Bytes.size bs)
+       (\bs' -> if Just bs == bs' then Ok mempty else Fail)
 
--- when interpreter encounters a capture, it should repeat the same
--- index for the continuation
-
-uncapture_s :: Status -> Int
-uncapture_s s = s `shiftR` 2
-
-capture_s :: Int -> Status
-capture_s from = from `shiftL` 2
-
-ok_c, fail_c :: Compiled
-ok_c = More Ok_s (\_ _ -> ok_c)
-fail_c = More Fail_s (\_ _ -> fail_c)
-
-bytes_c :: [Word8] -> Compiled
-bytes_c [] = ok_c
-bytes_c (h:t) =
-  let ct = bytes_c t
-  in More Waiting_s (\_ w -> if w == h then ct else fail_c)
-
-many_c :: Compiled -> Compiled
-many_c c = mr
+many_c :: Compiled b -> Compiled b
+many_c = go0
   where
-  mr = go c
-  go (More Ok_s _) = mr
-  go (More Fail_s _) = fail_c
-  go (More Waiting_s k) = More Waiting_s (\i b -> go (k i b))
-  go (More capture k) = More capture (\i b -> go (k i b))
+  go0 !acc Fail = Fail
+  go0 !acc (Ok caps) = Fail
+  go0 !acc (More n k) = More n step where
+    step Nothing = Ok acc
+    step bs = go (k bs)
+    where
+      go Fail = Fail
+      go (Ok caps) = go0 (acc <> caps) c
+      go (More n k) = More n (\bs -> go (k bs))
 
+or_c :: Compiled b -> Compiled b -> Compiled b
+or_c Fail c = c
+or_c c Fail = c
+or_c Ok _ = Ok
+or_c _ Ok = Ok
+
+{-
 or_c :: Compiled -> Compiled -> Compiled
 or_c (More Ok_s _) _ = ok_c
 or_c _ (More Ok_s _) = ok_c
@@ -125,4 +117,5 @@ many :: Regex -> Regex
 many Fail = Fail
 many Succeed = Succeed
 many (Or bs) = _hmm
+-}
 -}
