@@ -18,6 +18,7 @@ import qualified GHC.Exts
 import Unison.Lexer.Pos (Line, Pos (..))
 import Unison.Prelude
 import Unison.Util.Monoid (intercalateMap)
+import qualified Unison.Util.Range as Range 
 import Unison.Util.Range (Range (..), inRange)
 
 data Segment a = Segment {segment :: String, annotation :: Maybe a}
@@ -137,8 +138,11 @@ condensedExcerptToText margin e =
 
 excerptToText :: forall a. AnnotatedExcerpt a -> AnnotatedText a
 excerptToText e =
-  track (Pos line1 1) [] (Map.toList $ annotations e) (renderLineNumber line1) (text e)
+  track (Pos line1 1) [] sortedAnnotations (renderLineNumber line1) (text e)
   where
+    -- annotations over smaller ranges come first, so that
+    -- if two ranges overlap, we pick the one
+    sortedAnnotations = reverse (sortOn (Range.delta . fst) (Map.toList $ annotations e))
     line1 :: Int
     line1 = lineOffset e
     renderLineNumber :: Int -> AnnotatedText a
@@ -152,7 +156,7 @@ excerptToText e =
     track _ _ _ rendered "" = rendered
     track _ _ _ rendered "\n" = rendered <> "\n"
     track pos@(Pos line col) stack annotations rendered _input@(c : rest) =
-      let (poppedAnnotations, remainingAnnotations) = span (inRange pos . fst) annotations
+      let (poppedAnnotations, remainingAnnotations0) = span (inRange pos . fst) annotations
           -- drop any stack entries that will be closed after this char
           -- and add new stack entries
           stack' = foldl' pushColor stack0 poppedAnnotations
@@ -160,6 +164,8 @@ excerptToText e =
               pushColor s (Range _ end, style) = (style, end) : s
               stack0 = dropWhile ((<= pos) . snd) stack
           maybeColor = fst <$> headMay stack'
+          remainingAnnotations = drop 1 poppedAnnotations <> remainingAnnotations0 
+
           -- on new line, advance pos' vertically and set up line header
           -- additions :: AnnotatedText (Maybe a)
           pos' :: Pos

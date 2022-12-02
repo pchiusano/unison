@@ -9,6 +9,10 @@ _x@(Range a b) `contains` _y@(Range c d) = a <= c && d <= b
 overlaps :: Range -> Range -> Bool
 overlaps (Range a b) (Range c d) = a < d && c < b
 
+-- Returns (line end - line start, col end - col start)
+delta :: Range -> (Int,Int)
+delta (Range (Pos line col) (Pos line2 col2)) = (line2 - line, col2 - col)
+
 inRange :: Pos -> Range -> Bool
 inRange p (Range a b) = p >= a && p < b
 
