@@ -37,6 +37,7 @@ module Unison.Runtime.MCode
   )
 where
 
+import Debug.Trace qualified as Debug
 import Data.Bifunctor (bimap, first)
 import Data.Bits (shiftL, shiftR, (.|.))
 import Data.Coerce
@@ -626,17 +627,20 @@ testW :: Section -> EnumMap Word64 Section -> Branch
 testW !df !bs = 
   case EC.mapToList bs of
     [] -> TestW df (const df) bs 
+    [(0,_b0)] | Debug.trace "hitting this case (1)" False -> undefined
     [(0,b0)] ->
       TestW df match bs
       where
         match 0 = b0
         match _ = df
+    [(0,_b0), (1,_b1)] | Debug.trace "hitting this case (2)" False -> undefined
     [(0,b0), (1,b1)] ->
       TestW df match bs
       where
         match 0 = b0
         match 1 = b1
         match _ = df 
+    [(0,_b0), (1,_b1), (2,_b2)] | Debug.trace "hitting this case (3)" False -> undefined
     [(0,b0), (1,b1), (2,b2)] ->
       TestW df match bs
       where
@@ -644,6 +648,7 @@ testW !df !bs =
         match 1 = b1
         match 2 = b2
         match _ = df
+    [(0,_b0), (1,_b1), (2,_b2), (3,_b3)] | Debug.trace "hitting this case (4)" False -> undefined
     [(0,b0), (1,b1), (2,b2), (3,b3)] ->
       TestW df match bs
       where
@@ -652,6 +657,7 @@ testW !df !bs =
         match 2 = b2
         match 3 = b3
         match _ = df
+    [(0,_b0), (1,_b1), (2,_b2), (3,_b3), (4,_b4)] | Debug.trace "hitting this case (5)" False -> undefined
     [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4)] ->
       TestW df match bs
       where
