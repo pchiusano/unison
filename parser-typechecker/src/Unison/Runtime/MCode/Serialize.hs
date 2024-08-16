@@ -405,7 +405,7 @@ putBranch (Test2 a sa b sb d) =
     *> pWord b
     *> putSection sb
     *> putSection d
-putBranch (TestW d m) =
+putBranch (TestW d _ m) =
   putTag TestWT *> putSection d *> putEnumMap pWord putSection m
 putBranch (TestT d m) =
   putTag TestTT *> putSection d *> putMap (putText . Util.Text.toText) putSection m
@@ -421,7 +421,7 @@ getBranch =
         <*> gWord
         <*> getSection
         <*> getSection
-    TestWT -> TestW <$> getSection <*> getEnumMap gWord getSection
+    TestWT -> testW <$> getSection <*> getEnumMap gWord getSection
     TestTT -> TestT <$> getSection <*> getMap (Util.Text.fromText <$> getText) getSection
 
 gInt :: (MonadGet m) => m Int

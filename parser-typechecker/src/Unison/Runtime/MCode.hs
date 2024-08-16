@@ -22,6 +22,7 @@ module Unison.Runtime.MCode
     BPrim1 (..),
     BPrim2 (..),
     Branch (..),
+    testW,
     bcount,
     ucount,
     emitCombs,
@@ -615,22 +616,186 @@ data Branch
       !Section -- else ...
   | TestW
       !Section
+      !(Word64 -> Section)
       !(EnumMap Word64 Section)
   | TestT
       !Section
       !(M.Map Text Section)
-  deriving (Show, Eq, Ord)
 
+testW :: Section -> EnumMap Word64 Section -> Branch
+testW !df !bs = 
+  case EC.mapToList bs of
+    [] -> TestW df (const df) bs 
+    [(0,b0)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match _ = df
+    [(0,b0), (1,b1)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match _ = df 
+    [(0,b0), (1,b1), (2,b2)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match _ = df 
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match 7 = b7
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match 7 = b7
+        match 8 = b8
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match 7 = b7
+        match 8 = b8
+        match 9 = b9
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9), (10,b10)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match 7 = b7
+        match 8 = b8
+        match 9 = b9
+        match 10 = b10
+        match _ = df
+    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9), (10,b10), (11,b11)] ->
+      TestW df match bs
+      where
+        match 0 = b0
+        match 1 = b1
+        match 2 = b2
+        match 3 = b3
+        match 4 = b4
+        match 5 = b5
+        match 6 = b6
+        match 7 = b7
+        match 8 = b8
+        match 9 = b9
+        match 10 = b10
+        match 11 = b11
+        match _ = df
+    _ -> TestW df (\i -> EC.lookupWithDefault df i bs) bs
+
+instance Show Branch where
+  show (Test1 n t f) = "Test1 " ++ show n ++ " " ++ show t ++ " " ++ show f
+  show (Test2 m t n u f) = "Test2 " ++ show m ++ " " ++ show t ++ " " ++ show n ++ " " ++ show u ++ " " ++ show f
+  show (TestW t _ m) = "TestW " ++ show t ++ " " ++ show m
+  show (TestT t m) = "TestT " ++ show t ++ " " ++ show m
+
+instance Ord Branch where
+  compare (Test1 a1 b1 c1) (Test1 a2 b2 c2) = compare a1 a2 <> compare b1 b2 <> compare c1 c2
+  compare (Test2 a1 b1 c1 d1 e1) (Test2 a2 b2 c2 d2 e2) = compare a1 a2 <> compare b1 b2 <> compare c1 c2 <> compare d1 d2 <> compare e1 e2
+  compare (TestW a1 _b1 c1) (TestW a2 _b2 c2) = compare a1 a2 <> compare c1 c2
+  compare (TestT a1 b1) (TestT a2 b2) = compare a1 a2 <> compare b1 b2
+  compare b1 b2 = compare (tag b1) (tag b2) 
+    where
+    tag :: Branch -> Int
+    tag (Test1{}) = 0
+    tag (Test2{}) = 1 
+    tag (TestW{}) = 2
+    tag (TestT{}) = 3
+
+instance Eq Branch where
+  Test1 a1 b1 c1 == Test1 a2 b2 c2 = a1 == a2 && b1 == b2 && c1 == c2
+  Test2 a1 b1 c1 d1 e1 == Test2 a2 b2 c2 d2 e2 = a1 == a2 && b1 == b2 && c1 == c2 && d1 == d2 && e1 == e2
+  TestW a1 _b1 c1 == TestW a2 _b2 c2 = a1 == a2 && c1 == c2
+  TestT a1 b1 == TestT a2 b2 = a1 == a2 && b1 == b2
+  _ == _ = False
+    
 -- Convenience patterns for matches used in the algorithms below.
 pattern MatchW :: Int -> Section -> EnumMap Word64 Section -> Section
-pattern MatchW i d cs = Match i (TestW d cs)
+matchW :: Int -> Section -> EnumMap Word64 Section -> Section
+matchW i d cs = Match i (testW d cs)
+
+pattern MatchW i d cs <- Match i (TestW d _ cs)
 
 pattern MatchT :: Int -> Section -> M.Map Text Section -> Section
 pattern MatchT i d cs = Match i (TestT d cs)
 
-pattern NMatchW ::
-  Maybe Reference -> Int -> Section -> EnumMap Word64 Section -> Section
-pattern NMatchW r i d cs = NMatch r i (TestW d cs)
+nMatchW :: Maybe Reference -> Int -> Section -> EnumMap Word64 Section -> Section
+nMatchW r i d cs = NMatch r i (testW d cs)
+
+-- pattern NMatchW ::
+--   Maybe Reference -> Int -> Section -> EnumMap Word64 Section -> Section
+-- pattern NMatchW r i d cs <- NMatch r i (TestW d _ cs)
 
 -- Representation of the variable context available in the current
 -- frame. This tracks tags that have been dumped to the stack for
@@ -874,7 +1039,7 @@ emitSection rns grpr grpn rec ctx (TMatch v bs)
   | Just (i, UN) <- ctxResolve ctx v,
     MatchIntegral cs df <- bs =
       emitLitMatching
-        MatchW
+        matchW
         "missing integral case"
         rns
         grpr
@@ -887,7 +1052,7 @@ emitSection rns grpr grpn rec ctx (TMatch v bs)
   | Just (i, BX) <- ctxResolve ctx v,
     MatchNumeric r cs df <- bs =
       emitLitMatching
-        (NMatchW (Just r))
+        (nMatchW (Just r))
         "missing integral case"
         rns
         grpr
@@ -1268,7 +1433,7 @@ emitDataMatching ::
   Maybe (ANormal v) ->
   Emit Branch
 emitDataMatching r rns grpr grpn rec ctx cs df =
-  TestW <$> edf <*> traverse (emitCase rns grpr grpn rec ctx) (coerce cs)
+  testW <$> edf <*> traverse (emitCase rns grpr grpn rec ctx) (coerce cs)
   where
     -- Note: this is not really accurate. A default data case needs
     -- stack space corresponding to the actual data that shows up there.
@@ -1294,7 +1459,7 @@ emitSumMatching ::
   EnumMap Word64 ([Mem], ANormal v) ->
   Emit Section
 emitSumMatching rns grpr grpn rec ctx v i cs =
-  MatchW i edf <$> traverse (emitSumCase rns grpr grpn rec ctx v) cs
+  matchW i edf <$> traverse (emitSumCase rns grpr grpn rec ctx v) cs
   where
     edf = Die "uncovered unboxed sum case"
 
@@ -1312,7 +1477,7 @@ emitRequestMatching rns grpr grpn rec ctx hs df = (,) <$> pur <*> tops
   where
     pur = emitCase rns grpr grpn rec ctx ([BX], df)
     tops = traverse f (coerce hs)
-    f cs = TestW edf <$> traverse (emitCase rns grpr grpn rec ctx) cs
+    f cs = testW edf <$> traverse (emitCase rns grpr grpn rec ctx) cs
     edf = Die "unhandled ability"
 
 emitLitMatching ::
@@ -1474,7 +1639,7 @@ branchDeps :: Branch -> [Word64]
 branchDeps (Test1 _ s1 d) = sectionDeps s1 ++ sectionDeps d
 branchDeps (Test2 _ s1 _ s2 d) =
   sectionDeps s1 ++ sectionDeps s2 ++ sectionDeps d
-branchDeps (TestW d m) =
+branchDeps (TestW d _ m) =
   sectionDeps d ++ foldMap sectionDeps m
 branchDeps (TestT d m) =
   sectionDeps d ++ foldMap sectionDeps m
@@ -1483,7 +1648,7 @@ branchTypes :: Branch -> [Word64]
 branchTypes (Test1 _ s1 d) = sectionTypes s1 ++ sectionTypes d
 branchTypes (Test2 _ s1 _ s2 d) =
   sectionTypes s1 ++ sectionTypes s2 ++ sectionTypes d
-branchTypes (TestW d m) =
+branchTypes (TestW d _ m) =
   sectionTypes d ++ foldMap sectionTypes m
 branchTypes (TestT d m) =
   sectionTypes d ++ foldMap sectionTypes m
@@ -1574,7 +1739,7 @@ prettyBranches ind bs =
   case bs of
     Test1 i e df -> pdf df . picase i e
     Test2 i ei j ej df -> pdf df . picase i ei . picase j ej
-    TestW df m ->
+    TestW df _ m ->
       pdf df . foldr (\(i, e) r -> picase i e . r) id (mapToList m)
     TestT df m ->
       pdf df . foldr (\(i, e) r -> ptcase i e . r) id (M.toList m)

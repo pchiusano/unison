@@ -1850,7 +1850,7 @@ selectBranch t (Test2 u cu v cv e)
   | t == u = cu
   | t == v = cv
   | otherwise = e
-selectBranch t (TestW df cs) = lookupWithDefault df t cs
+selectBranch t (TestW _ lookup _) = lookup t
 selectBranch _ (TestT {}) = error "impossible"
 {-# INLINE selectBranch #-}
 
