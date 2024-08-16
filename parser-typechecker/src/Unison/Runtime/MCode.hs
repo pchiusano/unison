@@ -37,7 +37,6 @@ module Unison.Runtime.MCode
   )
 where
 
-import Debug.Trace qualified as Debug
 import Data.Bifunctor (bimap, first)
 import Data.Bits (shiftL, shiftR, (.|.))
 import Data.Coerce
@@ -46,6 +45,7 @@ import Data.Map.Strict qualified as M
 import Data.Primitive.ByteArray
 import Data.Primitive.PrimArray
 import Data.Word (Word16, Word64)
+import Debug.Trace qualified as Debug
 import GHC.Stack (HasCallStack)
 import Unison.ABT.Normalized (pattern TAbss)
 import Unison.Reference (Reference)
@@ -624,32 +624,32 @@ data Branch
       !(M.Map Text Section)
 
 testW :: Section -> EnumMap Word64 Section -> Branch
-testW !df !bs = 
+testW !df !bs =
   case EC.mapToList bs of
-    [] -> TestW df (const df) bs 
-    [(0,_b0)] | Debug.trace "hitting this case (1)" False -> undefined
-    [(0,b0)] ->
+    [] -> TestW df (const df) bs
+    [(0, _b0)] | Debug.trace "hitting this case (1)" False -> undefined
+    [(0, b0)] ->
       TestW df match bs
       where
         match 0 = b0
         match _ = df
-    [(0,_b0), (1,_b1)] | Debug.trace "hitting this case (2)" False -> undefined
-    [(0,b0), (1,b1)] ->
+    [(0, _b0), (1, _b1)] | Debug.trace "hitting this case (2)" False -> undefined
+    [(0, b0), (1, b1)] ->
       TestW df match bs
       where
         match 0 = b0
         match 1 = b1
-        match _ = df 
-    [(0,_b0), (1,_b1), (2,_b2)] | Debug.trace "hitting this case (3)" False -> undefined
-    [(0,b0), (1,b1), (2,b2)] ->
+        match _ = df
+    [(0, _b0), (1, _b1), (2, _b2)] | Debug.trace "hitting this case (3)" False -> undefined
+    [(0, b0), (1, b1), (2, b2)] ->
       TestW df match bs
       where
         match 0 = b0
         match 1 = b1
         match 2 = b2
         match _ = df
-    [(0,_b0), (1,_b1), (2,_b2), (3,_b3)] | Debug.trace "hitting this case (4)" False -> undefined
-    [(0,b0), (1,b1), (2,b2), (3,b3)] ->
+    [(0, _b0), (1, _b1), (2, _b2), (3, _b3)] | Debug.trace "hitting this case (4)" False -> undefined
+    [(0, b0), (1, b1), (2, b2), (3, b3)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -657,8 +657,8 @@ testW !df !bs =
         match 2 = b2
         match 3 = b3
         match _ = df
-    [(0,_b0), (1,_b1), (2,_b2), (3,_b3), (4,_b4)] | Debug.trace "hitting this case (5)" False -> undefined
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4)] ->
+    [(0, _b0), (1, _b1), (2, _b2), (3, _b3), (4, _b4)] | Debug.trace "hitting this case (5)" False -> undefined
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -666,8 +666,8 @@ testW !df !bs =
         match 2 = b2
         match 3 = b3
         match 4 = b4
-        match _ = df 
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5)] ->
+        match _ = df
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -677,7 +677,7 @@ testW !df !bs =
         match 4 = b4
         match 5 = b5
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -688,7 +688,7 @@ testW !df !bs =
         match 5 = b5
         match 6 = b6
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6), (7, b7)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -700,7 +700,7 @@ testW !df !bs =
         match 6 = b6
         match 7 = b7
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6), (7, b7), (8, b8)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -713,7 +713,7 @@ testW !df !bs =
         match 7 = b7
         match 8 = b8
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6), (7, b7), (8, b8), (9, b9)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -727,7 +727,7 @@ testW !df !bs =
         match 8 = b8
         match 9 = b9
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9), (10,b10)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6), (7, b7), (8, b8), (9, b9), (10, b10)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -742,7 +742,7 @@ testW !df !bs =
         match 9 = b9
         match 10 = b10
         match _ = df
-    [(0,b0), (1,b1), (2,b2), (3,b3), (4,b4), (5,b5), (6,b6), (7,b7), (8,b8), (9,b9), (10,b10), (11,b11)] ->
+    [(0, b0), (1, b1), (2, b2), (3, b3), (4, b4), (5, b5), (6, b6), (7, b7), (8, b8), (9, b9), (10, b10), (11, b11)] ->
       TestW df match bs
       where
         match 0 = b0
@@ -771,13 +771,13 @@ instance Ord Branch where
   compare (Test2 a1 b1 c1 d1 e1) (Test2 a2 b2 c2 d2 e2) = compare a1 a2 <> compare b1 b2 <> compare c1 c2 <> compare d1 d2 <> compare e1 e2
   compare (TestW a1 _b1 c1) (TestW a2 _b2 c2) = compare a1 a2 <> compare c1 c2
   compare (TestT a1 b1) (TestT a2 b2) = compare a1 a2 <> compare b1 b2
-  compare b1 b2 = compare (tag b1) (tag b2) 
+  compare b1 b2 = compare (tag b1) (tag b2)
     where
-    tag :: Branch -> Int
-    tag (Test1{}) = 0
-    tag (Test2{}) = 1 
-    tag (TestW{}) = 2
-    tag (TestT{}) = 3
+      tag :: Branch -> Int
+      tag (Test1 {}) = 0
+      tag (Test2 {}) = 1
+      tag (TestW {}) = 2
+      tag (TestT {}) = 3
 
 instance Eq Branch where
   Test1 a1 b1 c1 == Test1 a2 b2 c2 = a1 == a2 && b1 == b2 && c1 == c2
@@ -785,9 +785,10 @@ instance Eq Branch where
   TestW a1 _b1 c1 == TestW a2 _b2 c2 = a1 == a2 && c1 == c2
   TestT a1 b1 == TestT a2 b2 = a1 == a2 && b1 == b2
   _ == _ = False
-    
+
 -- Convenience patterns for matches used in the algorithms below.
 pattern MatchW :: Int -> Section -> EnumMap Word64 Section -> Section
+
 matchW :: Int -> Section -> EnumMap Word64 Section -> Section
 matchW i d cs = Match i (testW d cs)
 
