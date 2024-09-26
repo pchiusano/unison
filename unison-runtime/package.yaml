@@ -26,6 +26,7 @@ executables:
     dependencies:
       - base
       - vector
+      - containers
 
 library:
   source-dirs: src

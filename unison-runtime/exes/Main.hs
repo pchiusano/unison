@@ -5,7 +5,14 @@ import Data.Vector.Primitive.Mutable qualified as UV
 -- import Data.Vector qualified as IV
 import Data.Word (Word64, Word16)
 import System.CPUTime (getCPUTime)
+import Data.IntMap (IntMap)
+import Data.IntMap qualified as IM
 import Text.Printf
+import Data.IORef
+
+countUpTo :: Word64
+countUpTo = 1000 * 1000 * 1000
+-- countUpTo = 1000 * 1000 * 1000
 
 -- | An absolute reference to a code array
 type Ref = Int
@@ -14,8 +21,196 @@ type Ref = Int
 type Slot = Int
 
 -- | A local variable reference, relative to the current stack frame
-type Var = Word16
+type Var = Int
 
+-- currently unused
+data Value = Null | Closure [Word64] [Value] deriving (Eq,Ord,Show)
+
+-- data Frame = Frame { unboxed :: !(UV.IOVector Word64), boxed :: !(V.IOVector Value),  }
+data Stack = 
+  Stack { unboxed :: !(UV.IOVector Word64)
+        , boxed :: !(V.IOVector Value)
+        , tail :: !(IORef Stack)
+        } 
+
+-- is this sufficient? you set the IORef Stack to null when you find matching mark
+-- when reinstating the continuation, you set the Stack to something else  
+-- I think this does it
+newtype MCode2 = MCode2 { interpret :: (
+  IntMap (MCode2, IORef Stack) -> 
+    (UV.IOVector Word64) -> (V.IOVector Value) -> Var -> Stack -> IO () ) }
+-- UV.IOVector Word64 -> V.IOVector Value -> Slot -> Var -> Slot -> IO () 
+  
+data Function2 = Function2 { code2 :: MCode2, varCount :: !Int, arity :: !Int }
+
+main :: IO ()
+main = putStrLn "hi"
+
+let_ :: Var -> MCode2 -> MCode2 -> MCode2
+let_ var expr body = MCode2 go where
+  go handlers unboxed boxed out stack = do
+    interpret expr handlers unboxed boxed var stack
+    interpret body handlers unboxed boxed out stack
+
+return_ :: Var -> MCode2
+return_ var = MCode2 go where
+  go _ unboxed boxed out _stack = do
+    uv <- UV.read unboxed var
+    bv <- V.read boxed var 
+    UV.write unboxed out uv
+    V.write boxed out bv
+
+nat :: Word64 -> MCode2
+nat n = MCode2 go where
+  go _ unboxed boxed out _stack = do
+    UV.write unboxed out n
+    V.write boxed out Null
+
+if_ :: Var -> MCode2 -> MCode2 -> MCode2
+if_ var true false = MCode2 go where
+  go handlers unboxed boxed out stack = do 
+    cond <- UV.read unboxed var 
+    if cond /= 0 then interpret true handlers unboxed boxed out stack
+    else interpret false handlers unboxed boxed out stack
+
+trace :: String -> Var -> MCode2
+trace msg var = MCode2 go where
+  go _handlers unboxed boxed _out _stack = do
+    uv <- UV.read unboxed var 
+    bv <- V.read boxed var 
+    putStrLn (msg ++ ": " <> show (uv, bv))
+
+time :: IO t -> IO t
+time a = do
+  start <- getCPUTime
+  v <- a
+  end <- getCPUTime
+  let diff = fromIntegral (end - start) / 1e12
+  printf "Computation time  : %0.3f sec\n" (diff :: Double)
+  printf "Ops / s (millions): %0.3f \n" (fromIntegral countUpTo * (1 / diff :: Double) / 1e6)
+  return v
+
+{-
+main :: IO ()
+main = do
+  {-
+  prog acc rem = 
+    if rem == 0 then printLine acc 
+    else 
+      acc' = increment acc
+      rem' = decrement rem
+      prog acc' rem'
+  -}
+  run2 prog'
+  where
+    prog' = let_ 1 (nat 0) (let_ 2 (nat countUpTo) (let_ 3 (call fn [1,2]) (trace "result" 3)))
+    fn = Function2 go 2 4
+    go = 
+      let
+        acc = 0
+        rem = 1
+        acc' = 2
+        rem' = 3
+      in
+        if_ rem 
+          (let_ acc' (call natIncrement [acc]) 
+            $ let_ rem' (call natDecrement [rem])
+            $ tailcall fn [acc', rem'])
+          (return_ acc) 
+
+-- what about handlers?
+-- we have a stack of handlers which are installed at various positions
+-- this is another argument to MCode2
+-- we find the appropriate handler, then copy the stack with a memcopy
+-- then invoke the handler - the continuation is basically a region of the stack 
+-- when resuming the continuation, that just copies that region back onto the stack
+-- inefficiency is due to the fact that the handler itself probably just needed a tiny
+-- bit of stack
+-- if at handle site you just leave a bit of a gap then you're good?
+-- another option is to make the stack "append only"
+-- that is, allocate call frames on the heap, they have (say) 16 slots by default
+-- no copying happens when you make a request, because the handler just forks the stack
+-- and the continuation something something 
+
+tailcall :: Function2 -> [Var] -> MCode2
+tailcall (Function2 code arity) [a, b] = 
+  if arity == 2 then exact
+  else undefined
+  where 
+    staged = code id 
+    exact !unboxed !boxed !framePtr !_maxVar !_ = do
+      au <- UV.read unboxed (framePtr - fromIntegral a)
+      ab <- V.read boxed (framePtr - fromIntegral a)
+      bu <- UV.read unboxed (framePtr - fromIntegral b)
+      bb <- V.read boxed (framePtr - fromIntegral b)
+      let aslot = framePtr - 1 
+      let bslot = framePtr - 2
+      UV.write unboxed aslot au
+      UV.write unboxed bslot bu
+      V.write boxed aslot ab
+      V.write boxed bslot bb
+      staged unboxed boxed framePtr 2 framePtr
+tailcall (Function2 code arity) [a] = 
+  if arity == 1 then exact
+  else undefined
+  where 
+    staged = code id
+    exact !unboxed !boxed !framePtr !_maxVar !_ = do
+      au <- UV.read unboxed (framePtr - fromIntegral a)
+      ab <- V.read boxed (framePtr - fromIntegral a)
+      let aslot = framePtr - 1 
+      UV.write unboxed aslot au
+      V.write boxed aslot ab
+      staged unboxed boxed framePtr 1 framePtr
+tailcall _ _ = undefined
+
+call :: Function2 -> [Var] -> MCode2
+call (Function2 code arity) [a, b] = 
+  if arity == 2 then code args 
+  else undefined
+  where args 1 = a
+        args 2 = b
+        args _ = error "variable out of range"
+call (Function2 code arity) [a] = 
+  if arity == 1 then code (const a)
+  else error "arity mismatch in call"
+call _ _ = undefined
+
+natDecrement :: Function2
+natDecrement = Function2 code 1 
+  where
+    code varmap = go
+      where
+      !var = fromIntegral (varmap 1)
+      go unboxed boxed framePtr _ out = do 
+        au <- UV.read unboxed (framePtr - var)
+        UV.write unboxed out (au - 1)
+        V.write boxed out Null
+
+natPlus :: Function2
+natPlus = Function2 code 2 
+  where
+    code varmap = go
+      where
+      !var1 = fromIntegral (varmap 1)
+      !var2 = fromIntegral (varmap 2)
+      go unboxed boxed framePtr _ out = do 
+        au <- UV.read unboxed (framePtr - var1)
+        bu <- UV.read unboxed (framePtr - var2)
+        UV.write unboxed out (au + bu)
+        V.write boxed out Null
+
+natIncrement :: Function2
+natIncrement = Function2 code 1 
+  where
+    code varmap = go
+      where
+      !var = fromIntegral (varmap 1)
+      go unboxed boxed framePtr _ out = do 
+        au <- UV.read unboxed (framePtr - var)
+        UV.write unboxed out (au + 1)
+        V.write boxed out Null
+  
 {-
 Machine code representation.
 Uses a register-based VM with an infinite number of registers.
@@ -33,35 +228,17 @@ data MCode ref
 
 data Function = Function { code :: !(MCode Function), arity :: !Int }
 
--- currently unused
-data Value = Null | Closure [Word64] [Value] deriving (Eq,Ord,Show)
 
-main :: IO ()
-main = do
-  {-
-  prog acc rem = 
-    if rem == 0 then printLine acc 
-    else 
-      acc' = increment acc
-      rem' = decrement rem
-      prog acc' rem'
-  -}
-  let fn = Function (If0 2 (Print 1) (Let 3 (NatIncrement 1) $ Let 4 (NatDecrement 2) $ TailCall fn 3 4)) 2
-  let prog = Let 1 (Nat 0) (Let 2 (Nat countUpTo) (TailCall fn 1 2))
-  run prog
 
-countUpTo :: Word64
-countUpTo = 1000 * 1000 * 1000
+run2 :: MCode2 -> IO ()
+run2 prog = do  
+  let n = 1024
+  boxed <- V.replicate n Null 
+  unboxed <- UV.replicate n 0 
+  time $ prog unboxed boxed (n - 1) 0 (n - 1)
 
-time :: IO t -> IO t
-time a = do
-  start <- getCPUTime
-  v <- a
-  end <- getCPUTime
-  let diff = fromIntegral (end - start) / 1e12
-  printf "Computation time  : %0.3f sec\n" (diff :: Double)
-  printf "Ops / s (millions): %0.3f \n" (fromIntegral countUpTo * (1 / diff :: Double) / 1e6)
-  return v
+
+
 
 run :: MCode Function -> IO ()
 run prog = do 
@@ -145,3 +322,4 @@ run prog = do
           au <- UV.read unboxed (framePtr - fromIntegral a)
           ab <- V.read boxed (framePtr - fromIntegral a)
           putStrLn (show (au, ab))
+-}
