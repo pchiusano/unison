@@ -824,8 +824,8 @@ arity1Branches bs = [([pat], guard, body) | MatchCase pat guard body <- bs]
 --   Foo x y, [x,y], [(blah1 x, body1), (blah2 y, body2)]
 groupCases ::
   (Ord v) =>
-  [MatchCase' () (Term3 v ann)] ->
-  [([Pattern ()], [v], [(Maybe (Term3 v ann), ([v], Term3 v ann))])]
+  [MatchCase' () (Term3 v PrintAnnotation)] ->
+  [([Pattern ()], [v], [(Maybe (Term3 v PrintAnnotation), ([v], Term3 v PrintAnnotation))])]
 groupCases = \cases
   [] -> []
   ms@((p1, _, AbsN' vs1 _) : _) -> go (p1, vs1) [] ms
@@ -1986,9 +1986,11 @@ prettyDoc2 ac tm = do
             name' <- rec name
             target' <- rec target
             pure $ PP.group $ "[" <> name' <> "](" <> target' <> ")"
-        (toDocLink env.ppe -> Just e) -> pure . PP.group $ case e of
-          Left r -> "{type " <> tyName r <> "}"
-          Right r -> "{" <> tmName r <> "}"
+        (toDocLink env.ppe -> Just e) -> PP.group <$> case e of
+          Left r -> pure $ "{type " <> tyName r <> "}"
+          Right r -> do
+            inner <- pretty0 ac r
+            pure $ "{" <> inner <> "}"
         (toDocEval env.ppe -> Just tm) ->
           do
             inner <- pretty0 ac tm
@@ -2009,16 +2011,18 @@ prettyDoc2 ac tm = do
             pure $ PP.lines ["@typecheck " <> fence, inner, fence]
           where
             ac' = ac {elideUnit = True}
-        (toDocSource env.ppe -> Just es) ->
-          pure . PP.group $ "    @source{" <> intercalateMap ", " go es <> "}"
+        (toDocSource env.ppe -> Just es) -> do
+          inner <- traverse go es
+          pure . PP.group $ "    @source{" <> intercalateMap ", " id inner <> "}"
           where
-            go (Left r, _anns) = "type " <> tyName r
-            go (Right r, _anns) = tmName r
-        (toDocFoldedSource env.ppe -> Just es) ->
-          pure . PP.group $ "    @foldedSource{" <> intercalateMap ", " go es <> "}"
+            go (Left r, _anns) = pure $ "type " <> tyName r
+            go (Right r, _anns) = pretty0 ac r
+        (toDocFoldedSource env.ppe -> Just es) -> do
+          inner <- traverse go es
+          pure . PP.group $ "    @foldedSource{" <> intercalateMap ", " id inner <> "}"
           where
-            go (Left r, _anns) = "type " <> tyName r
-            go (Right r, _anns) = tmName r
+            go (Left r, _anns) = pure $ "type " <> tyName r
+            go (Right r, _anns) = pretty0 ac r
         (toDocSignatureInline env.ppe -> Just tm) ->
           pure . PP.group $ "@inlineSignature{" <> tmName tm <> "}"
         (toDocSignature env.ppe -> Just tms) ->
@@ -2153,7 +2157,7 @@ toDocTransclude ppe (App' (Ref' r) tm)
   | nameEndsWith ppe ".docTransclude" r = Just tm
 toDocTransclude _ _ = Nothing
 
-toDocLink :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe (Either Reference Referent)
+toDocLink :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe (Either Reference (Term3 v PrintAnnotation))
 toDocLink ppe (App' (Ref' r) tm)
   | nameEndsWith ppe ".docLink" r = case tm of
       (toDocEmbedTermLink ppe -> Just tm) -> Just (Right tm)
@@ -2181,8 +2185,8 @@ toDocParagraph ppe (App' (Ref' r) (List' tms))
   | nameEndsWith ppe ".docParagraph" r = Just (toList tms)
 toDocParagraph _ _ = Nothing
 
-toDocEmbedTermLink :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe Referent
-toDocEmbedTermLink ppe (App' (Ref' r) (DDelay' (Referent' tm)))
+toDocEmbedTermLink :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe (Term3 v PrintAnnotation)
+toDocEmbedTermLink ppe (App' (Ref' r) (DDelay' tm))
   | nameEndsWith ppe ".docEmbedTermLink" r = Just tm
 toDocEmbedTermLink _ _ = Nothing
 
@@ -2194,7 +2198,7 @@ toDocEmbedTypeLink _ _ = Nothing
 toDocSourceAnnotations :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe [Referent]
 toDocSourceAnnotations _ppe _tm = Just [] -- todo fetch annotations
 
-toDocSourceElement :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe (Either Reference Referent, [Referent])
+toDocSourceElement :: (Var v) => PrettyPrintEnv -> Term3 v PrintAnnotation -> Maybe (Either Reference (Term3 v PrintAnnotation), [Referent])
 toDocSourceElement ppe (Apps' (Ref' r) [tm, toDocSourceAnnotations ppe -> Just annotations])
   | nameEndsWith ppe ".docSourceElement" r =
       (,annotations) <$> ok tm
@@ -2209,7 +2213,7 @@ toDocSource' ::
   Text ->
   PrettyPrintEnv ->
   Term3 v PrintAnnotation ->
-  Maybe [(Either Reference Referent, [Referent])]
+  Maybe [(Either Reference (Term3 v PrintAnnotation), [Referent])]
 toDocSource' suffix ppe (App' (Ref' r) (List' tms))
   | nameEndsWith ppe suffix r =
       case [tm | Just tm <- toDocSourceElement ppe <$> toList tms] of
@@ -2222,7 +2226,7 @@ toDocSource,
     (Var v) =>
     PrettyPrintEnv ->
     Term3 v PrintAnnotation ->
-    Maybe [(Either Reference Referent, [Referent])]
+    Maybe [(Either Reference (Term3 v PrintAnnotation), [Referent])]
 toDocSource = toDocSource' ".docSource"
 toDocFoldedSource = toDocSource' ".docFoldedSource"
 
