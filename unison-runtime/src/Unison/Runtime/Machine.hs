@@ -49,7 +49,7 @@ import Foreign.LibFFI.Internal
 import Foreign.Marshal (alloca)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr
-import Unison.Runtime.JIT (jitCompileGroup)
+import Unison.Runtime.JIT (jitCompileGroup, printJITStats)
 import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.Frames
@@ -951,7 +951,10 @@ runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
           if status == statusError
             then die [] "native code reported an error"
             else do
-              when (JIT.stats JIT.config) (countExit status)
+              when (JIT.stats JIT.config) $ do
+                total <- countExit status
+                let every = JIT.statsEvery JIT.config
+                when (every > 0 && total `mod` every == 0) printJITStats
               -- Records are written innermost caller first; K has the
               -- innermost frame on top, so build from the last record.
               k <- foldM pushRecord k (reverse records)
@@ -972,6 +975,28 @@ runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
         when (JIT.trace JIT.config) $ JIT.jitDump "reenter"
         Conc.yield
         again cell stk k
+      -- The interpreter runs one instruction, then native code continues
+      -- after it, with whatever the instruction did to the handler
+      -- environment and K. The exception case is eval's, except that the
+      -- handler's continuation can be native too.
+      CallOut cix instr rest n cell -> do
+        when (JIT.trace JIT.config) $ JIT.jitDump ("call out " ++ show cix ++ " for " ++ show instr)
+        code <- readNativeCode cell
+        let cell' = if n == 1 then cell else noNativeCell
+        exec env henv activeThreads stk k cix instr >>= \case
+          (exception, henv, !stk', !k')
+            | exception -> do
+                eh <- resolveExceptionHandler henv
+                fv <- peek stk'
+                bpoke stk' $ Data1 exceptionRef TT.exceptionRaiseTag fv
+                (stk', fsz, asz) <- saveFrame stk'
+                let kk = Push fsz asz fakeCix 10 rest cell' k'
+                apply yld env henv activeThreads stk' kk False (VArg1 0) eh
+            | code /= nullPtr, sp stk' == sp stk + n, fp stk' == fp stk ->
+                runNative yld env henv activeThreads stk' k' (castPtrToFunPtr code)
+            | otherwise -> do
+                when (JIT.trace JIT.config) $ JIT.jitDump ("  no re-entry: pushed " ++ show (sp stk' - sp stk) ++ ", expected " ++ show n ++ "; fp " ++ show (fp stk, fp stk') ++ ", code " ++ show code)
+                eval yld env henv activeThreads stk' k' cix rest
     -- The exit says which function to call again. It is the one that took
     -- the exit, which after tail calls need not be the one entered here.
     again cell stk k = do
@@ -1032,13 +1057,21 @@ apply !yld env henv !activeThreads !stk !k !ck !args !val =
   case val of
     BoxedVal (PAp cix comb seg) ->
       case comb of
-        LamI a f entry _
+        LamI a f entry cell
           | ck || a <= ac -> do
               stk <- ensure stk f
               stk <- moveArgs stk args
               stk <- dumpSeg stk seg A
               stk <- acceptArgs stk a
-              eval yld env henv activeThreads stk k cix entry
+              native <- readNativeCode cell
+              if native == nullPtr || "apply" `elem` JIT.disabled JIT.config
+                then do
+                  bumpNativeCount cell
+                  eval yld env henv activeThreads stk k cix entry
+                else do
+                  when (JIT.trace JIT.config) $
+                    JIT.jitDump ("apply native " ++ show cix ++ " arity " ++ show a ++ " stack " ++ show stk)
+                  runNative yld env henv activeThreads stk k (castPtrToFunPtr native)
           | otherwise -> do
               seg <- closeArgs C stk seg args
               stk <- discardFrame =<< frameArgs stk

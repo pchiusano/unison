@@ -96,7 +96,7 @@ data Exit
 
 `Resume` is straightforward, it's just interpreted code to run on resume. `CallOut` is needed so that a single exit in the middle of a function doesn't cause the whole rest of the function to run interpreted. 
 
-`CallOut` only applies to instructions (`GInstr`), which the interpreter runs with `exec`. Function calls (`App`, `Call`) are sections, not instructions, and they never need a call-out:
+`CallOut` only applies to instructions (`GInstr`), which the interpreter runs with `exec`. It applies to *every* instruction native code has no version of, not to a chosen list: `exec` returns everything the interpreter would carry on with (the stack, the handler environment and `K`), native code depends only on the stack, and the trampoline hands the rest back untouched. So `ForeignCall`, the primitives without a native version, `Reset` and the affine and dynamic-scope operations are all call-outs. The two exceptions are `Capture` and `Discard`, which cut the stack back to a mark rather than push onto it; those resume in the interpreter. The re-entry function is generated for a fixed number of pushed values (MCode doesn't record it, so the code generator keeps a table, `pushCount`), and the trampoline checks the stack pointer moved by exactly that much before re-entering; if not, it resumes instead, so a wrong table entry costs time, never correctness. Function calls (`App`, `Call`) are sections, not instructions, and they never need a call-out:
 
 * A call in a `Let` binding that native code can't make itself: write a frame record for the `Let` body (see [On dynamically constructing `K` frames](#on-dynamically-constructing-k-frames)), then `Resume` at the binding. When the callee returns, `yield` pops that frame, finds the [re-entry point](#re-entry-points) for that `Let`, and goes back into native code.
 * A call in tail position: `Resume` at the `App` or `Call` section. Nothing of the current function is left to run.
@@ -105,8 +105,8 @@ Both of these rely on [re-entry points](#re-entry-points), described below: ways
 
 | Situation | Exit kind |
 | --- | --- |
-| `ForeignCall`, uncompiled `Prim1`/`Prim2` | call-out, re-enter after the instruction |
-| Unsupported control instruction (`Capture`, `Reset`, `Jump`, `RMatch`, affine and dynamic-scope operations, …) | resume at the section starting at that instruction |
+| Any instruction without a native version: `ForeignCall`, uncompiled `Prim1`/`Prim2`, `Reset`, affine and dynamic-scope operations, … | call-out, re-enter after the instruction |
+| Unsupported control *section* (`Jump`, `RMatch`, `Die`, …), or `Capture` / `Discard` | resume at that section |
 | A call native code can't make, in a `Let` binding: the callee isn't compiled, or it's an `App` of a function value in one of the [cases left to the interpreter](#calling-function-values) | record the `Push` frame for the `Let` body, resume at the binding. Native code is re-entered at the `Let` body when the callee returns. |
 | The same, in tail position | resume at the `App` / `Call` section |
 | Unison stack needs to grow | `GrowStack`: the function exits at its entry check, before doing anything else. The interpreter grows the stack and calls the same function again. See [Stack guards](#stack-guards). |
@@ -143,9 +143,10 @@ Properties of re-entry points:
 
 - **Each one is a `UnisonNativeFn`.** It starts by reading its locals from the Unison stack slots, which is always possible because of [the core rule](#entering-and-exiting-native-code), and begins with the same [stack check](#stack-guards) as any native function.
 - **No code is duplicated.** The code after a call-out lives only in the re-entry function. For a non-tail call, the normal path continues into the same code the re-entry point leads to.
-- **Only `Let`s whose binding is a call have one.** A `Let` that binds the result of arithmetic or a constructor is compiled inline.
+- **Only `Let`s whose binding is a call have one.** A `Let` that binds the result of arithmetic, a constructor or a conditional is compiled inline.
+- **Inside an inline binding, a re-entry point is generated with a *frame base*.** When native code exits from inside an inline binding, its frame records describe the interpreter's picture: a fresh frame for the binding, starting at the binding's base, and a `Push` frame for the body. Code that re-enters there is therefore generated in that picture: entered with the interpreter's frame pointer at the base, it recovers the function's own frame pointer by subtracting the base, writes records only for bindings nested inside, and the binding's own `Yield` is a return, which lets the interpreter pop the `Push` frame and run the body. Nothing else changes: slot offsets stay relative to the function's frame. The same mechanism gives a `Let` nested inside an inline binding its re-entry point, which the body combinator's own code can't provide (its arity counts the enclosing function's slots).
 - **They're optional.** A `Let` with no re-entry point is resumed in the interpreter, which is always correct. So they can be added gradually.
-- **Native code never looks one up;** only the interpreter does. A call-out's re-entry point is stored in its `Exit`. A `Let`'s re-entry point is the native code of the `Let` body's own combinator: the MCode emitter already makes every `Let` body a combinator whose arguments are the whole frame, so calling it is resuming at the body. Its [native code cell](#native-code-cells) is carried by the `Let` node and by the `Push` frame, and `yield` checks it with one load when it pops the frame.
+- **Native code never looks one up;** only the interpreter does. A call-out's re-entry point is a cell held by its `Exit` (a cell rather than a bare pointer because the re-entry function can itself exit with `GrowStack` or `Reenter`, which say "call this function again"). A `Let`'s re-entry point is the native code of the `Let` body's own combinator: the MCode emitter already makes every `Let` body a combinator whose arguments are the whole frame, so calling it is resuming at the body. Its [native code cell](#native-code-cells) is carried by the `Let` node and by the `Push` frame, and `yield` checks it with one load when it pops the frame.
 
 #### Native code cells
 
@@ -190,7 +191,7 @@ In each case it's one load and a test for null. If the cell is null, the interpr
 
 **Why not a table.** An earlier version of this design kept function pointers in a global table indexed by a number assigned to each supercombinator. A `CombIx` can't be the index: it's a `Reference`, a number for the top-level definition, and a bit-packed section number that's mostly gaps. So the JIT would have needed its own numbering, and a table layout that could grow while other threads read it. Cells need neither, and a lookup is one load where the table needed two.
 
-**What doesn't get a cell.** [Re-entry points](#re-entry-points) after call-outs, since native code never calls one by looking it up. The existing compiler also creates a `GCombInfo` for each `Let` body; its cell is the `Let`'s re-entry point.
+**Cells for re-entry points.** The existing compiler creates a `GCombInfo` for each `Let` body, and its cell is the `Let`'s re-entry point. The other re-entry points (after call-outs, and for `Let`s inside inline bindings) are auxiliary functions in the same module as their function; the JIT allocates a cell for each when it compiles the module, and the exit or frame-table entry that leads there holds it.
 
 **Cost.** `GCombInfo` is unpacked into every partial application closure, so each of those grows by one word.
 
@@ -286,7 +287,7 @@ If it finds native code, the interpreter sets up the call exactly as it would fo
 | exit index of a `Resume` | Continue interpreting at the recorded section. |
 | exit index of a `Reenter` | Nothing, beyond being back in Haskell, where the runtime can switch threads or run a GC. Then go back to step 1 with the same function. |
 | exit index of a `GrowStack` | Grow the Unison stack with the interpreter's `ensure`, then go back to step 1 with the same function. |
-| exit index of a `CallOut` | Run the one recorded instruction with the interpreter's `exec`. Then go back to step 1 with the re-entry function, so the rest of the function runs natively. If the instruction raised an exception, don't re-enter: route it to the current exception handler, as the interpreter does for that instruction. |
+| exit index of a `CallOut` | Run the one recorded instruction with the interpreter's `exec`. Then go back to step 1 with the re-entry function, so the rest of the function runs natively. If the instruction raised an exception, don't re-enter: route it to the current exception handler, as the interpreter does for that instruction (the handler's continuation is the re-entry function, so the rest of the function is still native afterwards). |
 | `EXIT_ERROR` | Read the error details from `Ctx` and throw the Haskell exception the interpreter would have thrown. |
 
 **Properties worth noting.**
@@ -312,11 +313,15 @@ Higher-order code is everywhere in Unison, so native code has to be able to call
 
 1. Check that the value is a `GPAp`. This is a test on the pointer's tag bits.
 2. Read the arity and the number of captured arguments.
-3. If captured plus supplied equals the arity, the call is exactly saturated. Copy the captured arguments onto the Unison stack, followed by the supplied ones, in the layout the interpreter would produce.
+3. If captured plus supplied equals the arity, the call is exactly saturated. Copy the supplied arguments onto the Unison stack, then the captured ones above them, which is the layout the interpreter's `apply` produces.
 4. Read the address of the native code cell from the closure's `GCombInfo`, and load the function pointer from the cell.
 5. Call it like any other native function: a tail call if the `App` is in tail position, and otherwise a call followed by the status check.
 
 Compared to a call to a known function, this adds a few loads and compares.
+
+The interpreter's side of the same thing: when the interpreter applies a function value itself (`apply` on a `GPAp`), it checks the callee's cell just as `enter` does for a known callee, so a compiled function is entered natively however it was reached.
+
+**A known combinator used as a value** (`App (Env f)` with no arguments, which is how a lambda becomes a closure) is a `GPAp` with nothing captured: a constant, kept in the [pool](#appendix-the-constant-pool) and built once.
 
 **What still exits to the interpreter.**
 
@@ -399,7 +404,7 @@ Native code does this once per return to Haskell, not once per write. No GC can 
 - Before returning to Haskell (on `OK`, an exit or an error), set the array's header to `stg_MUT_ARR_PTRS_DIRTY_info` and mark every card covering the slots native code could have written: from the `ap` it was entered with, up to the highest `sp` it reached. That's usually one or two bytes.
 - This lives in one place, the wrapper's return path or a small helper it calls, which keeps it off the fast path and makes it easy to test.
 
-`ustk` holds no pointers and needs no barrier. Other mutable objects native code writes to need their own: `Ref.write` on a `MutVar` must do what `dirty_MUT_VAR` does, which includes adding it to the mutable list. Marking the header and cards has been tested and is sufficient on GHC 9.10.3: with it, the debug runtime's heap sanity checks pass, and without it they fail (see the runtime spike in `jit-spikes/runtime`). One thing still to verify: that the non-moving collector, which needs a different barrier, isn't in use.
+`ustk` holds no pointers and needs no barrier. Other mutable objects native code writes to need their own: `Ref.write` on a `MutVar` calls a C helper that stores the value and then calls the runtime's `dirty_MUT_VAR`, exactly as compiled Haskell does (it moves a clean variable onto the mutable list); `MutableArray.write` stores, sets the array's info pointer to the dirty one and marks the card, again as compiled Haskell does, with no runtime call. Marking the header and cards has been tested and is sufficient on GHC 9.10.3: with it, the debug runtime's heap sanity checks pass, and without it they fail (see the runtime spike in `jit-spikes/runtime`). One thing still to verify: that the non-moving collector, which needs a different barrier, isn't in use.
 
 **Why the allocation budget is required, not just polite.** The allocation budget is checked by the [preemption](#preemption) poll. `allocate` takes blocks from the nursery, and once the nursery is empty it takes fresh blocks from the block allocator without limit. GC is only triggered when a *Haskell* heap check fails after the nursery is exhausted; nothing native code does triggers one, and a null `HpLim` on its own is treated by the scheduler as a context switch, not as a GC request. So the budget is what bounds memory growth: after a budget exit, the interpreter's own allocation (the trampoline allocates `K` frames and `Stack` records) hits a heap check within a block or so, and the GC runs. This needs an explicit test: a native loop that allocates heavily must show bounded resident memory and regular GCs.
 

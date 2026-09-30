@@ -723,3 +723,212 @@ scratch/main> run refTest
 
   49995000
 ```
+
+## Call-outs
+
+Instructions native code has no version of are run by the interpreter, which then re-enters
+native code after them. A foreign call that fails goes to the current `Exception` handler
+instead, and a call-out inside an inline `let` binding re-enters in the middle of that binding.
+A `let` inside such a binding gets its own re-entry point too.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+catchFailure : '{IO, Exception} a ->{IO} Either Text a
+catchFailure c = handle c() with cases
+  { a } -> Right a
+  { Exception.raise f -> _ } -> match f with Failure _ msg _ -> Left msg
+
+readPlus : MutableArray {IO} Nat -> Nat ->{IO, Exception} Nat
+readPlus arr i = MutableArray.read arr i + 1
+
+catching : '{IO} (Either Text Nat, Either Text Nat)
+catching = do
+  arr = IO.arrayOf 7 3
+  (catchFailure '(readPlus arr 1), catchFailure '(readPlus arr 5))
+
+callOutInBinding : Nat ->{IO} Nat
+callOutInBinding n =
+  r = IO.ref n
+  x = if n == 0 then 1 else Ref.read r + 1
+  y = if x > 100 then Ref.read r else x * 2
+  y + 1
+
+callOutTest : '{IO} (Nat, Nat, Nat)
+callOutTest = do (callOutInBinding 0, callOutInBinding 20, callOutInBinding 200)
+
+sizePlus : Nat -> Nat
+sizePlus n = Text.size (Nat.toText n) + n
+
+letInIf : Nat -> Nat
+letInIf n =
+  x = if n > 0 then
+        y = sizePlus n
+        y + 1
+      else 0
+  x * 2
+
+> (letInIf 0, letInIf 41)
+
+fill : MutableArray {IO} Nat -> Nat ->{IO, Exception} ()
+fill arr i =
+  if Nat.eq i (MutableArray.size arr) then ()
+  else
+    MutableArray.write arr i (i * i)
+    fill arr (i + 1)
+
+sumArr : MutableArray {IO} Nat -> Nat -> Nat ->{IO, Exception} Nat
+sumArr arr i acc =
+  if Nat.eq i (MutableArray.size arr) then acc
+  else sumArr arr (i + 1) (acc + MutableArray.read arr i)
+
+arrayTest : '{IO} (Either Text Nat, Either Text Nat, Either Text ())
+arrayTest = do
+  arr = IO.arrayOf 0 1000
+  (catchFailure do
+     fill arr 0
+     sumArr arr 0 0,
+   catchFailure '(MutableArray.read arr 1000),
+   catchFailure '(MutableArray.write arr 1000 7))
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + arrayTest        : '{IO} ( Either Text Nat,
+                         Either Text Nat,
+                         Either Text ())
+  + callOutInBinding : Nat ->{IO} Nat
+  + callOutTest      : '{IO} (Nat, Nat, Nat)
+  + catchFailure     : '{IO, Exception} a ->{IO} Either Text a
+  + catching         : '{IO} (Either Text Nat, Either Text Nat)
+  + fill             : MutableArray {IO} Nat
+                       -> Nat
+                       ->{IO, Exception} ()
+  + letInIf          : Nat -> Nat
+  + readPlus         : MutableArray {IO} Nat
+                       -> Nat
+                       ->{IO, Exception} Nat
+  + sizePlus         : Nat -> Nat
+  + sumArr           : MutableArray {IO} Nat
+                       -> Nat
+                       -> Nat
+                       ->{IO, Exception} Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    37 | > (letInIf 0, letInIf 41)
+           ⧩
+           (0, 88)
+```
+
+``` ucm
+scratch/main> run catching
+
+  (Right 8, Left "MutableArray.read: array index out of bounds")
+
+scratch/main> run callOutTest
+
+  (3, 43, 201)
+
+scratch/main> run arrayTest
+
+  ( Right 332833500
+  , Left "MutableArray.read: array index out of bounds"
+  , Left "MutableArray.write: array index out of bounds"
+  )
+```
+
+## Function values
+
+A call to a function value is native when the value is a closure with compiled code and the
+call is exactly saturated. Over-application (`mk 1 2`, where `mk 1` returns a function) and
+under-application (`adder 5`, which builds a closure) are left to the interpreter.
+
+``` unison
+use Nat + - * / < > <= >=
+
+applyN : Nat -> (a -> a) -> a -> a
+applyN n f a = if Nat.eq n 0 then a else applyN (Nat.drop n 1) f (f a)
+
+twice : (Nat -> Nat) -> Nat -> Nat
+twice f x =
+  y = f x
+  f y
+
+adder : Nat -> Nat -> Nat
+adder k x = x + k
+
+mk : Nat -> (Nat -> Nat)
+mk k = adder (k * 10)
+
+compose2 : (Nat -> Nat) -> (Nat -> Nat) -> Nat -> Nat
+compose2 f g x = f (g x)
+
+sumWith : (Nat -> Nat) -> Nat -> Nat
+sumWith f n =
+  go acc i = if Nat.eq i n then acc else go (acc + f i) (i + 1)
+  go 0 0
+
+> applyN 10000 (x -> x + 3) 0
+> twice (adder 5) 10
+> applyN 3 (adder 7) 1
+> compose2 (adder 1) (adder 2) 3
+> applyN 5 (twice (adder 1)) 0
+> mk 1 2
+> applyN 4 (mk 2) 0
+> sumWith (x -> x * x) 100
+> sumWith (compose2 (mk 1) (adder 1)) 10
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + adder    : Nat -> Nat -> Nat
+  + applyN   : Nat -> (a ->{g} a) -> a ->{g} a
+  + compose2 : (Nat ->{g1} Nat)
+               -> (Nat ->{g} Nat)
+               -> Nat
+               ->{g, g1} Nat
+  + mk       : Nat -> Nat -> Nat
+  + sumWith  : (Nat ->{g} Nat) -> Nat ->{g} Nat
+  + twice    : (Nat ->{g} Nat) -> Nat ->{g} Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    25 | > applyN 10000 (x -> x + 3) 0
+           ⧩
+           30000
+
+    26 | > twice (adder 5) 10
+           ⧩
+           20
+
+    27 | > applyN 3 (adder 7) 1
+           ⧩
+           22
+
+    28 | > compose2 (adder 1) (adder 2) 3
+           ⧩
+           6
+
+    29 | > applyN 5 (twice (adder 1)) 0
+           ⧩
+           10
+
+    30 | > mk 1 2
+           ⧩
+           12
+
+    31 | > applyN 4 (mk 2) 0
+           ⧩
+           80
+
+    32 | > sumWith (x -> x * x) 100
+           ⧩
+           328350
+
+    33 | > sumWith (compose2 (mk 1) (adder 1)) 10
+           ⧩
+           155
+```

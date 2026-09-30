@@ -4,6 +4,7 @@ module Unison.Runtime.JIT.Exits
   ( Exit (..),
     ExitIndex,
     registerExits,
+    replaceExits,
     lookupExit,
     countExit,
     exitCounts,
@@ -15,7 +16,7 @@ import Data.IntMap.Strict qualified as IM
 import System.IO.Unsafe (unsafePerformIO)
 import Foreign.Ptr (Ptr)
 import Unison.Runtime.MCode (CombIx, NativeCell)
-import Unison.Runtime.Machine.Types (MSection)
+import Unison.Runtime.Machine.Types (MInstr, MSection)
 
 data Exit
   = -- | interpret from this section of this combinator
@@ -27,6 +28,11 @@ data Exit
   | -- | the runtime asked the thread to stop; call the function whose
     -- cell this is again when the thread next runs
     Reenter !(Ptr NativeCell)
+  | -- | run this instruction with the interpreter (it pushes the given
+    -- number of values), then call the function in this cell, which
+    -- continues with the section after it. If the instruction pushed a
+    -- different number of values, interpret that section instead.
+    CallOut !CombIx !MInstr !MSection !Int !(Ptr NativeCell)
   | -- | a description, for statistics
     Named String Exit
 
@@ -46,6 +52,13 @@ registerExits exits = atomicModifyIORef' table $ \(Table next m c) ->
   let n = length exits
    in (Table (next + n) (m <> IM.fromList (zip [next ..] exits)) c, next)
 
+-- | Overwrites exits registered earlier, starting at the given index: the
+-- second code generation pass produces the final ones (with the cells of
+-- the auxiliary functions), the first only their number.
+replaceExits :: ExitIndex -> [Exit] -> IO ()
+replaceExits base exits = atomicModifyIORef' table $ \(Table next m c) ->
+  (Table next (IM.fromList (zip [base ..] exits) <> m) c, ())
+
 lookupExit :: ExitIndex -> IO Exit
 lookupExit i = do
   Table _ m _ <- readIORef table
@@ -53,8 +66,10 @@ lookupExit i = do
     Just e -> pure e
     Nothing -> error ("JIT: unknown exit index " ++ show i)
 
-countExit :: ExitIndex -> IO ()
-countExit i = atomicModifyIORef' table $ \(Table n m c) -> (Table n m (IM.insertWith (+) i 1 c), ())
+-- | Counts an exit; gives the total taken so far.
+countExit :: ExitIndex -> IO Int
+countExit i = atomicModifyIORef' table $ \(Table n m c) ->
+  let c' = IM.insertWith (+) i 1 c in (Table n m c', sum (IM.elems c'))
 
 -- | Every exit that has been taken, with its count.
 exitCounts :: IO [(ExitIndex, Exit, Int)]

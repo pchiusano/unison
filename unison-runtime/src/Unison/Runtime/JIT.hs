@@ -21,7 +21,7 @@ import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.LLVM
 import Unison.Runtime.JIT.Layout (probeLayouts)
 import Unison.Runtime.JIT.Native (configureNative, ctxLayout, rtsFacts)
-import Unison.Runtime.MCode (prettySection)
+import Unison.Runtime.MCode (prettyIns, prettySection)
 import Unison.Runtime.Machine.Types (MCombs)
 
 -- | The constructor arities of every data type loaded so far, which the
@@ -65,8 +65,8 @@ startJIT = case mode config of
               case facts of
                 -- the allocator's address isn't needed: generated code calls
                 -- unison_jit_alloc_words by name, and the JIT resolves it from the process
-                [arrWordsInfo, arrPtrsInfo, bytesHdr, bytesCount, ptrsHdr, ptrsCount, ptrsSize, cardBits, _allocator] -> do
-                  let rts = RtsFacts arrWordsInfo arrPtrsInfo bytesHdr bytesCount ptrsHdr ptrsCount ptrsSize cardBits
+                [arrWordsInfo, arrPtrsInfo, bytesHdr, bytesCount, ptrsHdr, ptrsCount, ptrsSize, cardBits, _allocator, mutVarVar, _barrier, arrPtrsDirtyInfo] -> do
+                  let rts = RtsFacts arrWordsInfo arrPtrsInfo bytesHdr bytesCount ptrsHdr ptrsCount ptrsSize cardBits mutVarVar arrPtrsDirtyInfo
                   writeIORef jitState (Just (JITState ls (CtxOffsets a b c d e f g h i j k l m n o p q r s) rts))
                   triple <- targetTriple
                   jitLog ("mode " ++ show (mode config) ++ ", LLVM ready, target " ++ triple)
@@ -95,4 +95,5 @@ printJITStats = when (stats config) $ do
       Resume cix sect -> "resume " ++ show cix ++ " at " ++ takeWhile (/= '\n') (dropWhile (== ' ') (prettySection 0 sect ""))
       GrowStack n _ -> "grow stack by " ++ show n
       Reenter _ -> "reenter (poll)"
+      CallOut cix instr _ _ _ -> "call out " ++ show cix ++ " for " ++ takeWhile (/= '\n') (prettyIns instr "")
       Named name e -> name ++ ": " ++ describe e

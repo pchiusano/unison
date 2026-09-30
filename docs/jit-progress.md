@@ -15,7 +15,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M1: skeleton and numeric loops | done 2026-09-30. Test matrix passes; "Sum 0 to 1 million" 104× faster; everything else exits and is the same or slower until M2-M4 |
 | M2: calls and frames | done 2026-09-30. Test matrix (7 configurations) passes; "fib 20" 16× faster; "depth 1000000" runs natively with the C stack guard. Data and list code is slower until M3/M4. See [jit-m2.md](jit-m2.md) |
 | M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
-| M4: call-outs and function values | not started |
+| M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
 | M0 spike 3: interpreter overhead | done: under 2%, cell field and check kept |
@@ -28,8 +28,13 @@ Update it whenever a step finishes or something non-obvious is learned.
   `stack exec unison -- -C jit_codebase transcript.fork unison-src/transcripts/idempotent/jit-tests.md`
 - `transcript.fork` runs on a throwaway copy of the codebase, so `jit_codebase` itself is never modified.
 - **Stack does not rebuild when only the optimization level changes.** After any `stack build --fast`,
-  a plain `stack build` compiles nothing and leaves the unoptimized binary in place. To get an optimized
-  binary: `stack clean` and then `stack build`. If that build is interrupted, plain `stack build` resumes it. Check by running the benchmarks: on an optimized build
+  a plain `stack build` compiles nothing and leaves the unoptimized binary in place. So the two
+  builds live in separate work dirs (since 2026-09-30): `.stack-work` is the `--fast` tree and
+  `.stack-work-opt` the optimized one. Build and run the optimized binary with
+  `stack build --work-dir .stack-work-opt --flag unison-runtime:jit` and
+  `stack exec --work-dir .stack-work-opt unison -- ...`. Dependencies are shared between the
+  trees, only local packages are built twice, and switching rebuilds nothing. Don't run two
+  Stack builds at once. Check by running the benchmarks: on an optimized build
   "Count to 1 million" in `suite` takes about 40 ms on this machine class; on a `--fast` build, about 3 s.
 - `stack.yaml` builds everything with `-fno-omit-yields`, so compiled Haskell loops that don't allocate
   can still be preempted. Native code gets no such help, which is why the design polls.
@@ -42,8 +47,12 @@ Update it whenever a step finishes or something non-obvious is learned.
 - Iterating: `stack build --fast --flag unison-runtime:jit unison-runtime` (compile errors fast),
   then `stack build --flag unison-runtime:jit` to relink the executable.
 - Running with the JIT: `UNISON_JIT=eager` or `unison --jit eager`. Diagnostics: `UNISON_JIT_LOG=1`
-  (compile log), `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell
-  sides), `UNISON_JIT_DUMP_MCODE=1`, `UNISON_JIT_STATS=1` (exit counts after each evaluation).
+  (compile log, including why a combinator or part of one was left to the interpreter),
+  `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell sides; unusable
+  on programs that load base, it exhausts memory during the load), `UNISON_JIT_DUMP_MCODE=1`,
+  `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS_EVERY=N` (with
+  stats: also every N exits, for evaluations that never finish), `UNISON_JIT_DISABLE=a,b,...`
+  (turn features off for bisecting a bug: `app`, `apply`, `ref`, `array`, `cmp`, `callout`).
 - Seeing the generated code: `--jit-dump-ir DIR` (or `UNISON_JIT_DUMP_IR=DIR`) writes one `.ll`
   file per definition into `DIR`, with the MCode of each function as a comment above its IR and a
   line for each combinator that wasn't compiled and why; `--jit-dump-ir -` prints to stderr. Two
@@ -60,14 +69,14 @@ Update it whenever a step finishes or something non-obvious is learned.
   running a binary that Cabal's configure step invokes (`pkg-config --version` was the case on
   2026-09-30). The process sits in an unkillable state until the prompt is answered. Answer the
   prompt; nothing in the project is wrong.
-- **Heap sanity checking** (GC-checked runs, M3): link the executable against the debug RTS by
-  adding `-debug` to the `ghc-options` in `unison-cli-main/package.yaml`, deleting
-  `unison-cli-main/unison-cli-main.cabal` (the committed one was made by a newer hpack, so Stack
-  ignores package.yaml until it is regenerated), then `stack build --fast --flag unison-runtime:jit
-  --force-dirty unison-cli-main`. `stack exec unison -- +RTS --info` must say `rts_thr_debug`.
-  Then run transcripts with `+RTS -DS -RTS` at the end of the command line: the RTS checks every
-  heap object at every GC, which catches a bad info pointer, tag, or a missed write barrier. About
-  10× slower. Revert the package.yaml change and relink the same way afterwards; don't commit it.
+- **Heap sanity checking** (GC-checked runs): a third work dir holds a `--fast` build linked
+  against the debug RTS, built once with
+  `stack build --fast --flag unison-runtime:jit --ghc-options=-debug --work-dir .stack-work-debug`
+  (rebuilds are incremental like any other tree). `stack exec --work-dir .stack-work-debug unison -- +RTS --info`
+  says `rts_thr_debug`. Run transcripts through it with `+RTS -DS -RTS` at the end of the
+  command line: the RTS checks every heap object at every GC, which catches a bad info pointer,
+  tag, or a missed write barrier. About 10× slower. (Until 2026-09-30 this was done by editing
+  `unison-cli-main/package.yaml`; the separate tree needs no edits.)
 - **Never run two Stack builds at once, and never leave a killed one behind.** A build killed by a
   timeout leaves `Cabal-simple` and `ghc` processes holding the build lock, and later builds hang
   silently on it ("still blocking for directory lock"). Check with `pgrep -fl "stack build|Cabal-simple"`
@@ -192,7 +201,8 @@ All within the 2% the plan allows. The correctness transcript still passes, so c
 without breaking code loading.
 
 **Stack rule, refined:** after building any package with `--fast`, run `stack clean <package>`
-before the optimized `stack build`, or that package stays unoptimized. Rebuilding just
+before the optimized `stack build`, or that package stays unoptimized. (Superseded 2026-09-30 by
+the separate `.stack-work-opt` tree, see "How to build and run".) Rebuilding just
 `unison-runtime` and relinking takes a few minutes; a full clean build takes about 15.
 
 ## M1 measurements
@@ -257,6 +267,28 @@ the row, and re-measure on an idle machine before quoting.
 Against the M2 interpreter numbers (measured on a quiet machine) the tree entries are 3× and
 5.5× faster, so the exit criterion holds either way. What's left slow is exactly M4's list:
 calls to function values and foreign calls.
+
+## M4 measurements
+
+2026-09-30, optimized build (`.stack-work-opt`) with the `jit` flag, `jitSuite`, idle machine,
+best of three runs. Commit 298123434 plus the combinator-as-value constant.
+
+| Benchmark | `UNISON_JIT=off` | `UNISON_JIT=eager` | Change |
+| --- | --- | --- | --- |
+| Sum 0 to 1 million | 67.0 ms | 320 µs | 210× faster |
+| fib 20 | 1.39 ms | 87 µs | 16× faster |
+| Cons list: map with a lambda | 85 µs | 21.5 µs | 4× faster (M4 target was 3×) |
+| Cons list: foldLeft with a lambda | 86 µs | 5.0 µs | 17× faster |
+| Binary tree: 1000 inserts | 1.67 ms | 254 µs | 6.6× faster |
+| Binary tree: 1000 lookups | 769 µs | 67 µs | 11× faster |
+| Apply a function argument 10000 times | 1.17 ms | 49 µs | 24× faster |
+| Mutate a Ref 10000 times | 950 µs | 59 µs | 16× faster |
+
+Nothing in the suite is slower than the interpreter any more. The exits left in the suite are
+`Ref.new` (a call-out per `refLoop` call), the preemption polls, and `CAST` in base's time
+functions; the loops themselves run without leaving native code. What the suite doesn't
+exercise: partial application with captured arguments (`Name`, a call-out), ability handler
+calls (`App (Dyn i)`, a resume), and over-application.
 
 ## Baseline: interpreter only
 
@@ -360,3 +392,27 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   re-entering it read the wrong slots. Lesson: the test transcript uses builtins only, and base
   library code (`printTime`) has shapes it doesn't. Run the benchmark transcript as a test too,
   with the `--fast` binary, before calling a milestone done.
+- 2026-09-30: M4 steps 1, 2 and 2b. Every instruction without a native version is now a
+  call-out, and the code after it is an auxiliary LLVM function in the same module (named
+  `u<grp>_<i>_r<n>`, with its own cell). The same mechanism, with a *frame base*, gives
+  re-entry inside inline bindings and to `Let`s nested in them, so M2's "applying non-function"
+  limitation is gone. Lessons: MCode's `Ins` doesn't say how many values an instruction pushes
+  (`Prim1 LOAD` pushes two, `TRCE` none), so the generator keeps a `pushCount` table and the
+  trampoline verifies the stack pointer before re-entering. The exit and frame tables were
+  registered from the first generation pass, whose cells were placeholders; now the second
+  pass's entries replace them. The interpreter's `apply` never looked at the callee's cell, so
+  function values (thunks passed to handlers, say) always ran interpreted; it now enters native
+  code like `enter`. A `DMatch` on a type whose arities aren't registered (`Boolean` is a
+  builtin reference, not in `builtinDataSpec`) is still compiled for the enumeration case, since
+  the pointer tag identifies it. A `UNISON_JIT_LOG=1` line "partly interpreted" now says why a
+  branch arm or binding fell back.
+- 2026-09-30: M4 steps 3 to 6. Native closure calls; `apply` enters native code; `Ref`, mutable
+  arrays and universal comparison native; combinators-as-values from the pool. Two bugs worth
+  remembering: (1) the generator went exponential on `Duration.toText` (a `Let` inside an inline
+  binding got an auxiliary function per occurrence, and the body was inlined too), which showed
+  up as every benchmark "hanging" while the compiler ate memory; auxiliary functions are now
+  memoized per (section, depth, base). Bisected with the new `UNISON_JIT_DISABLE`. (2) The
+  pool's `PAp` for a combinator used `nullSeg`, whose boxes are lazy CAFs: native code read
+  through an indirection and refused every closure call, silently. Segment boxes are now
+  checked for an evaluated pointer tag before use. Also: the debug-RTS binary lives in its own
+  work dir now (see "How to build and run"), and Stack work dirs replace `stack clean`.

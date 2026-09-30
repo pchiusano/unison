@@ -13,7 +13,7 @@ import Data.Char (toLower)
 import Data.List (stripPrefix)
 import Data.Maybe (fromMaybe, mapMaybe)
 import System.Environment (lookupEnv)
-import System.IO (hPutStrLn, stderr)
+import System.IO (hFlush, hPutStrLn, stderr)
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 
@@ -37,6 +37,9 @@ data Config = Config
     trace :: Bool,
     -- | print exit counts when the process ends
     stats :: Bool,
+    -- | with stats: also print the counts every this many exits (for
+    -- evaluations that never finish)
+    statsEvery :: Int,
     -- | fire the entry poll every N entries (stress mode @poll=N@)
     stressPoll :: Int,
     -- | initial Unison stack size in slots (stress mode @ustack=N@)
@@ -46,7 +49,12 @@ data Config = Config
     -- | C stack budget for native calls, in bytes (stress mode @cstack=N@)
     stressCStack :: Int,
     -- | allocation budget between polls, in words (stress mode @alloc=N@)
-    stressAlloc :: Int
+    stressAlloc :: Int,
+    -- | features turned off for debugging, from @UNISON_JIT_DISABLE@
+    -- (comma separated): @app@ (closure calls), @apply@ (the interpreter
+    -- entering native code for a closure), @ref@, @array@, @cmp@
+    -- (universal comparison), @callout@ (call-outs become resumes)
+    disabled :: [String]
   }
   deriving (Show)
 
@@ -56,9 +64,11 @@ config = unsafePerformIO $ do
   logging <- lookupEnv "UNISON_JIT_LOG"
   dump <- lookupEnv "UNISON_JIT_DUMP_IR"
   stats <- lookupEnv "UNISON_JIT_STATS"
+  every <- lookupEnv "UNISON_JIT_STATS_EVERY"
   mcode <- lookupEnv "UNISON_JIT_DUMP_MCODE"
   tr <- lookupEnv "UNISON_JIT_TRACE"
   stress <- maybe [] (splitOn ',') <$> lookupEnv "UNISON_JIT_STRESS"
+  disabledFeatures <- maybe [] (splitOn ',') <$> lookupEnv "UNISON_JIT_DISABLE"
   let setting key = listToMaybe' (mapMaybe (stripPrefix (key ++ "=")) stress) >>= readMaybe
   pure
     Config
@@ -74,7 +84,9 @@ config = unsafePerformIO $ do
         stressStack = setting "ustack",
         stressCallee = fromMaybe 0 (setting "callee"),
         stressCStack = fromMaybe 0 (setting "cstack"),
-        stressAlloc = fromMaybe 0 (setting "alloc")
+        stressAlloc = fromMaybe 0 (setting "alloc"),
+        statsEvery = fromMaybe 0 (every >>= readMaybe),
+        disabled = disabledFeatures
       }
   where
     splitOn c s = case break (== c) s of
@@ -91,4 +103,4 @@ jitLog msg
 
 -- | Writes diagnostic text to stderr, unconditionally.
 jitDump :: String -> IO ()
-jitDump = hPutStrLn stderr
+jitDump msg = hPutStrLn stderr msg >> hFlush stderr

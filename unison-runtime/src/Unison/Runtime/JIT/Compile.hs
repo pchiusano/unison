@@ -19,13 +19,16 @@ import System.FilePath ((</>))
 import Unison.Runtime.JIT.Codegen qualified as CG
 import Unison.Runtime.JIT.Codegen (CtxOffsets, Function (..), RtsFacts, genFunction, modulePrelude)
 import Unison.Runtime.JIT.Config
-import Unison.Runtime.JIT.Exits (registerExits)
-import Unison.Runtime.JIT.Frames (registerFrames)
+import Unison.Runtime.JIT.Exits (registerExits, replaceExits)
+import Unison.Runtime.JIT.Frames (registerFrames, replaceFrames)
 import Unison.Runtime.JIT.LLVM
 import Unison.Runtime.JIT.Layout (Layouts)
 import Unison.Runtime.JIT.Pool (PoolKey (..), poolIndices)
 import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Reference (Reference)
+import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..))
+import Unison.Runtime.TypeTags qualified as TT
+import Unison.Builtin.Decls qualified as Ty (unitRef)
 import Unison.Runtime.MCode
 import Unison.Runtime.Machine.Types (MCombs, MSection)
 import Unison.Util.EnumContainers qualified as EC
@@ -58,14 +61,20 @@ letCellsOf s = [c | Let _ _ _ _ c <- sectionsOf s]
 
 -- | The constants a section tree needs from the pool.
 poolKeysOf :: MSection -> [PoolKey]
-poolKeysOf s = concat [keys i | Ins i _ <- sectionsOf s]
+poolKeysOf s = concat [keys i | Ins i _ <- sectionsOf s] ++ concat [combKey r | App _ r ZArgs <- sectionsOf s]
   where
+    -- a known combinator used as a value
+    combKey = \case
+      Env cix comb | Comb info <- unRComb comb -> [KeyComb cix info]
+      _ -> []
     keys = \case
       Pack r t ZArgs -> [KeyEnum r t]
       Pack r _ _ -> [KeyEnum r (PackedTag 0)]
       Lit l@(MT _) -> [KeyLit l]
       Lit l@(MM _) -> [KeyLit l]
       Lit l@(MY _) -> [KeyLit l]
+      Prim2 REFW _ _ -> [KeyEnum Ty.unitRef TT.unitTag]
+      ForeignCall _ MutableArray_write _ -> [KeyEnum Ty.unitRef TT.unitTag]
       _ -> []
 
 -- | What compilation needs, found once at startup.
@@ -79,9 +88,10 @@ data JITState = JITState
 -- Combinators the code generator can't handle are left interpreted.
 compileGroup :: JITState -> Map.Map Reference [Int] -> Reference -> Word64 -> MCombs -> IO ()
 compileGroup st types ref grp combs = do
+  jitLog ("unison_" ++ show grp ++ ": compiling " ++ show ref)
   t0 <- getMonotonicTimeNSec
   poolIxs <- poolIndices (concat [poolKeysOf s | Comb (LamI _ _ s _) <- map snd (EC.mapToList combs)])
-  let env (base, fbase) = CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) combs poolIxs (jsRts st) types
+  let env (base, fbase, cells) = CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) combs poolIxs (jsRts st) types cells (disabled config)
       -- Let body combinators are only entered through the cell their Let
       -- carries, so those that no Let refers to (the ones inside bindings)
       -- are not worth compiling. Local functions have zero in the low bits.
@@ -94,20 +104,27 @@ compileGroup st types ref grp combs = do
         ]
       name i = "u" ++ show grp ++ "_" ++ show i
       gen base (i, cix, a, f, entry, cell) = genFunction (env base) (name i) cix a f entry cell
-      -- first pass: find out which functions compile and how many exits each has
-      (skipped, firstPass) = partitionEithers [either (Left . (,) i) Right (gen (0, 0) c) | c@(i, _, _, _, _, _) <- candidates]
+      -- first pass: find out which functions compile, and how many exits,
+      -- frames and auxiliary functions each has
+      (skipped, firstPass) = partitionEithers [either (Left . (,) i) Right (gen (0, 0, repeat noNativeCell) c) | c@(i, _, _, _, _, _) <- candidates]
   forM_ skipped $ \(i, why) -> jitLog (name i ++ ": not compiled: " ++ why)
   when (not (null firstPass)) $ do
     let counts = map (length . fnExits) firstPass
         fcounts = map (length . fnFrames) firstPass
+        acounts = map (length . fnAux) firstPass
     base <- registerExits (concatMap fnExits firstPass)
     fbase <- registerFrames (concatMap fnFrames firstPass)
-    -- second pass, with each function's real exit and frame bases
-    let bases = zip (scanl (+) base counts) (scanl (+) fbase fcounts)
+    cellBlock <- newNativeCells (sum acounts)
+    -- second pass, with each function's real exit and frame bases and cells
+    let cells = [map (nativeCellAt cellBlock) [a .. a + n - 1] | (a, n) <- zip (scanl (+) 0 acounts) acounts]
+        bases = zip3 (scanl (+) base counts) (scanl (+) fbase fcounts) cells
         compiled = [f | (b, c) <- zip bases (filter ((`notElem` map fst skipped) . sel1) candidates), Right f <- [gen b c]]
         sel1 (i, _, _, _, _, _) = i
         ir = modulePrelude ++ unlines (map fnIR compiled)
         modName = "unison_" ++ show grp
+    -- the second pass's exits and frames name the auxiliary functions' cells
+    replaceExits base (concatMap fnExits compiled)
+    replaceFrames fbase (concatMap fnFrames compiled)
     -- The dump has each function's MCode as a comment above its IR, and
     -- says which combinators were not compiled and why.
     forM_ (dumpIR config) $ \dir -> do
@@ -139,13 +156,14 @@ compileGroup st types ref grp combs = do
             then jitDump ("; module " ++ modName ++ " after O2\n" ++ txt)
             else writeFile (dir </> modName ++ ".opt.ll") txt
         forM_ compiled $ \f -> do
-          sym <- lookupSymbol (fnName f)
-          case sym of
-            Left e -> jitLog (fnName f ++ ": " ++ e)
-            Right fp -> writeNativeCode (fnCell f) (castFunPtrToPtr fp)
+          forM_ (fnNotes f) $ \note -> jitLog (fnName f ++ ": partly interpreted: " ++ note)
+          forM_ ((fnName f, fnCell f) : fnAux f) $ \(sym, cell) ->
+            lookupSymbol sym >>= \case
+              Left e -> jitLog (sym ++ ": " ++ e)
+              Right fp -> writeNativeCode cell (castFunPtrToPtr fp)
         t1 <- getMonotonicTimeNSec
         jitLog
           ( modName ++ ": compiled " ++ show (length compiled) ++ " of " ++ show (length candidates)
-              ++ " combinators, " ++ show (sum counts) ++ " exits, in "
+              ++ " combinators (" ++ show (sum acounts) ++ " auxiliary functions), " ++ show (sum counts) ++ " exits, in "
               ++ show (fromIntegral (t1 - t0) / 1e6 :: Double) ++ " ms"
           )

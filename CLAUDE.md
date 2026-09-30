@@ -14,8 +14,10 @@ Before doing anything on the JIT, read these in order:
 
 Rules:
 
-- Iterate with `stack build --fast`. Benchmark only on an optimized build: `stack clean`, then
-  `stack build`. Stack does not rebuild when only the optimization level changes.
+- Iterate with `stack build --fast`. Benchmark only on an optimized build, which lives in its own
+  work dir so switching never rebuilds: `stack build --work-dir .stack-work-opt ...` and
+  `stack exec --work-dir .stack-work-opt unison -- ...`. Stack does not rebuild when only the
+  optimization level changes, so never mix the two in one work dir.
 - Correctness tests: `stack exec unison -- -C jit_codebase transcript.fork unison-src/transcripts/idempotent/jit-tests.md`
 - Benchmarks: `stack exec unison -- -C jit_codebase transcript.fork unison-src/transcripts-manual/jit-benchmarks.md`
 - Running a transcript writes `<name>.output.md` next to it. Don't commit those.

@@ -28,8 +28,9 @@ import GHC.Exts (RealWorld)
 import System.IO.Unsafe (unsafePerformIO)
 import Unison.Reference (Reference)
 import Unison.Runtime.ANF (PackedTag)
-import Unison.Runtime.MCode (MLit (..))
-import Unison.Runtime.Stack (Closure, Val (..), charTypeTag, falseVal, floatTypeTag, intTypeTag, natTypeTag, trueVal, pattern Enum, pattern Foreign)
+import Unison.Runtime.MCode (CombIx, GCombInfo, MLit (..))
+import Unison.Runtime.Machine.Types (MComb)
+import Unison.Runtime.Stack (Closure, Val (..), charTypeTag, falseVal, floatTypeTag, intTypeTag, natTypeTag, nullSeg, trueVal, pattern Enum, pattern Foreign, pattern PAp)
 import Unison.Runtime.Stack qualified as Stack
 
 -- The order matches unboxedTypeTagToInt in Stack.hs.
@@ -55,7 +56,29 @@ data PoolKey
     KeyEnum !Reference !PackedTag
   | -- | a boxed literal (text, term link, type link)
     KeyLit !MLit
-  deriving (Eq, Ord, Show)
+  | -- | a known combinator as a value: a @PAp@ with nothing captured, the
+    -- same closure the interpreter builds for @App (Env cix) ZArgs@.
+    -- Interned by the CombIx alone (the combinator has no Ord).
+    KeyComb !CombIx !(GCombInfo MComb)
+
+instance Eq PoolKey where
+  a == b = compare a b == EQ
+
+instance Ord PoolKey where
+  compare = \cases
+    (KeyEnum r t) (KeyEnum r' t') -> compare (r, t) (r', t')
+    (KeyEnum {}) _ -> LT
+    _ (KeyEnum {}) -> GT
+    (KeyLit l) (KeyLit l') -> compare l l'
+    (KeyLit {}) _ -> LT
+    _ (KeyLit {}) -> GT
+    (KeyComb c _) (KeyComb c' _) -> compare c c'
+
+instance Show PoolKey where
+  show = \case
+    KeyEnum r t -> "KeyEnum " ++ show r ++ " " ++ show t
+    KeyLit l -> "KeyLit " ++ show l
+    KeyComb c _ -> "KeyComb " ++ show c
 
 data Pool = Pool
   { poolArray :: !(MutableArray RealWorld Closure),
@@ -112,6 +135,9 @@ poolIndices keys = do
 closureFor :: PoolKey -> Closure
 closureFor = \case
   KeyEnum r t -> Enum r t
+  -- the segment's boxes must be evaluated (native code reads through
+  -- them); nullSeg's components are CAFs, so force them
+  KeyComb cix comb -> let (u, b) = nullSeg in u `seq` b `seq` PAp cix comb (u, b)
   KeyLit l -> case l of
     MT t -> Foreign (Stack.WrapText t)
     MM r -> Foreign (Stack.WrapReferent r)

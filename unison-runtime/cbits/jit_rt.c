@@ -90,6 +90,19 @@ void *unison_jit_alloc_words(UnisonJitCtx *ctx, int64_t n) {
   return allocate((Capability *)ctx->cap, n);
 }
 
+// Writes a MutVar# (an IORef) the way compiled Haskell does: the store,
+// then the runtime's barrier, which moves a clean variable onto the
+// mutable list. Cold code in C (decision D9).
+void unison_jit_write_mutvar(UnisonJitCtx *ctx, StgMutVar *mv, StgClosure *v) {
+  StgClosure *old = mv->var;
+  __atomic_thread_fence(__ATOMIC_RELEASE);
+  mv->var = v;
+  // the register table follows the function table at the start of a Capability
+  // (see unison_jit_hplim_address)
+  StgRegTable *reg = (StgRegTable *)((char *)ctx->cap + sizeof(StgFunTable));
+  dirty_MUT_VAR(reg, mv, old);
+}
+
 // Addresses and sizes from the runtime that generated code needs: the
 // info pointers for the two kinds of array in a Seg, and their layouts.
 int64_t unison_jit_rts_facts(int64_t *out, int64_t n) {
@@ -103,6 +116,9 @@ int64_t unison_jit_rts_facts(int64_t *out, int64_t n) {
       offsetof(StgMutArrPtrs, size) / sizeof(W_),   // 6: word index of the payload size (elements + card table)
       MUT_ARR_PTRS_CARD_BITS,                       // 7: log2 of elements per card
       (int64_t)&unison_jit_alloc_words,             // 8: the allocator
+      offsetof(StgMutVar, var) / sizeof(W_),        // 9: word index of a MutVar#'s content
+      (int64_t)&unison_jit_write_mutvar,            // 10: the MutVar# write barrier
+      (int64_t)&stg_MUT_ARR_PTRS_DIRTY_info,        // 11: mutable Array# info after a write
   };
   int64_t count = sizeof facts / sizeof facts[0];
   for (int64_t i = 0; i < n && i < count; i++) out[i] = facts[i];

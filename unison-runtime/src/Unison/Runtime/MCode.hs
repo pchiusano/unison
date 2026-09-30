@@ -30,6 +30,8 @@ module Unison.Runtime.MCode
     writeNativeCode,
     bumpNativeCount,
     NativeCellPool (..),
+    newNativeCells,
+    nativeCellAt,
     newNativeCellPool,
     takeNativeCells,
     growNativeCellPool,
@@ -63,6 +65,7 @@ module Unison.Runtime.MCode
     prettyCombs,
     prettyComb,
     prettySection,
+    prettyIns,
   )
 where
 

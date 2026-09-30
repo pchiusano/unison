@@ -6,6 +6,7 @@ module Unison.Runtime.JIT.Frames
   ( Frame (..),
     FrameIndex,
     registerFrames,
+    replaceFrames,
     lookupFrame,
   )
 where
@@ -36,6 +37,12 @@ registerFrames :: [Frame] -> IO FrameIndex
 registerFrames frames = atomicModifyIORef' table $ \(Table next m) ->
   let n = length frames
    in (Table (next + n) (m <> IM.fromList (zip [next ..] frames)), next)
+
+-- | Overwrites frames registered earlier, starting at the given index
+-- (see replaceExits).
+replaceFrames :: FrameIndex -> [Frame] -> IO ()
+replaceFrames base frames = atomicModifyIORef' table $ \(Table next m) ->
+  (Table next (IM.fromList (zip [base ..] frames) <> m), ())
 
 lookupFrame :: FrameIndex -> IO Frame
 lookupFrame i = do
