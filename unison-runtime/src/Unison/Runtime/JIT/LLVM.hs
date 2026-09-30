@@ -19,11 +19,15 @@ import Foreign.Ptr (FunPtr)
 #ifdef UNISON_JIT
 import Foreign.C.String (CString, peekCString, withCString, withCStringLen)
 import Foreign.C.Types (CInt (..), CSize (..))
-import Foreign.Ptr (WordPtr (..), castPtrToFunPtr, wordPtrToPtr)
+import Foreign.Marshal.Alloc (alloca)
+import Foreign.Ptr (Ptr, WordPtr (..), castPtrToFunPtr, nullPtr, wordPtrToPtr)
+import Foreign.Storable (peek, poke)
 
 foreign import ccall safe "unison_jit_init" c_init :: IO CInt
 
-foreign import ccall safe "unison_jit_add_module" c_addModule :: CString -> CSize -> CString -> IO CInt
+foreign import ccall safe "unison_jit_add_module" c_addModule :: CString -> CSize -> CString -> Ptr CString -> IO CInt
+
+foreign import ccall unsafe "unison_jit_free_string" c_freeString :: CString -> IO ()
 
 foreign import ccall safe "unison_jit_lookup" c_lookup :: CString -> IO Word64
 
@@ -49,11 +53,22 @@ initLLVM = do
 
 -- | Parses a module from IR text, runs the given pass pipeline
 -- (such as @default<O2>@, or @""@ for none) and hands it to the JIT.
-addModule :: String -> String -> IO (Either String ())
-addModule passes ir =
-  withCStringLen ir $ \(p, n) -> withCString passes $ \ps -> do
-    r <- c_addModule p (fromIntegral n) ps
-    if r == 0 then pure (Right ()) else Left <$> lastError "adding a module"
+-- When asked, also returns the module's text after the passes.
+addModule :: Bool -> String -> String -> IO (Either String (Maybe String))
+addModule wantOptimized passes ir =
+  withCStringLen ir $ \(p, n) -> withCString passes $ \ps -> alloca $ \out -> do
+    poke out nullPtr
+    r <- c_addModule p (fromIntegral n) ps (if wantOptimized then out else nullPtr)
+    if r /= 0
+      then Left <$> lastError "adding a module"
+      else do
+        cs <- peek out
+        if cs == nullPtr
+          then pure (Right Nothing)
+          else do
+            txt <- peekCString cs
+            c_freeString cs
+            pure (Right (Just txt))
 
 -- | The address of a compiled function. Code is generated on first lookup.
 lookupSymbol :: String -> IO (Either String (FunPtr a))
@@ -83,8 +98,8 @@ notBuilt = pure (Left "JIT: not built in (build with --flag unison-runtime:jit)"
 initLLVM :: IO (Either String ())
 initLLVM = notBuilt
 
-addModule :: String -> String -> IO (Either String ())
-addModule _ _ = notBuilt
+addModule :: Bool -> String -> String -> IO (Either String (Maybe String))
+addModule _ _ _ = notBuilt
 
 lookupSymbol :: String -> IO (Either String (FunPtr a))
 lookupSymbol _ = notBuilt

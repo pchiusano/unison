@@ -52,6 +52,7 @@ import Foreign.Ptr
 import Unison.Runtime.JIT (jitCompileGroup)
 import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.JIT.Exits
+import Unison.Runtime.JIT.Frames
 import Unison.Runtime.JIT.Native
 import Unison.Runtime.JIT.Pool (globalPool)
 import Foreign.Storable qualified as Store
@@ -746,7 +747,7 @@ eval' !yld env henv !activeThreads !stk !k here (Call ck combIx rcomb args) = do
   enter yld env henv activeThreads stk k combIx ck args rcomb
 eval' !yld env henv !activeThreads !stk !k _ (Jump i args) =
   bpeekOff stk i >>= jump yld env henv activeThreads stk k args
-eval' !yld env henv !activeThreads !stk !k r (Let nw cix f sect) = do
+eval' !yld env henv !activeThreads !stk !k r (Let nw cix f sect cell) = do
   (stk, fsz, asz) <- saveFrame stk
   eval
     yld
@@ -754,7 +755,7 @@ eval' !yld env henv !activeThreads !stk !k r (Let nw cix f sect) = do
     henv
     activeThreads
     stk
-    (Push fsz asz cix f sect k)
+    (Push fsz asz cix f sect cell k)
     r
     nw
 eval' !yld env henv !activeThreads !stk !k r (Ins i nx) = do
@@ -769,7 +770,7 @@ eval' !yld env henv !activeThreads !stk !k r (Ins i nx) = do
           fv <- peek stk
           bpoke stk $ Data1 exceptionRef TT.exceptionRaiseTag fv
           (stk, fsz, asz) <- saveFrame stk
-          let kk = Push fsz asz fakeCix 10 nx k
+          let kk = Push fsz asz fakeCix 10 nx noNativeCell k
           apply yld env henv activeThreads stk kk False (VArg1 0) eh
       | otherwise -> eval yld env henv activeThreads stk k r nx
 eval' !_ _ _ !_ !_activeThreads !_ _ Exit = pure ()
@@ -939,10 +940,10 @@ runNative ::
 runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
   where
     go (Stack ap fp sp ustk bstk) = do
-      (status, ap', fp', sp') <- enterNative fn ustk bstk globalPool ap fp sp
+      (status, ap', fp', sp', records) <- enterNative fn ustk bstk globalPool ap fp sp
       let stk = Stack ap' fp' sp' ustk bstk
       when (JIT.trace JIT.config) $
-        JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")")
+        JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")" ++ concatMap (("\n  frame record " ++) . show) records)
       if status == statusOK
         then yield yld env henv activeThreads stk k
         else
@@ -950,23 +951,29 @@ runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
             then die [] "native code reported an error"
             else do
               when (JIT.stats JIT.config) (countExit status)
-              act stk =<< lookupExit status
-    act stk = \case
-      Named _ e -> act stk e
+              -- Records are written innermost caller first; K has the
+              -- innermost frame on top, so build from the last record.
+              k <- foldM pushRecord k (reverse records)
+              act stk k =<< lookupExit status
+    pushRecord k (FrameRecord i fsz asz) = do
+      Frame cix f sect cell <- lookupFrame i
+      pure (Push fsz asz cix f sect cell k)
+    act stk k = \case
+      Named _ e -> act stk k e
       Resume cix sect -> do
         when (JIT.trace JIT.config) $ JIT.jitDump ("resume " ++ show cix ++ " at\n" ++ prettySection 4 sect "")
         eval yld env henv activeThreads stk k cix sect
       GrowStack n cell -> do
         when (JIT.trace JIT.config) $ JIT.jitDump ("grow stack by " ++ show n)
-        stk <- ensure stk n
-        again cell stk
+        stk <- ensureGenerously stk n
+        again cell stk k
       Reenter cell -> do
         when (JIT.trace JIT.config) $ JIT.jitDump "reenter"
         Conc.yield
-        again cell stk
+        again cell stk k
     -- The exit says which function to call again. It is the one that took
     -- the exit, which after tail calls need not be the one entered here.
-    again cell stk = do
+    again cell stk k = do
       code <- readNativeCode cell
       if code == nullPtr
         then die [] "native code disappeared from its cell"
@@ -1082,8 +1089,8 @@ jump !yld env henv !activeThreads !stk !k !args clo = case clo of
     adjust :: K -> (SZ, K)
     adjust (Mark a rs denv k) =
       (0, Mark (a + asize stk) rs denv k)
-    adjust (Push n a cix f rsect k) =
-      (0, Push n (a + asize stk) cix f rsect k)
+    adjust (Push n a cix f rsect c k) =
+      (0, Push n (a + asize stk) cix f rsect c k)
     adjust k = (asize stk, k)
 {-# INLINE jump #-}
 
@@ -1112,8 +1119,8 @@ repush !yld env !activeThreads !stk (HEnv aenv denv0) = go denv0
       where
         denv' = cs <> EC.withoutKeys denv ps
         cs' = EC.restrictKeys denv ps
-    go !denv (Push n a cix f rsect sk) !k =
-      go denv sk $ Push n a cix f rsect k
+    go !denv (Push n a cix f rsect c sk) !k =
+      go denv sk $ Push n a cix f rsect c k
     go !_ (Local {}) !_ = die [] "repush: captured Local frame"
     go !_ (AMark {}) !_ = die [] "repush: captured AMark frame"
     go !_ (Keep {}) !_ = die [] "repush: captured Keep frame"
@@ -1283,10 +1290,14 @@ yield !yld env henv0 !activeThreads !stk = leap
       stk <- adjustArgs stk a
       henv <- evaluate $ HEnv aenv mempty
       apply yld env henv activeThreads stk k False (VArg1 0) h
-    leap (Push fsz asz cix f nx k) = do
+    leap (Push fsz asz cix f nx cell k) = do
       stk <- restoreFrame stk fsz asz
       stk <- ensure stk f
-      eval yld env henv0 activeThreads stk k cix nx
+      -- The Let body may have native code (the re-entry point).
+      native <- readNativeCode cell
+      if native == nullPtr
+        then eval yld env henv0 activeThreads stk k cix nx
+        else runNative yld env henv0 activeThreads stk k (castPtrToFunPtr native)
     leap (Local henv asz k) = do
       stk <- restoreFrame stk 0 asz
       yield yld env henv activeThreads stk k
@@ -1519,11 +1530,11 @@ splitCont !denv !stk !k !p =
       where
         denv' = cs <> EC.withoutKeys denv ps
         cs' = EC.restrictKeys denv ps
-    walk !denv !sz !ck (Push n a br p brSect k) =
+    walk !denv !sz !ck (Push n a br p brSect c k) =
       walk
         denv
         (sz + n + a)
-        (Push n a br p brSect ck)
+        (Push n a br p brSect c ck)
         k
 
     finish :: DEnv -> SZ -> SZ -> K -> K -> IO (Val, DEnv, Stack, K)
@@ -1545,7 +1556,7 @@ abortCont !stk !k !r = walk (asize stk) k
       KE -> die [] "abortCont: fell off stack"
       (CB _) -> die [] "abortCont: fell off stack"
       (Local _ a k) -> walk (sz + a) k
-      (Push n a _ _ _ k) -> walk (sz + n + a) k
+      (Push n a _ _ _ _ k) -> walk (sz + n + a) k
       (Keep _ a k) -> walk (sz + a) k
       -- dynamic mark cannot match
       (Mark a _ _ k) -> walk (sz + a) k
@@ -2005,7 +2016,7 @@ reflectValue0 rty rtm = goV0
       ps <- traverse (resolveTy rty) (EC.setToList ps)
       de <- traverse (\(k, v) -> (,) <$> resolveTy rty k <*> goV v) (mapToList de)
       ANF.Mark (fromIntegral a) ps de <$> goK k
-    goK (Push f a cix _ _rsect k) =
+    goK (Push f a cix _ _rsect _ k) =
       ANF.Push
         (fromIntegral f)
         (fromIntegral a)
@@ -2165,13 +2176,14 @@ reifyValue0Canon combs tys tms rty rtm = goV
           Mark (fromIntegral a) (setFromList ps) (mapFromList de) k
     goK (ANF.Push f a gr k) =
       goIx gr >>= \case
-        (cix, RComb (Lam _ fr sect)) ->
+        (cix, RComb (Comb (LamI _ fr sect cell))) ->
           Push
             (fromIntegral f)
             (fromIntegral a)
             cix
             fr
             sect
+            cell
             <$> goK k
         (CIx r _ _, _) ->
           die [] . err $
@@ -2262,13 +2274,14 @@ reifyValue0 (combs, rty, rtm) = goV
           Mark (fromIntegral a) (setFromList ps) (mapFromList de) k
     goK (ANF.Push f a gr k) =
       goIx gr >>= \case
-        (cix, RComb (Lam _ fr sect)) ->
+        (cix, RComb (Comb (LamI _ fr sect cell))) ->
           Push
             (fromIntegral f)
             (fromIntegral a)
             cix
             fr
             sect
+            cell
             <$> goK k
         (CIx r _ _, _) ->
           die [] . err $

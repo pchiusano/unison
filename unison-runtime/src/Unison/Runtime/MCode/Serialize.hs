@@ -111,7 +111,7 @@ putSection = \case
   Match i b -> putTag MatchT <> pInt i <> putBranch b
   Yield a -> putTag YieldT <> putArgs a
   Ins i s -> putTag InsT <> putInstr i <> putSection s
-  Let s ci f bd ->
+  Let s ci f bd _ ->
     putTag LetT
       <> putSection s
       <> putCombIx ci
@@ -141,7 +141,7 @@ getSection =
     YieldT -> Yield <$> getArgs
     InsT -> Ins <$> getInstr <*> getSection
     LetT ->
-      Let <$> getSection <*> getCombIx <*> gInt <*> getSection
+      Let <$> getSection <*> getCombIx <*> gInt <*> getSection <*> pure noNativeCell
     DieT -> Die <$> getString
     ExitT -> pure Exit
     DMatchT -> DMatch <$> getMaybe getReference <*> gInt <*> getBranch

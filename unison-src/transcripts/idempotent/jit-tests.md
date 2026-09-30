@@ -145,31 +145,77 @@ ackermann m n =
   else if n == 0 then ackermann (m - 1) 1
   else ackermann (m - 1) (ackermann m (n - 1))
 
+-- mutual non-tail recursion across two definitions
+evenDepth : Nat -> Nat
+evenDepth n = if n == 0 then 0 else 1 + oddDepth (n - 1)
+
+oddDepth : Nat -> Nat
+oddDepth n = if n == 0 then 1 else 1 + evenDepth (n - 1)
+
+-- three calls deep; only the innermost hands over to the interpreter
+inner : Nat -> Nat
+inner n = Text.size (Nat.toText n) + n
+
+middle : Nat -> Nat
+middle n = inner n + 1
+
+outer : Nat -> Nat
+outer n = middle n + 1
+
+-- a call inside a `let` binding's own `let`: its frame is not the function's
+letInBinding : Nat -> Nat
+letInBinding n =
+  x =
+    y = inner n
+    y + 1
+  x * 2
+
 > fib 20
 > depth 1000000
 > ackermann 2 10
+> evenDepth 100001
+> outer 41
+> letInBinding 41
 ```
 
 ``` ucm :added-by-ucm
   Loading changes detected in scratch.u.
 
-  + ackermann : Nat -> Nat -> Nat
-  + depth     : Nat -> Nat
-  + fib       : Nat -> Nat
+  + ackermann    : Nat -> Nat -> Nat
+  + depth        : Nat -> Nat
+  + evenDepth    : Nat -> Nat
+  + fib          : Nat -> Nat
+  + inner        : Nat -> Nat
+  + letInBinding : Nat -> Nat
+  + middle       : Nat -> Nat
+  + oddDepth     : Nat -> Nat
+  + outer        : Nat -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    16 | > fib 20
+    41 | > fib 20
            ⧩
            6765
 
-    17 | > depth 1000000
+    42 | > depth 1000000
            ⧩
            1000000
 
-    18 | > ackermann 2 10
+    43 | > ackermann 2 10
            ⧩
            23
+
+    44 | > evenDepth 100001
+           ⧩
+           100002
+
+    45 | > outer 41
+           ⧩
+           45
+
+    46 | > letInBinding 41
+           ⧩
+           88
 ```
 
 ## Data: allocation and pattern matching
@@ -509,10 +555,31 @@ bits n =
     b = if Choose.choose then 1 else 0
     b + 2 * bits (n - 1)
 
+-- a non-tail call whose callee performs an operation: the caller's frame is
+-- captured by the handler and resumed twice
+pick : Nat ->{Choose} Nat
+pick n = if Choose.choose then n else n + 1
+
+addPicked : Nat ->{Choose} Nat
+addPicked n =
+  x = pick n
+  x + 100
+
+-- inline bindings (an `if` bound by a `let`), one of which performs an
+-- operation from inside the binding
+picky : Nat ->{Choose} Nat
+picky n =
+  x = if n == 0 then 1 else n
+  y = if x > 10 then Nat.drop x 10 else x + 100
+  z = if Choose.choose then y else x
+  x + y + z
+
 > runCounter 0 '(sumNext 1000)
 > (runAbort '(findFirst 144 0), runAbort '(findFirst 145 0))
 > runChoose '(bits 3)
 > runCounter 10 '(runChoose '(Counter.next + bits 2))
+> runChoose '(addPicked 5)
+> (runChoose '(picky 5), runChoose '(picky 50))
 ```
 
 ``` ucm :added-by-ucm
@@ -522,8 +589,11 @@ bits n =
   + structural ability Choose
   + structural ability Counter
 
+  + addPicked  : Nat ->{Choose} Nat
   + bits       : Nat ->{Choose} Nat
   + findFirst  : Nat -> Nat ->{Abort} Nat
+  + pick       : Nat ->{Choose} Nat
+  + picky      : Nat ->{Choose} Nat
   + runAbort   : '{g, Abort} a ->{g} Optional a
   + runChoose  : '{g, Choose} a ->{g} [a]
   + runCounter : Nat -> '{g, Counter} a ->{g} a
@@ -531,21 +601,29 @@ bits n =
 
   Run `update` to apply these changes to your codebase.
 
-    54 | > runCounter 0 '(sumNext 1000)
+    73 | > runCounter 0 '(sumNext 1000)
            ⧩
            499500
 
-    55 | > (runAbort '(findFirst 144 0), runAbort '(findFirst 145 0))
+    74 | > (runAbort '(findFirst 144 0), runAbort '(findFirst 145 0))
            ⧩
            (Some 12, None)
 
-    56 | > runChoose '(bits 3)
+    75 | > runChoose '(bits 3)
            ⧩
            [7, 3, 5, 1, 6, 2, 4, 0]
 
-    57 | > runCounter 10 '(runChoose '(Counter.next + bits 2))
+    76 | > runCounter 10 '(runChoose '(Counter.next + bits 2))
            ⧩
            [13, 11, 12, 10]
+
+    77 | > runChoose '(addPicked 5)
+           ⧩
+           [105, 106]
+
+    78 | > (runChoose '(picky 5), runChoose '(picky 50))
+           ⧩
+           ([215, 115], [130, 140])
 ```
 
 ## Preemption

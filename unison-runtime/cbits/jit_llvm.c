@@ -61,7 +61,9 @@ int unison_jit_init(void) {
 
 // Parses a module from IR text, optimizes it, and hands it to the JIT.
 // `passes` is a pass pipeline such as "default<O2>", or "" for none.
-int unison_jit_add_module(const char *ir, size_t len, const char *passes) {
+// If out_opt is non-null, it receives the module's text after the passes
+// ran (malloc'd with LLVM's allocator; free it with unison_jit_free_string).
+int unison_jit_add_module(const char *ir, size_t len, const char *passes, char **out_opt) {
   LLVMContextRef ctx = LLVMContextCreate();
   LLVMOrcThreadSafeContextRef tsctx =
       LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx);
@@ -87,6 +89,7 @@ int unison_jit_add_module(const char *ir, size_t len, const char *passes) {
       return fail("passes", e);
     }
   }
+  if (out_opt) *out_opt = LLVMPrintModuleToString(mod);
 
   LLVMOrcThreadSafeModuleRef tsm = LLVMOrcCreateNewThreadSafeModule(mod, tsctx);
   LLVMOrcDisposeThreadSafeContext(tsctx);
@@ -98,6 +101,8 @@ int unison_jit_add_module(const char *ir, size_t len, const char *passes) {
   }
   return 0;
 }
+
+void unison_jit_free_string(char *s) { LLVMDisposeMessage(s); }
 
 // Returns the address of a compiled symbol, or 0 on failure.
 // Code is generated the first time a symbol from its module is looked up.

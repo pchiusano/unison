@@ -148,6 +148,7 @@ module Unison.Runtime.Stack
     grabSeg,
     truncateSeg,
     ensure,
+    ensureGenerously,
     duplicate,
     discardFrame,
     saveFrame,
@@ -307,6 +308,7 @@ data K
       !CombIx -- resumption section reference
       !Int -- stack guard
       !(RSection Val) -- resumption section
+      !(Ptr.Ptr NativeCell) -- native code cell of the resumption section's combinator
       !K
   | -- saved context during affine handler
     Local
@@ -522,7 +524,7 @@ traceK :: Reference -> K -> [(Reference, Int)]
 traceK begin = dedup (begin, 1)
   where
     dedup p (Mark _ _ _ k) = dedup p k
-    dedup p@(cur, n) (Push _ _ (CIx r _ _) _ _ k)
+    dedup p@(cur, n) (Push _ _ (CIx r _ _) _ _ _ k)
       | cur == r = dedup (cur, 1 + n) k
       | otherwise = p : dedup (r, 1) k
     dedup p _ = [p]
@@ -612,7 +614,7 @@ frameDataSize = go 0
     go sz KE = sz
     go sz (CB _) = sz
     go sz (Mark a _ _ k) = go (sz + a) k
-    go sz (Push f a _ _ _ k) =
+    go sz (Push f a _ _ _ _ k) =
       go (sz + f + a) k
     go _ (Keep {}) =
       error "frameDataSize: captured Keep frame"
@@ -1218,6 +1220,15 @@ ensure stk@(Stack ap fp sp ustk bstk) sze
       | otherwise = 10240
 {-# INLINE ensure #-}
 
+-- | Like 'ensure', but grows by at least the stack's current size. Native
+-- code pays for every growth by unwinding all its frames to the
+-- interpreter, so it asks for room in big steps.
+ensureGenerously :: Stack -> SZ -> IO Stack
+ensureGenerously stk@(Stack _ _ _ _ bstk) sze
+  | sze <= 0 = pure stk
+  | otherwise = ensure stk (max sze (sizeofMutableArray bstk))
+{-# INLINE ensureGenerously #-}
+
 bump :: Stack -> IO Stack
 bump (Stack ap fp sp ustk bstk) = do
   let stk' = Stack ap fp (sp + 1) ustk bstk
@@ -1524,7 +1535,7 @@ instance Show K where
     where
       go _ KE = "]"
       go _ (CB _) = "]"
-      go com (Push f a ci _g _rsect k) =
+      go com (Push f a ci _g _rsect _ k) =
         com ++ show (f, a, ci) ++ go "," k
       go com (Mark a ps _ k) =
         com ++ "M " ++ show a ++ " " ++ show ps ++ go "," k
@@ -1580,7 +1591,7 @@ contTermRefs f (Mark _ _ m k) =
       _ -> mempty
   )
     <> contTermRefs f k
-contTermRefs f (Push _ _ (CIx r _ _) _ _ k) =
+contTermRefs f (Push _ _ (CIx r _ _) _ _ _ k) =
   f r <> contTermRefs f k
 contTermRefs _ _ = mempty
 
@@ -1628,7 +1639,7 @@ instance Eq K where
   CB cb == CB cb' = cb == cb'
   Mark a ps m k == Mark a' ps' m' k' =
     a == a' && ps == ps' && liftEq (==) m m' && k == k'
-  Push f a ci _ _ k == Push f' a' ci' _ _ k' =
+  Push f a ci _ _ _ k == Push f' a' ci' _ _ _ k' =
     f == f' && a == a' && ci == ci' && k == k'
   _ == _ = False
 
@@ -1731,7 +1742,7 @@ compareK tyEq = \cases
       <> compare ps ps'
       <> liftCompare (compareVal tyEq) m m'
       <> compareK tyEq k k'
-  (Push f a ci _ _sect k) (Push f' a' ci' _ _sect' k') ->
+  (Push f a ci _ _sect _ k) (Push f' a' ci' _ _sect' _ k') ->
     compare f f'
       <> compare a a'
       <> compare ci ci'

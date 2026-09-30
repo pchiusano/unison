@@ -132,7 +132,10 @@ data GlobalOptions = GlobalOptions
     exitOption :: ShouldExit,
     lspFormattingConfig :: LspFormattingConfig,
     -- | JIT mode: "off", "on" or "eager". Overrides the UNISON_JIT environment variable.
-    jitOption :: Maybe String
+    jitOption :: Maybe String,
+    -- | Where to write the JIT's generated LLVM IR: a directory, or "-" for stderr.
+    -- Overrides the UNISON_JIT_DUMP_IR environment variable.
+    jitDumpIROption :: Maybe String
   }
   deriving (Show, Eq)
 
@@ -293,9 +296,10 @@ globalOptionsParser = do
   exitOption <- exitParser
   lspFormattingConfig <- lspFormattingParser
   jitOption <- jitParser
+  jitDumpIROption <- jitDumpIRParser
 
   pure
-    GlobalOptions {codebasePathOption, exitOption, lspFormattingConfig, jitOption}
+    GlobalOptions {codebasePathOption, exitOption, lspFormattingConfig, jitOption, jitDumpIROption}
 
 codebasePathParser :: Parser (Maybe CodebasePathOption)
 codebasePathParser = do
@@ -328,6 +332,13 @@ jitParser =
     long "jit"
       <> metavar "MODE"
       <> help "[Experimental] JIT compilation mode: off, on, or eager. Same as the UNISON_JIT environment variable."
+
+jitDumpIRParser :: Parser (Maybe String)
+jitDumpIRParser =
+  optional . strOption $
+    long "jit-dump-ir"
+      <> metavar "DIR"
+      <> help "[Experimental] Write the LLVM IR the JIT generates, with the MCode of each function as a comment, to one .ll file per definition in DIR, or to stderr if DIR is '-'. Same as the UNISON_JIT_DUMP_IR environment variable."
 
 lspFormattingParser :: Parser LspFormattingConfig
 lspFormattingParser = flag LspFormatDisabled LspFormatEnabled (long "lsp-format" <> help lspFormatHelp)

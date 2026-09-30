@@ -15,6 +15,7 @@ module Unison.Runtime.JIT.Codegen
     CtxOffsets (..),
     Function (..),
     genFunction,
+    modulePrelude,
   )
 where
 
@@ -27,16 +28,17 @@ import Data.Word (Word64)
 import Foreign.Ptr (Ptr, WordPtr (..), ptrToWordPtr)
 import GHC.Float (castDoubleToWord64)
 import Unison.Runtime.JIT.Exits (Exit (..))
+import Unison.Runtime.JIT.Frames (Frame (..))
 import Unison.Runtime.JIT.Layout
 import Unison.Runtime.JIT.Pool
 import Unison.Runtime.MCode
-import Unison.Runtime.Machine.Types (MSection)
+import Unison.Runtime.Machine.Types (MCombs, MSection)
 import Unison.Runtime.Stack (Val)
 import Unison.Util.EnumContainers qualified as EC
 
 -- | Byte offsets of the fields of the C @Ctx@, from @unison_jit_ctx_layout@.
 data CtxOffsets = CtxOffsets
-  { oUstk, oBstk, oPool, oStackSize, oHplim, oAp, oFp, oSp, oMaxSp, oStressPoll, oStressPollLeft :: !Int
+  { oUstk, oBstk, oPool, oStackSize, oHplim, oAp, oFp, oSp, oMaxSp, oStressPoll, oStressPollLeft, oStressCallee, oStressCalleeLeft, oFrames, oNFrames, oMaxFrames, oCStackLimit :: !Int
   }
 
 data Env = Env
@@ -44,8 +46,14 @@ data Env = Env
     envCtx :: CtxOffsets,
     -- | index of this module's first exit in the global table
     envExitBase :: Int,
+    -- | index of this module's first frame in the global frame table
+    envFrameBase :: Int,
     -- | emit the stress-mode poll countdown
-    envStressPoll :: Bool
+    envStressPoll :: Bool,
+    -- | emit the stress-mode "callee not compiled" countdown
+    envStressCallee :: Bool,
+    -- | the group being compiled, for the arity of Let body combinators
+    envCombs :: MCombs
   }
 
 data Function = Function
@@ -53,8 +61,14 @@ data Function = Function
     fnIR :: String,
     -- | in index order, starting at the module's base plus the count before this function
     fnExits :: [Exit],
+    -- | likewise for the frame table
+    fnFrames :: [Frame],
     fnCell :: Ptr NativeCell
   }
+
+-- | Declarations every module needs.
+modulePrelude :: String
+modulePrelude = "declare ptr @llvm.stacksave.p0()\n"
 
 -- ---------------------------------------------------------------------------
 -- The generator
@@ -68,6 +82,9 @@ data GS = GS
     -- | exits, reversed
     gsExits :: [Exit],
     gsNExits :: !Int,
+    -- | frames, reversed
+    gsFrames :: [Frame],
+    gsNFrames :: !Int,
     -- | highest frame offset used
     gsMaxK :: !Int,
     -- | set when the function can't be compiled after all
@@ -175,48 +192,6 @@ ctxField env f = do
 -- ---------------------------------------------------------------------------
 -- Exits
 
--- | Adds an exit and returns its global index.
-addExit :: Env -> Exit -> Gen Int
-addExit env e = do
-  n <- gets gsNExits
-  modify' (\s -> s {gsExits = e : gsExits s, gsNExits = n + 1})
-  pure (envExitBase env + n)
-
--- | A block that writes the frame back to the Unison stack, records the
--- stack pointers in @Ctx@, and returns the exit's index. @d@ is the frame
--- depth at the exit point; every slot 1..d is written back.
-exitBlock :: Env -> Int -> Exit -> Gen String
-exitBlock = exitBlockNamed "exit"
-
-exitBlockNamed :: String -> Env -> Int -> Exit -> Gen String
-exitBlockNamed base env d e = do
-  ix <- addExit env e
-  sideBlock base $ do
-    forM_ [1 .. d] $ \k -> do
-      u <- loadU k
-      ua <- stackAddrU k
-      emit ("store i64 " ++ u ++ ", ptr " ++ ua)
-      b <- loadB k
-      ba <- stackAddrB k
-      emit ("store ptr " ++ b ++ ", ptr " ++ ba)
-    ap <- ctxField env oAp
-    emit ("store i64 %ap, ptr " ++ ap)
-    fp <- ctxField env oFp
-    emit ("store i64 %fp, ptr " ++ fp)
-    sp <- ctxField env oSp
-    f <- fpPlus d
-    emit ("store i64 " ++ f ++ ", ptr " ++ sp)
-    emit ("ret i64 " ++ show ix)
-
--- | Terminates the current block with a resume exit at this section.
-exitResume :: Env -> CombIx -> Int -> MSection -> Gen ()
-exitResume env cix d sect = do
-  l <- exitBlock env d (Resume cix sect)
-  emit ("br label %" ++ l)
-
--- ---------------------------------------------------------------------------
--- Functions
-
 data FnEnv = FnEnv
   { feEnv :: Env,
     feCix :: CombIx,
@@ -225,29 +200,194 @@ data FnEnv = FnEnv
     feCell :: Ptr NativeCell,
     feHead :: String,
     -- | registers holding the type-tag and boolean closures, loaded at entry
-    feTagChar, feTagFloat, feTagInt, feTagNat, feTrue, feFalse :: String
+    feTagChar, feTagFloat, feTagInt, feTagNat, feTrue, feFalse :: String,
+    -- | the inline @Let@ bindings the code being generated is inside of,
+    -- innermost first
+    feEnclosing :: [Enclosing]
   }
+
+-- | An inline @Let@ binding being generated. Inside it, the interpreter's
+-- view is a fresh frame starting at @enBase@ (its @ap = fp = sp0@), so
+-- exits write a frame record for it, and a @Yield@ delivers the results
+-- to the body instead of returning.
+data Enclosing = Enclosing
+  { -- | frame table index
+    enIndex :: Int,
+    -- | frame offset of the binding's frame base
+    enBase :: Int,
+    -- | label of the body block
+    enBody :: String,
+    -- | number of results the body expects
+    enResults :: Int
+  }
+
+-- | The frame base the interpreter would see: @fp@ for the function's own
+-- frame, or the innermost inline binding's base.
+frameBase :: FnEnv -> Gen String
+frameBase fe = case feEnclosing fe of
+  [] -> pure "%fp"
+  e : _ -> fpPlus (enBase e)
+
+-- | Writes the frame records for every enclosing inline binding,
+-- innermost first (the order a chain of native callers would write them).
+unwindEnclosing :: FnEnv -> Gen ()
+unwindEnclosing fe = go (feEnclosing fe)
+  where
+    go [] = pure ()
+    go (e : outer) = do
+      let (fsz, asz) = case outer of
+            [] -> (enBase e, Nothing)
+            o : _ -> (enBase e - enBase o, Just "0")
+      writeRecord (feEnv fe) (enIndex e) fsz asz
+      go outer
+
+-- | Writes one frame record. The pending-argument count is @fp - ap@
+-- unless given.
+writeRecord :: Env -> Int -> Int -> Maybe String -> Gen ()
+writeRecord env ix fsz masz = do
+  fr <- ctxField env oFrames
+  frp <- fresh "frames"
+  emit (frp ++ " = load ptr, ptr " ++ fr)
+  nfa <- ctxField env oNFrames
+  nf <- fresh "nf"
+  emit (nf ++ " = load i64, ptr " ++ nfa)
+  off <- fresh "off"
+  emit (off ++ " = mul i64 " ++ nf ++ ", 3")
+  rec0 <- fresh "rec"
+  emit (rec0 ++ " = getelementptr i64, ptr " ++ frp ++ ", i64 " ++ off)
+  emit ("store i64 " ++ show ix ++ ", ptr " ++ rec0)
+  rec1 <- fresh "rec"
+  emit (rec1 ++ " = getelementptr i64, ptr " ++ rec0 ++ ", i64 1")
+  emit ("store i64 " ++ show fsz ++ ", ptr " ++ rec1)
+  rec2 <- fresh "rec"
+  emit (rec2 ++ " = getelementptr i64, ptr " ++ rec0 ++ ", i64 2")
+  asz <- case masz of
+    Just a -> pure a
+    Nothing -> do
+      a <- fresh "asz"
+      emit (a ++ " = sub i64 %fp, %ap")
+      pure a
+  emit ("store i64 " ++ asz ++ ", ptr " ++ rec2)
+  nf' <- fresh "nf"
+  emit (nf' ++ " = add i64 " ++ nf ++ ", 1")
+  emit ("store i64 " ++ nf' ++ ", ptr " ++ nfa)
+
+-- | Adds an exit and returns its global index.
+addExit :: Env -> Exit -> Gen Int
+addExit env e = do
+  n <- gets gsNExits
+  modify' (\s -> s {gsExits = e : gsExits s, gsNExits = n + 1})
+  pure (envExitBase env + n)
+
+-- | Adds a frame table entry and returns its global index.
+addFrame :: Env -> Frame -> Gen Int
+addFrame env f = do
+  n <- gets gsNFrames
+  modify' (\s -> s {gsFrames = f : gsFrames s, gsNFrames = n + 1})
+  pure (envFrameBase env + n)
+
+-- | Writes slots 1..d back to the Unison stack.
+writeFrame :: Int -> Gen ()
+writeFrame d =
+  forM_ [1 .. d] $ \k -> do
+    u <- loadU k
+    ua <- stackAddrU k
+    emit ("store i64 " ++ u ++ ", ptr " ++ ua)
+    b <- loadB k
+    ba <- stackAddrB k
+    emit ("store ptr " ++ b ++ ", ptr " ++ ba)
+
+-- | A stress-mode countdown on a pair of Ctx fields; gives an i1 that is
+-- true every Nth time.
+stressFire :: Env -> (CtxOffsets -> Int) -> (CtxOffsets -> Int) -> Gen String
+stressFire env oLeft oEvery = do
+  left <- ctxField env oLeft
+  n <- fresh "left"
+  emit (n ++ " = load i64, ptr " ++ left)
+  n' <- fresh "left"
+  emit (n' ++ " = sub i64 " ++ n ++ ", 1")
+  fire <- fresh "fire"
+  emit (fire ++ " = icmp sle i64 " ++ n' ++ ", 0")
+  every <- ctxField env oEvery
+  ev <- fresh "every"
+  emit (ev ++ " = load i64, ptr " ++ every)
+  reset <- fresh "reset"
+  emit (reset ++ " = select i1 " ++ fire ++ ", i64 " ++ ev ++ ", i64 " ++ n')
+  emit ("store i64 " ++ reset ++ ", ptr " ++ left)
+  pure fire
+
+-- | Loads the callee's code pointer from its cell. Gives the pointer and
+-- an i1 saying whether the callee must be treated as not compiled.
+loadCallee :: Env -> Ptr NativeCell -> Gen (String, String)
+loadCallee env cell = do
+  let WordPtr addr = ptrToWordPtr cell
+  fnp <- fresh "fn"
+  emit (fnp ++ " = load ptr, ptr inttoptr (i64 " ++ show addr ++ " to ptr)")
+  isNull <- fresh "isnull"
+  emit (isNull ++ " = icmp eq ptr " ++ fnp ++ ", null")
+  if envStressCallee env
+    then do
+      fire <- stressFire env oStressCalleeLeft oStressCallee
+      skip <- fresh "skip"
+      emit (skip ++ " = or i1 " ++ isNull ++ ", " ++ fire)
+      pure (fnp, skip)
+    else pure (fnp, isNull)
+
+-- | A block that writes the frame back to the Unison stack, records the
+-- stack pointers in @Ctx@, and returns the exit's index. @d@ is the frame
+-- depth at the exit point; every slot 1..d is written back.
+exitBlock :: FnEnv -> Int -> Exit -> Gen String
+exitBlock = exitBlockNamed "exit"
+
+exitBlockNamed :: String -> FnEnv -> Int -> Exit -> Gen String
+exitBlockNamed base fe d e = do
+  let env = feEnv fe
+  ix <- addExit env e
+  sideBlock base $ do
+    writeFrame d
+    b <- frameBase fe
+    ap <- ctxField env oAp
+    emit ("store i64 " ++ (if null (feEnclosing fe) then "%ap" else b) ++ ", ptr " ++ ap)
+    fp <- ctxField env oFp
+    emit ("store i64 " ++ b ++ ", ptr " ++ fp)
+    sp <- ctxField env oSp
+    f <- fpPlus d
+    emit ("store i64 " ++ f ++ ", ptr " ++ sp)
+    unwindEnclosing fe
+    emit ("ret i64 " ++ show ix)
+
+-- | Terminates the current block with a resume exit at this section.
+exitResume :: FnEnv -> Int -> MSection -> Gen ()
+exitResume fe d sect = do
+  l <- exitBlock fe d (Resume (feCix fe) sect)
+  emit ("br label %" ++ l)
+
+-- ---------------------------------------------------------------------------
+-- Functions
 
 -- | Compiles one combinator, or says why it can't be.
 genFunction :: Env -> String -> CombIx -> Int -> Int -> MSection -> Ptr NativeCell -> Either String Function
 genFunction env name cix arity frameSize body cell
   | not (startsSupported body) = Left "body starts with something the JIT doesn't compile"
   | otherwise =
-      let fe = FnEnv env cix arity frameSize cell "head" "%tag.char" "%tag.float" "%tag.int" "%tag.nat" "%val.true" "%val.false"
-          gs0 = GS 0 [] ("head", []) [] 0 arity Nothing
+      let fe = FnEnv env cix arity frameSize cell "head" "%tag.char" "%tag.float" "%tag.int" "%tag.nat" "%val.true" "%val.false" []
+          gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity Nothing
           ((), gs) = runState (genHead fe body >> startBlock "unreachable") gs0
           blocks = [b | b@(l, _) <- reverse (gsBlocks gs), l /= "unreachable"]
           maxK = max (gsMaxK gs) (arity + frameSize)
-          entry = entryBlock env arity frameSize maxK
+          entry = entryBlock env arity maxK
           text =
             unlines $
               ["define i64 @" ++ name ++ "(ptr %ctx, i64 %ap, i64 %fp, i64 %sp) {"]
                 ++ entry
                 ++ concat [(l ++ ":") : map ("  " ++) is | (l, is) <- blocks]
                 ++ ["}"]
+          -- the grow exit asks for what the entry check demanded
+          fixGrow (GrowStack _ c) = GrowStack (maxK - arity) c
+          fixGrow e = e
        in case gsFailed gs of
             Just why -> Left why
-            Nothing -> Right (Function name text (reverse (gsExits gs)) cell)
+            Nothing -> Right (Function name text (map fixGrow (reverse (gsExits gs))) (reverse (gsFrames gs)) cell)
 
 -- The first instruction decides whether compiling is worth anything.
 startsSupported :: MSection -> Bool
@@ -259,12 +399,15 @@ startsSupported = \case
   DMatch {} -> True
   Call {} -> True
   Yield {} -> True
+  Let b _ _ _ _ -> startsSupported b
   _ -> False
 
 -- | The entry block: allocas, addresses from @Ctx@, argument loads, the
--- stack check, then a branch to the loop head.
-entryBlock :: Env -> Int -> Int -> Int -> [String]
-entryBlock env arity frameSize maxK =
+-- stack check, then a branch to the loop head. @maxK@ is the highest
+-- frame offset the function touches, which is at least the frame size and
+-- covers the arguments of every call it makes.
+entryBlock :: Env -> Int -> Int -> [String]
+entryBlock env arity maxK =
   map ("  " ++) $
     ["%u" ++ show k ++ " = alloca i64" | k <- [1 .. maxK]]
       ++ ["%b" ++ show k ++ " = alloca ptr" | k <- [1 .. maxK]]
@@ -294,7 +437,7 @@ entryBlock env arity frameSize maxK =
            "store i64 %maxsp.new, ptr %maxsp.a"
          ]
       -- the interpreter's check: sp + size + 1 < stack size, else grow
-      ++ [ "%need = add i64 %sp, " ++ show (frameSize + 1),
+      ++ [ "%need = add i64 %sp, " ++ show (maxK - arity + 1),
            "%room = icmp slt i64 %need, %stack.size",
            "br i1 %room, label %head, label %grow"
          ]
@@ -311,8 +454,9 @@ genHead :: FnEnv -> MSection -> Gen ()
 genHead fe body = do
   let env = feEnv fe
       d = feArity fe
-  -- the entry block's stack check branches to %grow when the frame doesn't fit
-  _ <- exitBlockNamed "grow" env d (GrowStack (feFrameSize fe) (feCell fe))
+  -- the entry block's stack check branches to %grow when the frame doesn't
+  -- fit; the size asked for is fixed up in genFunction once it is known
+  _ <- exitBlockNamed "grow" fe d (GrowStack (feFrameSize fe) (feCell fe))
   -- poll
   -- The load is volatile: another thread sets HpLim, and without volatile
   -- LLVM would hoist the load out of the loop and the poll would never fire.
@@ -320,7 +464,7 @@ genHead fe body = do
   emit (hp ++ " = load volatile ptr, ptr %hplim.p")
   stop <- fresh "stop"
   emit (stop ++ " = icmp eq ptr " ++ hp ++ ", null")
-  reenter <- exitBlock env d (Reenter (feCell fe))
+  reenter <- exitBlock fe d (Reenter (feCell fe))
   bodyLabel <- freshLabel "body"
   when (envStressPoll env) $ do
     left <- ctxField env oStressPollLeft
@@ -354,7 +498,112 @@ genSection fe d sect = case sect of
     x <- loadU (d - i)
     genBranch fe d x br sect
   DMatch _ i br -> genDMatch fe d i br sect
-  _ -> exitResume (feEnv fe) (feCix fe) d sect
+  Let binding bcix f body cell -> genLet fe d binding bcix f body cell sect
+  _ -> exitResume fe d sect
+
+-- | A @Let@. A binding that is a call to a known function becomes a native
+-- call. Other bindings are generated inline: their exits write a frame
+-- record for this @Let@, and their @Yield@ delivers the results to the
+-- body. If neither works, the interpreter takes the @Let@, and pushes the
+-- frame itself.
+genLet :: FnEnv -> Int -> MSection -> CombIx -> Int -> MSection -> Ptr NativeCell -> MSection -> Gen ()
+genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCombs env) of
+  Just (Comb (LamI bodyArity _ _ _))
+    | m <- bodyArity - d,
+      m >= 0 -> case binding of
+        Call _ _ comb args
+          | Comb (LamI arity _ _ ccell) <- unRComb comb,
+            let srcs = argSources fe d args,
+            length srcs == arity -> do
+              ix <- addFrame env (Frame bcix f body cell)
+              genNonTailCall fe d d ccell srcs sect (Just (ix, d)) $ do
+                loadResults d m
+                genSection fe (d + m) body
+        _ | startsSupported binding -> do
+              ix <- addFrame env (Frame bcix f body cell)
+              bodyL <- freshLabel "body"
+              let fe' = fe {feEnclosing = Enclosing ix d bodyL m : feEnclosing fe}
+              ok <- attempt (genSection fe' d binding)
+              if ok
+                then do
+                  startBlock bodyL
+                  genSection fe (d + m) body
+                else exitResume fe d sect
+        _ -> exitResume fe d sect
+  _ -> exitResume fe d sect
+  where
+    env = feEnv fe
+
+-- | Loads @m@ results left on the stack above offset @base@ into their slots.
+loadResults :: Int -> Int -> Gen ()
+loadResults base m =
+  forM_ [1 .. m] $ \j -> do
+    ua <- stackAddrU (base + j)
+    u <- fresh "u"
+    emit (u ++ " = load i64, ptr " ++ ua)
+    storeU (base + j) u
+    ba <- stackAddrB (base + j)
+    b <- fresh "b"
+    emit (b ++ " = load ptr, ptr " ++ ba)
+    storeB (base + j) b
+
+-- | A native call that returns here. The callee's frame starts at offset
+-- @base@ (the current depth for a @Let@ binding, or an enclosing binding's
+-- base for a tail call inside one); its arguments come from the slots
+-- @srcs@ at the current depth @d@. On @OK@ the continuation runs with the
+-- results on the stack above @base@. Otherwise the slots up to @base@ are
+-- written back, the frame record for this @Let@ (if given: index and frame
+-- size) and those of the enclosing bindings are written, and the status is
+-- passed on. If the callee can't be called, the interpreter resumes at
+-- @sect@.
+genNonTailCall :: FnEnv -> Int -> Int -> Ptr NativeCell -> [Int] -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
+genNonTailCall fe d base ccell srcs sect ownFrame continue = do
+  let env = feEnv fe
+      n = length srcs
+  (fnp, skip) <- loadCallee env ccell
+  slow <- exitBlock fe d (Resume (feCix fe) sect)
+  guardL <- freshLabel "guard"
+  emit ("br i1 " ++ skip ++ ", label %" ++ slow ++ ", label %" ++ guardL)
+  startBlock guardL
+  -- the C stack guard: exit instead of calling when the budget is used up
+  csp <- fresh "csp"
+  emit (csp ++ " = call ptr @llvm.stacksave.p0()")
+  cspi <- fresh "csp"
+  emit (cspi ++ " = ptrtoint ptr " ++ csp ++ " to i64")
+  lim <- ctxField env oCStackLimit
+  limv <- fresh "lim"
+  emit (limv ++ " = load i64, ptr " ++ lim)
+  deep <- fresh "deep"
+  emit (deep ++ " = icmp ult i64 " ++ cspi ++ ", " ++ limv)
+  callL <- freshLabel "call"
+  emit ("br i1 " ++ deep ++ ", label %" ++ slow ++ ", label %" ++ callL)
+  startBlock callL
+  -- arguments go above the callee's base, as moveArgs would put them
+  vals <- loadSources srcs
+  forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
+    ua <- stackAddrU (base + n - j)
+    emit ("store i64 " ++ u ++ ", ptr " ++ ua)
+    ba <- stackAddrB (base + n - j)
+    emit ("store ptr " ++ b ++ ", ptr " ++ ba)
+  bp <- fpPlus base
+  top <- fpPlus (base + n)
+  r <- fresh "r"
+  emit (r ++ " = call i64 " ++ fnp ++ "(ptr %ctx, i64 " ++ bp ++ ", i64 " ++ bp ++ ", i64 " ++ top ++ ")")
+  ok <- fresh "ok"
+  emit (ok ++ " = icmp eq i64 " ++ r ++ ", 0")
+  -- the callee is exiting: record the frames the interpreter would have
+  -- pushed, and pass the status along
+  unwind <- sideBlock "unwind" $ do
+    writeFrame base
+    forM_ ownFrame $ \(ix, fdepth) -> case feEnclosing fe of
+      [] -> writeRecord env ix fdepth Nothing
+      e : _ -> writeRecord env ix (fdepth - enBase e) (Just "0")
+    unwindEnclosing fe
+    emit ("ret i64 " ++ r)
+  contL <- freshLabel "cont"
+  emit ("br i1 " ++ ok ++ ", label %" ++ contL ++ ", label %" ++ unwind)
+  startBlock contL
+  continue
 
 -- | Runs a generator that may fail. On failure the state is rolled back
 -- (except the name counter) and False is returned; nothing was emitted.
@@ -391,12 +640,12 @@ genBranch fe d x br sect = case br of
       l <- arm "case" s
       pure ("i64 " ++ signed w ++ ", label %" ++ l)
     emit ("switch i64 " ++ x ++ ", label %" ++ ldf ++ " [ " ++ unwords arms ++ " ]")
-  _ -> exitResume (feEnv fe) (feCix fe) d sect
+  _ -> exitResume fe d sect
   where
     arm base s = do
       label <- freshLabel base
       ok <- attempt (sideBlockNamed label (genSection fe d s))
-      unless ok $ sideBlockNamed label (exitResume (feEnv fe) (feCix fe) d sect)
+      unless ok $ sideBlockNamed label (exitResume fe d sect)
       pure label
 
 signed :: Word64 -> String
@@ -415,7 +664,7 @@ genDMatch fe d i br sect = do
   emit (tagBits ++ " = and i64 " ++ raw ++ ", 7")
   isEnum <- fresh "isenum"
   emit (isEnum ++ " = icmp eq i64 " ++ tagBits ++ ", " ++ show (lPtrTag layout))
-  other <- exitBlock env d (Resume (feCix fe) sect)
+  other <- exitBlock fe d (Resume (feCix fe) sect)
   enumL <- freshLabel "enum"
   emit ("br i1 " ++ isEnum ++ ", label %" ++ enumL ++ ", label %" ++ other)
   startBlock enumL
@@ -432,14 +681,20 @@ genDMatch fe d i br sect = do
   genBranch fe d tag br sect
 
 -- | The slots that an argument list selects, top first, as frame offsets.
-argSources :: Int -> Args -> [Int]
-argSources d = \case
+-- @VArgV@ means "everything in the frame above index i", and the frame
+-- the interpreter sees is the innermost inline binding's, if any.
+argSources :: FnEnv -> Int -> Args -> [Int]
+argSources fe d = \case
   ZArgs -> []
   VArg1 i -> [d - i]
   VArg2 i j -> [d - i, d - j]
   VArgR i l -> [d - i - k | k <- [0 .. l - 1]]
   VArgN v -> [d - i | i <- primArrayToList v]
-  VArgV i -> [d - k | k <- [0 .. d - i - 1]]
+  VArgV i -> [d - k | k <- [0 .. (d - base) - i - 1]]
+  where
+    base = case feEnclosing fe of
+      [] -> 0
+      e : _ -> enBase e
 
 -- | Loads the selected values into registers (a parallel move must read everything first).
 loadSources :: [Int] -> Gen [(String, String)]
@@ -448,16 +703,29 @@ loadSources ks = forM ks $ \k -> (,) <$> loadU k <*> loadB k
 -- | Return: move the results into place as @moveArgs@ then @frameArgs@ would,
 -- and hand them to the continuation.
 genYield :: FnEnv -> Int -> Args -> MSection -> Gen ()
+genYield fe d args _sect
+  | e : _ <- feEnclosing fe = do
+      -- inside an inline binding: the results go to the body
+      let srcs = argSources fe d args
+          n = length srcs
+      if n /= enResults e
+        then modify' (\s -> s {gsFailed = Just "binding yields the wrong number of values"})
+        else do
+          vals <- loadSources srcs
+          forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
+            storeU (enBase e + n - j) u
+            storeB (enBase e + n - j) b
+          emit ("br label %" ++ enBody e)
 genYield fe d args sect = do
   let env = feEnv fe
   -- pending arguments (fp /= ap) mean over-application; leave that to the interpreter
   pending <- fresh "pending"
   emit (pending ++ " = icmp ne i64 %ap, %fp")
-  slow <- exitBlock env d (Resume (feCix fe) sect)
+  slow <- exitBlock fe d (Resume (feCix fe) sect)
   fast <- freshLabel "yield"
   emit ("br i1 " ++ pending ++ ", label %" ++ slow ++ ", label %" ++ fast)
   startBlock fast
-  let srcs = argSources d args
+  let srcs = argSources fe d args
       n = length srcs
   vals <- loadSources srcs
   forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
@@ -477,11 +745,20 @@ genYield fe d args sect = do
 -- | A tail call: to this function (a loop) or to another one through its cell.
 genCall :: FnEnv -> Int -> CombIx -> RComb Val -> Args -> MSection -> Gen ()
 genCall fe d cix comb args sect
+  | e : _ <- feEnclosing fe = case unRComb comb of
+      -- a tail call inside an inline binding is a call that returns to the body
+      Comb (LamI arity _ _ ccell)
+        | let srcs = argSources fe d args,
+          length srcs == arity ->
+            genNonTailCall fe d (enBase e) ccell srcs sect Nothing $ do
+              loadResults (enBase e) (enResults e)
+              emit ("br label %" ++ enBody e)
+      _ -> exitResume fe d sect
   | cix == feCix fe = do
-      let srcs = argSources d args
+      let srcs = argSources fe d args
           n = length srcs
       if n /= feArity fe
-        then exitResume env (feCix fe) d sect
+        then exitResume fe d sect
         else do
           vals <- loadSources srcs
           forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
@@ -490,17 +767,13 @@ genCall fe d cix comb args sect
           emit ("br label %" ++ feHead fe)
   | otherwise = case unRComb comb of
       Comb (LamI arity _ _ cell) -> do
-        let srcs = argSources d args
+        let srcs = argSources fe d args
             n = length srcs
         if n /= arity
-          then exitResume env (feCix fe) d sect
+          then exitResume fe d sect
           else do
-            let WordPtr addr = ptrToWordPtr cell
-            fnp <- fresh "fn"
-            emit (fnp ++ " = load ptr, ptr inttoptr (i64 " ++ show addr ++ " to ptr)")
-            isNull <- fresh "isnull"
-            emit (isNull ++ " = icmp eq ptr " ++ fnp ++ ", null")
-            slow <- exitBlock env d (Resume (feCix fe) sect)
+            (fnp, isNull) <- loadCallee env cell
+            slow <- exitBlock fe d (Resume (feCix fe) sect)
             go <- freshLabel "tail"
             emit ("br i1 " ++ isNull ++ ", label %" ++ slow ++ ", label %" ++ go)
             startBlock go
@@ -514,7 +787,7 @@ genCall fe d cix comb args sect
             r <- fresh "r"
             emit (r ++ " = musttail call i64 " ++ fnp ++ "(ptr %ctx, i64 %ap, i64 %fp, i64 " ++ f ++ ")")
             emit ("ret i64 " ++ r)
-      _ -> exitResume env (feCix fe) d sect
+      _ -> exitResume fe d sect
   where
     env = feEnv fe
 
@@ -561,7 +834,7 @@ genInstr fe d instr sect k = case instr of
     y <- loadU (d - j)
     genPrim2 fe d op x y sect
     k (d + 1)
-  _ -> exitResume (feEnv fe) (feCix fe) d sect
+  _ -> exitResume fe d sect
 
 -- | Stores an unboxed result with its type tag at depth @d + 1@.
 result :: FnEnv -> Int -> String -> String -> Gen ()
@@ -590,7 +863,7 @@ cmp op x y = do
 -- | Branches to a resume exit if the condition holds, else continues.
 exitIf :: FnEnv -> Int -> MSection -> String -> Gen ()
 exitIf fe d sect c = do
-  slow <- exitBlock (feEnv fe) d (Resume (feCix fe) sect)
+  slow <- exitBlock fe d (Resume (feCix fe) sect)
   ok <- freshLabel "ok"
   emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ ok)
   startBlock ok

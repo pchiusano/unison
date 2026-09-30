@@ -280,7 +280,8 @@ Everything needed to run one compiled function end to end, with the smallest use
 
 Driven by measurements from M5, so the list is provisional.
 
-- Worker functions with register arguments for calls within a batch.
+- Worker functions with register arguments for calls within a batch. A self-recursive function is its own batch, so `fib` can have its worker call itself directly before batching exists. A worker's exit status has to come back through the register chain (a two-word return, or the result in `Ctx` and the status returned), and each worker frame still writes its slots and frame record on the way out. (Noted 2026-09-30 after reading the O2 output for `fib`.)
+- Booleans as `i1` in registers: a comparison result is only turned into the true/false closure when it is stored somewhere that escapes, and a `DMatch` on it becomes a branch. In `fib` today the `n < 2` test is six instructions and a load. Small enough to do before M6.
 - Native versions of whichever builtins the call-out statistics show to be hot. List operations are the likely first candidate (D19).
 - Under-saturated calls to function values.
 - Static linking of LLVM.

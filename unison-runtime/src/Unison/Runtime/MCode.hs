@@ -646,6 +646,7 @@ data GSection comb
       !CombIx -- body section refrence
       !Int -- stack safety
       !(GSection comb) -- body code
+      !(Ptr NativeCell) -- native code cell of the body's combinator (the re-entry point)
   | -- Throw an exception with the given message
     Die String
   | -- Immediately stop a thread of interpretation. This is more of
@@ -776,11 +777,47 @@ growNativeCellPool n (NativeCellPool _ _ capacity) = newNativeCellPool (max n (2
 -- cell from @base@, numbering them in order. Returns the count used.
 attachNativeCells ::
   Ptr NativeCell -> EnumMap Word64 (GCombs val comb) -> (Int, EnumMap Word64 (GCombs val comb))
-attachNativeCells base groups = (n, groups')
+attachNativeCells base groups = (n, fmap attachLets groups')
   where
     (groups', n) = runState (traverse (traverse attach) groups) 0
     attach (Comb (LamI a f s _)) = state \i -> (Comb (LamI a f s (nativeCellAt base i)), i + 1)
     attach c = pure c
+    -- Every Let names its body's combinator, which is in the same group;
+    -- the Let carries that combinator's cell so the interpreter can find
+    -- the body's native code when it pops the Let's frame. That only
+    -- works when the body combinator's arity is the depth of the frame the
+    -- interpreter has at that point. Inside a Let binding it isn't: the
+    -- binding runs in a fresh frame, but the combinator's arguments also
+    -- include the enclosing function's slots below that frame. So a Let
+    -- inside a binding gets no re-entry point and its body is interpreted.
+    attachLets combs = fmap attachComb combs
+      where
+        attachComb (Comb (LamI a f s c)) = Comb (LamI a f (setLets False s) c)
+        attachComb c = c
+        cellOf inBinding w
+          | inBinding = noNativeCell
+          | otherwise = case EC.lookup w combs of
+              Just (Comb (LamI _ _ _ c)) -> c
+              _ -> noNativeCell
+        setLets inB section = case section of
+          Let b cix@(CIx _ _ w) f bd _ -> Let (setLets True b) cix f (setLets inB bd) (cellOf inB w)
+          Ins i nx -> Ins i (setLets inB nx)
+          Match i bs -> Match i (setLetsB inB bs)
+          DMatch i j bs -> DMatch i j (setLetsB inB bs)
+          NMatch i j bs -> NMatch i j (setLetsB inB bs)
+          RMatch i s bs -> RMatch i (setLets inB s) (fmap (setLetsB inB) bs)
+          App {} -> section
+          Call {} -> section
+          Jump {} -> section
+          Yield {} -> section
+          Die {} -> section
+          Exit -> section
+        setLetsB inB = \case
+          Test1 i s d -> Test1 i (setLets inB s) (setLets inB d)
+          Test2 i s j t d -> Test2 i (setLets inB s) j (setLets inB t) (setLets inB d)
+          TestW d m -> TestW (setLets inB d) (fmap (setLets inB) m)
+          TestT d m -> TestT (setLets inB d) (fmap (setLets inB) m)
+          TestY d m -> TestY (setLets inB d) (fmap (setLets inB) m)
 
 data GComb val comb
   = Comb {-# UNPACK #-} !(GCombInfo comb)
@@ -1406,7 +1443,7 @@ emitLet rns grpr grpn rec d vcs ctx bnd
   where
     f s (w, Lam _ f bd) =
       let cix = (CIx grpr grpn w)
-       in Let s cix f bd
+       in Let s cix f bd noNativeCell
 
 -- Translate from ANF prim ops to machine code operations. The
 -- machine code operations are divided with respect to more detailed
@@ -1809,13 +1846,13 @@ sectionDeps (NMatch _ _ br) = branchDeps br
 sectionDeps (Ins i s)
   | Name (Env (CIx _ w _) _) _ <- i = w : sectionDeps s
   | otherwise = sectionDeps s
-sectionDeps (Let s (CIx _ w _) _ b) =
+sectionDeps (Let s (CIx _ w _) _ b _) =
   w : sectionDeps s ++ sectionDeps b
 sectionDeps _ = []
 
 sectionTypes :: GSection comb -> [Word64]
 sectionTypes (Ins i s) = instrTypes i ++ sectionTypes s
-sectionTypes (Let s _ _ b) = sectionTypes s ++ sectionTypes b
+sectionTypes (Let s _ _ b _) = sectionTypes s ++ sectionTypes b
 sectionTypes (Match _ br) = branchTypes br
 sectionTypes (DMatch _ _ br) = branchTypes br
 sectionTypes (NMatch _ _ br) = branchTypes br
@@ -1903,7 +1940,7 @@ prettySection ind sec =
     Yield as -> showString "Yield " . prettyArgs as
     Ins i nx ->
       prettyIns i . showString "\n" . prettySection ind nx
-    Let s _ _ b ->
+    Let s _ _ b _ ->
       showString "Let\n"
         . prettySection (ind + 2) s
         . showString "\n"
@@ -2017,7 +2054,7 @@ sanitizeSection sandboxedForeigns section = case section of
   Jump {} -> section
   Match i bs -> Match i (sanitizeBranches sandboxedForeigns bs)
   Yield {} -> section
-  Let s i f b -> Let (sanitizeSection sandboxedForeigns s) i f (sanitizeSection sandboxedForeigns b)
+  Let s i f b c -> Let (sanitizeSection sandboxedForeigns s) i f (sanitizeSection sandboxedForeigns b) c
   Die {} -> section
   Exit -> section
   DMatch i j bs -> DMatch i j (sanitizeBranches sandboxedForeigns bs)

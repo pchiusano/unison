@@ -74,6 +74,7 @@ library
       Unison.Runtime.JIT.Compile
       Unison.Runtime.JIT.Config
       Unison.Runtime.JIT.Exits
+      Unison.Runtime.JIT.Frames
       Unison.Runtime.JIT.Layout
       Unison.Runtime.JIT.LLVM
       Unison.Runtime.JIT.Native

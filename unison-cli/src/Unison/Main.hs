@@ -159,9 +159,10 @@ main version = do
       progName <- getProgName
       -- hSetBuffering stdout NoBuffering -- cool
       (renderUsageInfo, globalOptions, command) <- parseCLIArgs progName (Text.unpack (Version.gitDescribeWithDate version))
-      let GlobalOptions {codebasePathOption = mCodePathOption, exitOption, lspFormattingConfig, jitOption} = globalOptions
+      let GlobalOptions {codebasePathOption = mCodePathOption, exitOption, lspFormattingConfig, jitOption, jitDumpIROption} = globalOptions
       -- The runtime reads its JIT settings from the environment, once, at startup.
       for_ jitOption (setEnv "UNISON_JIT")
+      for_ jitDumpIROption (setEnv "UNISON_JIT_DUMP_IR")
       currentDir <- getCurrentDirectory
       case command of
         PrintVersion ->

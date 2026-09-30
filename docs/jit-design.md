@@ -145,7 +145,7 @@ Properties of re-entry points:
 - **No code is duplicated.** The code after a call-out lives only in the re-entry function. For a non-tail call, the normal path continues into the same code the re-entry point leads to.
 - **Only `Let`s whose binding is a call have one.** A `Let` that binds the result of arithmetic or a constructor is compiled inline.
 - **They're optional.** A `Let` with no re-entry point is resumed in the interpreter, which is always correct. So they can be added gradually.
-- **They don't have [native code cells](#native-code-cells).** Native code never looks one up; only the interpreter does. A call-out's re-entry point is stored in its `Exit`. A `Let`'s re-entry point is stored in a Haskell-side structure keyed by the `Let` body's `CombIx`, which is the name a `Push` frame carries.
+- **Native code never looks one up;** only the interpreter does. A call-out's re-entry point is stored in its `Exit`. A `Let`'s re-entry point is the native code of the `Let` body's own combinator: the MCode emitter already makes every `Let` body a combinator whose arguments are the whole frame, so calling it is resuming at the body. Its [native code cell](#native-code-cells) is carried by the `Let` node and by the `Push` frame, and `yield` checks it with one load when it pops the frame.
 
 #### Native code cells
 
@@ -190,7 +190,7 @@ In each case it's one load and a test for null. If the cell is null, the interpr
 
 **Why not a table.** An earlier version of this design kept function pointers in a global table indexed by a number assigned to each supercombinator. A `CombIx` can't be the index: it's a `Reference`, a number for the top-level definition, and a bit-packed section number that's mostly gaps. So the JIT would have needed its own numbering, and a table layout that could grow while other threads read it. Cells need neither, and a lookup is one load where the table needed two.
 
-**What doesn't get a cell.** [Re-entry points](#re-entry-points), since native code never calls one by looking it up. The existing compiler also creates a `GCombInfo` for each `Let` body. Those leave the field unused.
+**What doesn't get a cell.** [Re-entry points](#re-entry-points) after call-outs, since native code never calls one by looking it up. The existing compiler also creates a `GCombInfo` for each `Let` body; its cell is the `Let`'s re-entry point.
 
 **Cost.** `GCombInfo` is unpacked into every partial application closure, so each of those grows by one word.
 

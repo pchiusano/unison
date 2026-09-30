@@ -28,7 +28,8 @@ data Config = Config
   { mode :: Mode,
     -- | log each compiled module to stderr
     logging :: Bool,
-    -- | directory to write each module's IR into
+    -- | directory to write each module's IR into, with the MCode of each
+    -- function as a comment; @-@ prints it to stderr instead
     dumpIR :: Maybe FilePath,
     -- | print the MCode of every loaded definition to stderr
     dumpMCode :: Bool,
@@ -39,7 +40,11 @@ data Config = Config
     -- | fire the entry poll every N entries (stress mode @poll=N@)
     stressPoll :: Int,
     -- | initial Unison stack size in slots (stress mode @ustack=N@)
-    stressStack :: Maybe Int
+    stressStack :: Maybe Int,
+    -- | treat every Nth callee as not compiled (stress mode @callee=N@)
+    stressCallee :: Int,
+    -- | C stack budget for native calls, in bytes (stress mode @cstack=N@)
+    stressCStack :: Int
   }
   deriving (Show)
 
@@ -64,7 +69,9 @@ config = unsafePerformIO $ do
         trace = maybe False (not . null) tr,
         stats = maybe False (not . null) stats,
         stressPoll = fromMaybe 0 (setting "poll"),
-        stressStack = setting "ustack"
+        stressStack = setting "ustack",
+        stressCallee = fromMaybe 0 (setting "callee"),
+        stressCStack = fromMaybe 0 (setting "cstack")
       }
   where
     splitOn c s = case break (== c) s of

@@ -41,9 +41,9 @@ startJIT = case mode config of
         (offs, _) <- ctxLayout
         case (layouts, offs) of
           (Left e, _) -> jitLog (e ++ "; the JIT is off")
-          (Right ls, [a, b, c, d, e, f, g, h, i, j, k]) -> do
-            configureNative (stressPoll config) (trace config)
-            writeIORef jitState (Just (JITState ls (CtxOffsets a b c d e f g h i j k)))
+          (Right ls, [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q]) -> do
+            configureNative (stressPoll config) (stressCallee config) (stressCStack config) (trace config)
+            writeIORef jitState (Just (JITState ls (CtxOffsets a b c d e f g h i j k l m n o p q)))
             triple <- targetTriple
             jitLog ("mode " ++ show (mode config) ++ ", LLVM ready, target " ++ triple)
           _ -> jitLog "unexpected Ctx layout; the JIT is off"
