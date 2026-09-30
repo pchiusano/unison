@@ -44,7 +44,9 @@ data Config = Config
     -- | treat every Nth callee as not compiled (stress mode @callee=N@)
     stressCallee :: Int,
     -- | C stack budget for native calls, in bytes (stress mode @cstack=N@)
-    stressCStack :: Int
+    stressCStack :: Int,
+    -- | allocation budget between polls, in words (stress mode @alloc=N@)
+    stressAlloc :: Int
   }
   deriving (Show)
 
@@ -71,7 +73,8 @@ config = unsafePerformIO $ do
         stressPoll = fromMaybe 0 (setting "poll"),
         stressStack = setting "ustack",
         stressCallee = fromMaybe 0 (setting "callee"),
-        stressCStack = fromMaybe 0 (setting "cstack")
+        stressCStack = fromMaybe 0 (setting "cstack"),
+        stressAlloc = fromMaybe 0 (setting "alloc")
       }
   where
     splitOn c s = case break (== c) s of

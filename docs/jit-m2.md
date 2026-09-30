@@ -122,3 +122,19 @@ Still exiting: `App`, `Jump`, `DMatch` on constructors with fields, `NMatch`, `R
   the current size, which made it 13.
 - **`Yield` with pending arguments still exits** (`ap /= fp`), also at re-entry, where `ap` is
   the caller's. Over-application through native frames is rare enough to leave for M4.
+
+## Learnings and questions
+
+Written after the milestone, from the discussion of it.
+
+- **Reading the O2 output was worth it.** The `--jit-dump-ir` flag (added on request after M2,
+  writing both the input IR and the post-O2 module) showed at a glance what the design's
+  conventions cost per call: the cell load, the C stack check, arguments and results through
+  memory, and the boolean round trip. The last became an M3 item; the others are the case for
+  worker functions (M6) and are noted in [jit-optimization-ideas.md](jit-optimization-ideas.md).
+- **Workers matter most for self-recursion.** A recursive function's worker can call itself
+  with LLVM arguments before any batching exists, so that part of M6 doesn't wait on M5.
+- **The tests didn't cover base library shapes.** The `Let`-inside-a-binding bug only showed
+  up in the benchmark transcript (`printTime`). Run both transcripts as tests from now on.
+- **Deep recursion is bounded by the worker thread's 512 KB C stack**, not by anything in the
+  design; a dedicated native stack is in the ideas document.

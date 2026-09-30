@@ -13,6 +13,7 @@
 module Unison.Runtime.JIT.Codegen
   ( Env (..),
     CtxOffsets (..),
+    RtsFacts (..),
     Function (..),
     genFunction,
     modulePrelude,
@@ -22,6 +23,7 @@ where
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict
 import Data.Char (ord)
+import Data.Bits (shiftL, shiftR)
 import Data.Int (Int64)
 import Data.Primitive.PrimArray (primArrayToList)
 import Data.Word (Word64)
@@ -31,6 +33,10 @@ import Unison.Runtime.JIT.Exits (Exit (..))
 import Unison.Runtime.JIT.Frames (Frame (..))
 import Unison.Runtime.JIT.Layout
 import Unison.Runtime.JIT.Pool
+import Unison.Reference (Reference)
+import Unison.Runtime.ANF (PackedTag (..))
+import Data.Map.Strict qualified as Map
+import Data.IntMap.Strict qualified as IM
 import Unison.Runtime.MCode
 import Unison.Runtime.Machine.Types (MCombs, MSection)
 import Unison.Runtime.Stack (Val)
@@ -38,7 +44,19 @@ import Unison.Util.EnumContainers qualified as EC
 
 -- | Byte offsets of the fields of the C @Ctx@, from @unison_jit_ctx_layout@.
 data CtxOffsets = CtxOffsets
-  { oUstk, oBstk, oPool, oStackSize, oHplim, oAp, oFp, oSp, oMaxSp, oStressPoll, oStressPollLeft, oStressCallee, oStressCalleeLeft, oFrames, oNFrames, oMaxFrames, oCStackLimit :: !Int
+  { oUstk, oBstk, oPool, oStackSize, oHplim, oAp, oFp, oSp, oMaxSp, oStressPoll, oStressPollLeft, oStressCallee, oStressCalleeLeft, oFrames, oNFrames, oMaxFrames, oCStackLimit, oCap, oAllocLeft :: !Int
+  }
+
+-- | From unison_jit_rts_facts: the info pointers and layouts of the two
+-- arrays a @Seg@ is made of.
+data RtsFacts = RtsFacts
+  { rArrWordsInfo, rArrPtrsInfo :: !Int,
+    -- | ByteArray#: header words including the byte count, and the word index of the count
+    rBytesHeader, rBytesCount :: !Int,
+    -- | Array#: header words, word index of the element count and of the payload size
+    rPtrsHeader, rPtrsCount, rPtrsSize :: !Int,
+    -- | log2 of elements per card-table byte
+    rCardBits :: !Int
   }
 
 data Env = Env
@@ -53,7 +71,12 @@ data Env = Env
     -- | emit the stress-mode "callee not compiled" countdown
     envStressCallee :: Bool,
     -- | the group being compiled, for the arity of Let body combinators
-    envCombs :: MCombs
+    envCombs :: MCombs,
+    -- | pool index of every constant this group uses
+    envPool :: Map.Map PoolKey Int,
+    envRts :: RtsFacts,
+    -- | constructor arities of the data types loaded so far
+    envTypes :: Map.Map Reference [Int]
   }
 
 data Function = Function
@@ -68,7 +91,7 @@ data Function = Function
 
 -- | Declarations every module needs.
 modulePrelude :: String
-modulePrelude = "declare ptr @llvm.stacksave.p0()\n"
+modulePrelude = "declare ptr @llvm.stacksave.p0()\ndeclare ptr @unison_jit_alloc_words(ptr, i64)\n"
 
 -- ---------------------------------------------------------------------------
 -- The generator
@@ -87,6 +110,10 @@ data GS = GS
     gsNFrames :: !Int,
     -- | highest frame offset used
     gsMaxK :: !Int,
+    -- | slots whose value is a boolean held as an i1 register, with no
+    -- closure built yet (docs/jit-m3.md, step 3). Absent means the slot's
+    -- allocas hold the value. Saved and restored around branch arms.
+    gsKinds :: IM.IntMap String,
     -- | set when the function can't be compiled after all
     gsFailed :: Maybe String
   }
@@ -145,25 +172,54 @@ useSlot k
   | k < 1 = modify' (\s -> s {gsFailed = Just ("refers to a slot below the frame (offset " ++ show k ++ ")")})
   | otherwise = useK k
 
+slotKind :: Int -> Gen (Maybe String)
+slotKind k = gets (IM.lookup k . gsKinds)
+
+-- | Marks slot @k@ as holding the boolean @c@ (an i1) with no closure.
+setBoolKind :: Int -> String -> Gen ()
+setBoolKind k c = useSlot k >> modify' (\s -> s {gsKinds = IM.insert k c (gsKinds s)})
+
+clearKind :: Int -> Gen ()
+clearKind k = modify' (\s -> s {gsKinds = IM.delete k (gsKinds s)})
+
+-- | Runs a generator and puts the slot kinds back afterwards: for code
+-- (a branch arm, an inline binding) after which control rejoins other paths.
+withKinds :: Gen a -> Gen a
+withKinds g = do
+  ks <- gets gsKinds
+  r <- g
+  modify' (\s -> s {gsKinds = ks})
+  pure r
+
 loadU :: Int -> Gen String
 loadU k = do
   useSlot k
-  v <- fresh "u"
-  emit (v ++ " = load i64, ptr " ++ uSlot k)
-  pure v
+  slotKind k >>= \case
+    Just _ -> pure "-1" -- a boxed value's word
+    Nothing -> do
+      v <- fresh "u"
+      emit (v ++ " = load i64, ptr " ++ uSlot k)
+      pure v
 
+-- | The closure in slot @k@; a boolean held as an i1 is materialized here.
 loadB :: Int -> Gen String
 loadB k = do
   useSlot k
-  v <- fresh "b"
-  emit (v ++ " = load ptr, ptr " ++ bSlot k)
-  pure v
+  slotKind k >>= \case
+    Just c -> do
+      p <- fresh "bool"
+      emit (p ++ " = select i1 " ++ c ++ ", ptr %val.true, ptr %val.false")
+      pure p
+    Nothing -> do
+      v <- fresh "b"
+      emit (v ++ " = load ptr, ptr " ++ bSlot k)
+      pure v
 
 storeU :: Int -> String -> Gen ()
-storeU k v = useSlot k >> emit ("store i64 " ++ v ++ ", ptr " ++ uSlot k)
+storeU k v = useSlot k >> clearKind k >> emit ("store i64 " ++ v ++ ", ptr " ++ uSlot k)
 
 storeB :: Int -> String -> Gen ()
-storeB k v = useSlot k >> emit ("store ptr " ++ v ++ ", ptr " ++ bSlot k)
+storeB k v = useSlot k >> clearKind k >> emit ("store ptr " ++ v ++ ", ptr " ++ bSlot k)
 
 -- | Address of stack index @fp + k@ in the unboxed or boxed stack.
 stackAddrU, stackAddrB :: Int -> Gen String
@@ -200,7 +256,7 @@ data FnEnv = FnEnv
     feCell :: Ptr NativeCell,
     feHead :: String,
     -- | registers holding the type-tag and boolean closures, loaded at entry
-    feTagChar, feTagFloat, feTagInt, feTagNat, feTrue, feFalse :: String,
+    feTagChar, feTagFloat, feTagInt, feTagNat :: String,
     -- | the inline @Let@ bindings the code being generated is inside of,
     -- innermost first
     feEnclosing :: [Enclosing]
@@ -370,8 +426,8 @@ genFunction :: Env -> String -> CombIx -> Int -> Int -> MSection -> Ptr NativeCe
 genFunction env name cix arity frameSize body cell
   | not (startsSupported body) = Left "body starts with something the JIT doesn't compile"
   | otherwise =
-      let fe = FnEnv env cix arity frameSize cell "head" "%tag.char" "%tag.float" "%tag.int" "%tag.nat" "%val.true" "%val.false" []
-          gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity Nothing
+      let fe = FnEnv env cix arity frameSize cell "head" "%tag.char" "%tag.float" "%tag.int" "%tag.nat" []
+          gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity IM.empty Nothing
           ((), gs) = runState (genHead fe body >> startBlock "unreachable") gs0
           blocks = [b | b@(l, _) <- reverse (gsBlocks gs), l /= "unreachable"]
           maxK = max (gsMaxK gs) (arity + frameSize)
@@ -392,7 +448,8 @@ genFunction env name cix arity frameSize body cell
 -- The first instruction decides whether compiling is worth anything.
 startsSupported :: MSection -> Bool
 startsSupported = \case
-  Ins (Lit l) _ -> litSupported l
+  Ins (Lit _) _ -> True
+  Ins (Pack {}) _ -> True
   Ins (Prim1 op _) _ -> prim1Supported op
   Ins (Prim2 op _ _) _ -> prim2Supported op
   Match {} -> True
@@ -462,8 +519,16 @@ genHead fe body = do
   -- LLVM would hoist the load out of the loop and the poll would never fire.
   hp <- fresh "hplim"
   emit (hp ++ " = load volatile ptr, ptr %hplim.p")
+  stopHp <- fresh "stop"
+  emit (stopHp ++ " = icmp eq ptr " ++ hp ++ ", null")
+  -- the allocation budget: exhausted once it goes negative
+  leftA <- ctxField env oAllocLeft
+  left <- fresh "alloc.left"
+  emit (left ++ " = load i64, ptr " ++ leftA)
+  over <- fresh "over"
+  emit (over ++ " = icmp slt i64 " ++ left ++ ", 0")
   stop <- fresh "stop"
-  emit (stop ++ " = icmp eq ptr " ++ hp ++ ", null")
+  emit (stop ++ " = or i1 " ++ stopHp ++ ", " ++ over)
   reenter <- exitBlock fe d (Reenter (feCell fe))
   bodyLabel <- freshLabel "body"
   when (envStressPoll env) $ do
@@ -497,7 +562,10 @@ genSection fe d sect = case sect of
   Match i br -> do
     x <- loadU (d - i)
     genBranch fe d x br sect
-  DMatch _ i br -> genDMatch fe d i br sect
+  DMatch mr i br -> genDMatch fe d i mr br sect
+  NMatch _ i br -> do
+    x <- loadU (d - i)
+    genBranch fe d x br sect
   Let binding bcix f body cell -> genLet fe d binding bcix f body cell sect
   _ -> exitResume fe d sect
 
@@ -523,7 +591,7 @@ genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCom
               ix <- addFrame env (Frame bcix f body cell)
               bodyL <- freshLabel "body"
               let fe' = fe {feEnclosing = Enclosing ix d bodyL m : feEnclosing fe}
-              ok <- attempt (genSection fe' d binding)
+              ok <- attempt (withKinds (genSection fe' d binding))
               if ok
                 then do
                   startBlock bodyL
@@ -622,29 +690,39 @@ attempt g = do
 -- can't (a data match arm that needs fields the native path doesn't
 -- push), that arm exits at the whole section instead.
 genBranch :: FnEnv -> Int -> String -> GBranch (RComb Val) -> MSection -> Gen ()
-genBranch fe d x br sect = case br of
+genBranch fe d x br sect = genBranchWith fe d x br sect (\_ -> genSection fe d)
+
+-- | 'genBranch' with the code for an arm supplied: it gets the case's
+-- constructor tag (or word) and the arm's section.
+genBranchWith :: FnEnv -> Int -> String -> GBranch (RComb Val) -> MSection -> (Word64 -> MSection -> Gen ()) -> Gen ()
+genBranchWith fe d x br sect armCode = case br of
   Test1 u y n -> do
     c <- fresh "is"
     emit (c ++ " = icmp eq i64 " ++ x ++ ", " ++ signed u)
-    ly <- arm "yes" y
-    ln <- arm "no" n
+    ly <- arm "yes" (Just u) y
+    ln <- arm "no" Nothing n
     emit ("br i1 " ++ c ++ ", label %" ++ ly ++ ", label %" ++ ln)
   Test2 u cu v cv e -> do
-    lu <- arm "case" cu
-    lv <- arm "case" cv
-    le <- arm "default" e
+    lu <- arm "case" (Just u) cu
+    lv <- arm "case" (Just v) cv
+    le <- arm "default" Nothing e
     emit ("switch i64 " ++ x ++ ", label %" ++ le ++ " [ i64 " ++ signed u ++ ", label %" ++ lu ++ "  i64 " ++ signed v ++ ", label %" ++ lv ++ " ]")
   TestW df cs -> do
-    ldf <- arm "default" df
+    ldf <- arm "default" Nothing df
     arms <- forM (EC.mapToList cs) $ \(w, s) -> do
-      l <- arm "case" s
+      l <- arm "case" (Just w) s
       pure ("i64 " ++ signed w ++ ", label %" ++ l)
     emit ("switch i64 " ++ x ++ ", label %" ++ ldf ++ " [ " ++ unwords arms ++ " ]")
   _ -> exitResume fe d sect
   where
-    arm base s = do
+    -- the default arm has no known constructor, so it runs at depth d
+    -- with nothing pushed (the interpreter's dataBranch does the same)
+    arm base mu s = do
       label <- freshLabel base
-      ok <- attempt (sideBlockNamed label (genSection fe d s))
+      let code = case mu of
+            Just u -> armCode u s
+            Nothing -> genSection fe d s
+      ok <- attempt (withKinds (sideBlockNamed label code))
       unless ok $ sideBlockNamed label (exitResume fe d sect)
       pure label
 
@@ -653,33 +731,132 @@ signed w = show (fromIntegral w :: Int64)
 
 -- | Branch on the constructor of a data value. Only enumerations (no
 -- fields) are handled natively so far; anything else exits.
-genDMatch :: FnEnv -> Int -> Int -> GBranch (RComb Val) -> MSection -> Gen ()
-genDMatch fe d i br sect = do
+genDMatch :: FnEnv -> Int -> Int -> Maybe Reference -> GBranch (RComb Val) -> MSection -> Gen ()
+genDMatch fe d i mr br sect =
+  slotKind (d - i) >>= \case
+    Just c -> genBoolBranch fe d c br sect
+    Nothing -> genDMatchClosure fe d i mr br sect
+
+-- | A match on a boolean that is still an i1: one branch. False is
+-- constructor 0, true is 1.
+genBoolBranch :: FnEnv -> Int -> String -> GBranch (RComb Val) -> MSection -> Gen ()
+genBoolBranch fe d c br sect = case br of
+  Test1 u y n -> two (if u == 1 then (y, n) else (n, y))
+  Test2 u cu v cv e -> two (pick 1 [(u, cu), (v, cv)] e, pick 0 [(u, cu), (v, cv)] e)
+  TestW df cs -> two (maybe df id (EC.lookup 1 cs), maybe df id (EC.lookup 0 cs))
+  _ -> exitResume fe d sect
+  where
+    pick t alts e = maybe e id (lookup t alts)
+    two (t, f) = do
+      lt <- arm "true" t
+      lf <- arm "false" f
+      emit ("br i1 " ++ c ++ ", label %" ++ lt ++ ", label %" ++ lf)
+    arm base s = do
+      label <- freshLabel base
+      ok <- attempt (withKinds (sideBlockNamed label (genSection fe d s)))
+      unless ok $ sideBlockNamed label (exitResume fe d sect)
+      pure label
+
+-- | A match on a data closure. The pointer tag says which of the four
+-- constructor closures it is; each keeps the constructor tag at a
+-- different offset, so four small blocks load it and meet at a switch.
+-- Each arm then pushes the fields as @dataBranch@ does: the first field
+-- on top. How many fields a constructor has comes from the data type's
+-- declaration ('envTypes'); one with three or more is a @DataG@ holding
+-- two arrays.
+genDMatchClosure :: FnEnv -> Int -> Int -> Maybe Reference -> GBranch (RComb Val) -> MSection -> Gen ()
+genDMatchClosure fe d i mr br sect = do
   let env = feEnv fe
-      layout = lEnum (envLayouts env)
+      ls = envLayouts env
+      kinds = [lEnum ls, lData1 ls, lData2 ls, lDataG ls]
+      arities = mr >>= \r -> Map.lookup r (envTypes env)
   p <- loadB (d - i)
   raw <- fresh "raw"
   emit (raw ++ " = ptrtoint ptr " ++ p ++ " to i64")
   tagBits <- fresh "ptrtag"
   emit (tagBits ++ " = and i64 " ++ raw ++ ", 7")
-  isEnum <- fresh "isenum"
-  emit (isEnum ++ " = icmp eq i64 " ++ tagBits ++ ", " ++ show (lPtrTag layout))
-  other <- exitBlock fe d (Resume (feCix fe) sect)
-  enumL <- freshLabel "enum"
-  emit ("br i1 " ++ isEnum ++ ", label %" ++ enumL ++ ", label %" ++ other)
-  startBlock enumL
   base <- fresh "base"
-  emit (base ++ " = sub i64 " ++ raw ++ ", " ++ show (lPtrTag layout))
-  addr <- fresh "tag.a"
-  emit (addr ++ " = add i64 " ++ base ++ ", " ++ show (lFieldOffset layout (lPtrs layout)))
-  ptr <- fresh "tag.p"
-  emit (ptr ++ " = inttoptr i64 " ++ addr ++ " to ptr")
+  emit (base ++ " = sub i64 " ++ raw ++ ", " ++ tagBits)
+  other <- exitBlock fe d (Resume (feCix fe) sect)
+  dispatch <- freshLabel "dispatch"
+  -- one block per closure kind, loading the packed tag from its offset
+  loads <- forM kinds $ \layout -> do
+    l <- freshLabel "kind"
+    packed <- fresh "packed"
+    sideBlockNamed l $ do
+      addr <- fresh "tag.a"
+      emit (addr ++ " = add i64 " ++ base ++ ", " ++ show (lFieldOffset layout (lPtrs layout)))
+      ptr <- fresh "tag.p"
+      emit (ptr ++ " = inttoptr i64 " ++ addr ++ " to ptr")
+      emit (packed ++ " = load i64, ptr " ++ ptr)
+      emit ("br label %" ++ dispatch)
+    pure (layout, l, packed)
+  emit ("switch i64 " ++ tagBits ++ ", label %" ++ other ++ " [ " ++ unwords [" i64 " ++ show (lPtrTag layout) ++ ", label %" ++ l | (layout, l, _) <- loads] ++ " ]")
+  startBlock dispatch
   packed <- fresh "packed"
-  emit (packed ++ " = load i64, ptr " ++ ptr)
+  emit (packed ++ " = phi i64 " ++ commas ["[ " ++ v ++ ", %" ++ l ++ " ]" | (_, l, v) <- loads])
   tag <- fresh "tag"
   emit (tag ++ " = and i64 " ++ packed ++ ", 65535") -- maskTags
-  genBranch fe d tag br sect
+  -- an arm for constructor u knows its field count, so it knows the kind
+  let arm u body = case arities >>= \as -> lookup (fromIntegral u) (zip [0 :: Int ..] as) of
+        Nothing -> exitResume fe d sect
+        Just 0 -> genSection fe d body
+        Just n -> do
+          pushFields fe d base n
+          genSection fe (d + n) body
+  genBranchWith fe d tag br sect arm
+  where
+    commas = foldr1 (\a b -> a ++ ", " ++ b)
 
+-- | Pushes the @n@ fields of the constructor closure at untagged address
+-- @base@ onto slots d+1..d+n, first field on top.
+pushFields :: FnEnv -> Int -> String -> Int -> Gen ()
+pushFields fe d base n = do
+  let ls = envLayouts (feEnv fe)
+      rts = envRts (feEnv fe)
+      loadFrom from what ty off = do
+        a <- fresh (what ++ ".a")
+        emit (a ++ " = add i64 " ++ from ++ ", " ++ show off)
+        pp <- fresh (what ++ ".p")
+        emit (pp ++ " = inttoptr i64 " ++ a ++ " to ptr")
+        v <- fresh what
+        emit (v ++ " = load " ++ ty ++ ", ptr " ++ pp)
+        pure v
+      loadAt = loadFrom base
+      -- field j of Data1/Data2: pointer j+1 and non-pointer j+1
+      field layout j = do
+        b <- loadAt "fb" "ptr" (lFieldOffset layout (j + 1))
+        u <- loadAt "fu" "i64" (lFieldOffset layout (lPtrs layout + j + 1))
+        pure (u, b)
+  case n of
+    1 -> do
+      (u, b) <- field (lData1 ls) 0
+      storeU (d + 1) u >> storeB (d + 1) b
+    2 -> do
+      (u0, b0) <- field (lData2 ls) 0
+      (u1, b1) <- field (lData2 ls) 1
+      storeU (d + 2) u0 >> storeB (d + 2) b0
+      storeU (d + 1) u1 >> storeB (d + 1) b1
+    _ -> do
+      -- DataG: the Seg's two fields are lifted boxes (ByteArray, Array)
+      -- around the arrays, since a tuple's fields can't be unpacked. Each
+      -- box is an evaluated single-constructor object: untag it and read
+      -- its one field, the array. The arrays hold the fields in reverse,
+      -- so element j goes to slot d+1+j.
+      let layout = lDataG ls
+          unbox what off = do
+            box <- loadAt what "ptr" (lFieldOffset layout off)
+            boxI <- fresh (what ++ ".box")
+            emit (boxI ++ " = ptrtoint ptr " ++ box ++ " to i64")
+            untagged <- fresh (what ++ ".un")
+            emit (untagged ++ " = and i64 " ++ boxI ++ ", -8")
+            loadFrom untagged what "i64" (lHeaderBytes ls)
+      usegI <- unbox "useg" 1
+      bsegI <- unbox "bseg" 2
+      forM_ [0 .. n - 1] $ \j -> do
+        u <- loadFrom usegI "fu" "i64" (8 * (rBytesHeader rts + j))
+        b <- loadFrom bsegI "fb" "ptr" (8 * (rPtrsHeader rts + j))
+        storeU (d + 1 + j) u >> storeB (d + 1 + j) b
 -- | The slots that an argument list selects, top first, as frame offsets.
 -- @VArgV@ means "everything in the frame above index i", and the frame
 -- the interpreter sees is the innermost inline binding's, if any.
@@ -825,6 +1002,18 @@ genInstr fe d instr sect k = case instr of
     storeU (d + 1) u
     storeB (d + 1) tag
     k (d + 1)
+  -- boxed literals and constructors without fields are pool constants
+  Lit l | Just ix <- Map.lookup (KeyLit l) (envPool (feEnv fe)) -> do
+    poolConstant fe d ix
+    k (d + 1)
+  Pack r t ZArgs | Just ix <- Map.lookup (KeyEnum r t) (envPool (feEnv fe)) -> do
+    poolConstant fe d ix
+    k (d + 1)
+  Pack r t args
+    | Just refIx <- Map.lookup (KeyEnum r (PackedTag 0)) (envPool (feEnv fe)),
+      Just fields <- packFields fe d args -> do
+        genPack fe d refIx t fields
+        k (d + 1)
   Prim1 op i | prim1Supported op -> do
     x <- loadU (d - i)
     genPrim1 fe d op x sect
@@ -836,17 +1025,153 @@ genInstr fe d instr sect k = case instr of
     k (d + 1)
   _ -> exitResume fe d sect
 
+-- | The slots a @Pack@'s arguments come from, in field order, when the
+-- code generator can build the constructor (one or two fields so far).
+packFields :: FnEnv -> Int -> Args -> Maybe [Int]
+packFields fe d args = case args of
+  ZArgs -> Nothing
+  _ -> Just (argSources fe d args)
+
+-- | Allocates a constructor with the given fields and pushes it. The
+-- reference comes from the pool entry for the type's enumeration
+-- constructor 0 (its first field). See docs/jit-m3.md for why each Pack
+-- allocates separately.
+genPack :: FnEnv -> Int -> Int -> PackedTag -> [Int] -> Gen ()
+genPack fe d refIx (PackedTag t) fields = do
+  let env = feEnv fe
+      ls = envLayouts env
+      rts = envRts env
+      n = length fields
+      (layout, ptrTag) = case n of
+        1 -> (lData1 ls, 3)
+        2 -> (lData2 ls, 4)
+        _ -> (lDataG ls, 5)
+      conWords = 1 + lPtrs layout + lNptrs layout
+      -- a DataG also gets its two arrays and their boxes, all in one chunk
+      cardWords = (n + (1 `shiftL` rCardBits rts) - 1) `shiftR` rCardBits rts
+      cardWords' = (cardWords + 7) `div` 8
+      bytesWords = rBytesHeader rts + n
+      ptrsWords = rPtrsHeader rts + n + cardWords'
+      boxWords = 2
+      words
+        | n <= 2 = conWords
+        | otherwise = conWords + 2 * boxWords + bytesWords + ptrsWords
+  -- the fields, before the allocation call so nothing is held across it
+  vals <- forM fields $ \k -> (,) <$> loadU k <*> loadB k
+  -- the Reference: first field of the pool's Enum for this type
+  ea <- fresh "enum.a"
+  emit (ea ++ " = getelementptr ptr, ptr %pool, i64 " ++ show refIx)
+  ep <- fresh "enum"
+  emit (ep ++ " = load ptr, ptr " ++ ea)
+  ei <- fresh "enum"
+  emit (ei ++ " = ptrtoint ptr " ++ ep ++ " to i64")
+  eb <- fresh "enum.base"
+  emit (eb ++ " = and i64 " ++ ei ++ ", -8")
+  ra <- fresh "ref.a"
+  emit (ra ++ " = add i64 " ++ eb ++ ", " ++ show (lFieldOffset (lEnum ls) 0))
+  rp <- fresh "ref.p"
+  emit (rp ++ " = inttoptr i64 " ++ ra ++ " to ptr")
+  ref <- fresh "ref"
+  emit (ref ++ " = load ptr, ptr " ++ rp)
+  -- charge the budget and allocate
+  leftA <- ctxField env oAllocLeft
+  left <- fresh "alloc.left"
+  emit (left ++ " = load i64, ptr " ++ leftA)
+  left' <- fresh "alloc.left"
+  emit (left' ++ " = sub i64 " ++ left ++ ", " ++ show words)
+  emit ("store i64 " ++ left' ++ ", ptr " ++ leftA)
+  obj <- fresh "obj"
+  emit (obj ++ " = call ptr @unison_jit_alloc_words(ptr %ctx, i64 " ++ show words ++ ")")
+  let word i = do
+        a <- fresh "w"
+        emit (a ++ " = getelementptr i64, ptr " ++ obj ++ ", i64 " ++ show i)
+        pure a
+      payload i = word (1 + i) -- after the header
+  hdr <- word 0
+  emit ("store i64 " ++ show (lInfo layout) ++ ", ptr " ++ hdr)
+  refA <- payload 0
+  emit ("store ptr " ++ ref ++ ", ptr " ++ refA)
+  tagA <- payload (lPtrs layout)
+  emit ("store i64 " ++ show t ++ ", ptr " ++ tagA)
+  if n <= 2
+    then forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
+      ba <- payload (1 + j)
+      emit ("store ptr " ++ b ++ ", ptr " ++ ba)
+      ua <- payload (lPtrs layout + 1 + j)
+      emit ("store i64 " ++ u ++ ", ptr " ++ ua)
+    else do
+      -- layout of the chunk after the constructor: ByteArray box, Array
+      -- box, ByteArray#, Array#. The arrays hold the fields in reverse:
+      -- element n-1-j is field j.
+      let ubox = conWords
+          bbox = ubox + boxWords
+          ubytes = bbox + boxWords
+          bptrs = ubytes + bytesWords
+          storeAt i what = do
+            a <- word i
+            emit ("store " ++ what ++ ", ptr " ++ a)
+          addrOf i = do
+            a <- word i
+            v <- fresh "addr"
+            emit (v ++ " = ptrtoint ptr " ++ a ++ " to i64")
+            pure v
+          tagged i tg = do
+            v <- addrOf i
+            tv <- fresh "tagged"
+            emit (tv ++ " = or i64 " ++ v ++ ", " ++ show (tg :: Int))
+            tp <- fresh "tagged"
+            emit (tp ++ " = inttoptr i64 " ++ tv ++ " to ptr")
+            pure tp
+      -- the ByteArray#
+      storeAt ubytes ("i64 " ++ show (rArrWordsInfo rts))
+      storeAt (ubytes + rBytesCount rts) ("i64 " ++ show (8 * n))
+      -- the Array#: element count, then payload size including the card table
+      storeAt bptrs ("i64 " ++ show (rArrPtrsInfo rts))
+      storeAt (bptrs + rPtrsCount rts) ("i64 " ++ show n)
+      storeAt (bptrs + rPtrsSize rts) ("i64 " ++ show (n + cardWords'))
+      forM_ [0 .. cardWords' - 1] $ \c -> storeAt (bptrs + rPtrsHeader rts + n + c) "i64 0"
+      forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
+        storeAt (ubytes + rBytesHeader rts + (n - 1 - j)) ("i64 " ++ u)
+        storeAt (bptrs + rPtrsHeader rts + (n - 1 - j)) ("ptr " ++ b)
+      -- the boxes, each pointing at its array
+      ua <- word ubytes
+      storeAt ubox ("i64 " ++ show (lByteArrayBoxInfo ls))
+      storeAt (ubox + 1) ("ptr " ++ ua)
+      ba <- word bptrs
+      storeAt bbox ("i64 " ++ show (lArrayBoxInfo ls))
+      storeAt (bbox + 1) ("ptr " ++ ba)
+      -- and the constructor's two Seg fields point at the boxes (tag 1)
+      ubp <- tagged ubox 1
+      bbp <- tagged bbox 1
+      storeAt (1 + 1) ("ptr " ++ ubp)
+      storeAt (1 + 2) ("ptr " ++ bbp)
+  -- the result is the tagged pointer
+  oi <- fresh "obj"
+  emit (oi ++ " = ptrtoint ptr " ++ obj ++ " to i64")
+  ti <- fresh "tagged"
+  emit (ti ++ " = or i64 " ++ oi ++ ", " ++ show (ptrTag :: Int))
+  tp <- fresh "tagged"
+  emit (tp ++ " = inttoptr i64 " ++ ti ++ " to ptr")
+  storeU (d + 1) "-1"
+  storeB (d + 1) tp
+
+-- | Pushes a pool entry as a boxed value.
+poolConstant :: FnEnv -> Int -> Int -> Gen ()
+poolConstant _fe d ix = do
+  a <- fresh "pool.a"
+  emit (a ++ " = getelementptr ptr, ptr %pool, i64 " ++ show ix)
+  v <- fresh "const"
+  emit (v ++ " = load ptr, ptr " ++ a)
+  storeU (d + 1) "-1"
+  storeB (d + 1) v
+
 -- | Stores an unboxed result with its type tag at depth @d + 1@.
 result :: FnEnv -> Int -> String -> String -> Gen ()
 result _fe d tag v = storeU (d + 1) v >> storeB (d + 1) tag
 
 -- | Stores a boolean result: a boxed enumeration closure.
 resultBool :: FnEnv -> Int -> String -> Gen ()
-resultBool fe d c = do
-  p <- fresh "bool"
-  emit (p ++ " = select i1 " ++ c ++ ", ptr " ++ feTrue fe ++ ", ptr " ++ feFalse fe)
-  storeU (d + 1) "-1"
-  storeB (d + 1) p
+resultBool _fe d c = setBoolKind (d + 1) c
 
 binop :: String -> String -> String -> Gen String
 binop op x y = do

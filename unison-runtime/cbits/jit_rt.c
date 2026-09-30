@@ -21,7 +21,8 @@ int64_t unison_jit_ctx_layout(int64_t *out, int64_t n) {
       offsetof(UnisonJitCtx, stress_poll_left), offsetof(UnisonJitCtx, stress_callee),
       offsetof(UnisonJitCtx, stress_callee_left), offsetof(UnisonJitCtx, frames),
       offsetof(UnisonJitCtx, n_frames),    offsetof(UnisonJitCtx, max_frames),
-      offsetof(UnisonJitCtx, cstack_limit),
+      offsetof(UnisonJitCtx, cstack_limit), offsetof(UnisonJitCtx, cap),
+      offsetof(UnisonJitCtx, alloc_left),
   };
   int64_t count = sizeof offs / sizeof offs[0];
   for (int64_t i = 0; i < n && i < count; i++) out[i] = offs[i];
@@ -56,6 +57,9 @@ static int64_t trace = 0;
 // How much C stack native code may use for non-tail calls, at most. The
 // stress mode cstack=N makes this small.
 static int64_t cstack_budget = 1 << 20;
+// Words native code may allocate between two polls. The stress mode
+// alloc=N makes this small.
+static int64_t alloc_budget = 256 * 1024;
 // C stack kept free for the runtime's own C code (the GC in particular),
 // below which native code never goes whatever the budget says.
 #define CSTACK_RESERVE (256 * 1024)
@@ -66,11 +70,43 @@ static int64_t cstack_budget = 1 << 20;
 // touched cost nothing.
 #define MIN_NATIVE_FRAME 4
 
-void unison_jit_configure(int64_t poll_every, int64_t callee_every, int64_t cstack, int64_t trace_on) {
+void unison_jit_configure(int64_t poll_every, int64_t callee_every, int64_t cstack, int64_t alloc,
+                          int64_t trace_on) {
   stress_poll = poll_every;
   stress_callee = callee_every;
   if (cstack > 0) cstack_budget = cstack;
+  if (alloc > 0) alloc_budget = alloc;
   trace = trace_on;
+}
+
+// ---------------------------------------------------------------------------
+// Allocation
+
+// Generated code calls this once per straight-line run to get room for the
+// objects the run builds. allocate() never returns NULL (it aborts on heap
+// overflow like Haskell code would); the budget in Ctx bounds how much can
+// be allocated before the interpreter gets a chance to run a GC.
+void *unison_jit_alloc_words(UnisonJitCtx *ctx, int64_t n) {
+  return allocate((Capability *)ctx->cap, n);
+}
+
+// Addresses and sizes from the runtime that generated code needs: the
+// info pointers for the two kinds of array in a Seg, and their layouts.
+int64_t unison_jit_rts_facts(int64_t *out, int64_t n) {
+  int64_t facts[] = {
+      (int64_t)&stg_ARR_WORDS_info,                // 0: ByteArray# info
+      (int64_t)&stg_MUT_ARR_PTRS_FROZEN_CLEAN_info, // 1: frozen Array# info
+      sizeofW(StgArrBytes),                         // 2: ByteArray# header words (incl. the byte count)
+      offsetof(StgArrBytes, bytes) / sizeof(W_),    // 3: word index of the byte count
+      sizeofW(StgMutArrPtrs),                       // 4: Array# header words (incl. ptrs and size)
+      offsetof(StgMutArrPtrs, ptrs) / sizeof(W_),   // 5: word index of the element count
+      offsetof(StgMutArrPtrs, size) / sizeof(W_),   // 6: word index of the payload size (elements + card table)
+      MUT_ARR_PTRS_CARD_BITS,                       // 7: log2 of elements per card
+      (int64_t)&unison_jit_alloc_words,             // 8: the allocator
+  };
+  int64_t count = sizeof facts / sizeof facts[0];
+  for (int64_t i = 0; i < n && i < count; i++) out[i] = facts[i];
+  return count;
 }
 
 // One context per OS thread. A Haskell thread stays on one OS thread for the
@@ -120,6 +156,8 @@ int64_t unison_jit_enter(UnisonNativeFn fn, int64_t *ustk, void **bstk, void **p
   ctx->hplim = unison_jit_hplim_address();
   ctx->max_sp = sp;
   ctx->n_frames = 0;
+  ctx->cap = rts_unsafeGetMyCapability();
+  ctx->alloc_left = alloc_budget;
   // The budget counts down from here, but never below the thread's floor.
   int64_t here = (int64_t)&ctx;
   int64_t limit = here - cstack_budget;

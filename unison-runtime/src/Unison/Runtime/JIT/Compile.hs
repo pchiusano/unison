@@ -17,12 +17,14 @@ import Data.Map qualified as Map
 import GHC.Clock (getMonotonicTimeNSec)
 import System.FilePath ((</>))
 import Unison.Runtime.JIT.Codegen qualified as CG
-import Unison.Runtime.JIT.Codegen (CtxOffsets, Function (..), genFunction, modulePrelude)
+import Unison.Runtime.JIT.Codegen (CtxOffsets, Function (..), RtsFacts, genFunction, modulePrelude)
 import Unison.Runtime.JIT.Config
 import Unison.Runtime.JIT.Exits (registerExits)
 import Unison.Runtime.JIT.Frames (registerFrames)
 import Unison.Runtime.JIT.LLVM
 import Unison.Runtime.JIT.Layout (Layouts)
+import Unison.Runtime.JIT.Pool (PoolKey (..), poolIndices)
+import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Reference (Reference)
 import Unison.Runtime.MCode
 import Unison.Runtime.Machine.Types (MCombs, MSection)
@@ -31,37 +33,55 @@ import Data.Bits ((.&.))
 import Data.Set qualified as Set
 
 
--- | The cells carried by every Let in a section tree.
-letCellsOf :: MSection -> [Ptr NativeCell]
-letCellsOf = go
+-- | Everything in a section tree, innermost sections included, in order.
+sectionsOf :: MSection -> [MSection]
+sectionsOf s = s : rest
   where
-    go = \case
-      Let b _ _ bd c -> c : go b ++ go bd
-      Ins _ nx -> go nx
+    rest = case s of
+      Let b _ _ bd _ -> sectionsOf b ++ sectionsOf bd
+      Ins _ nx -> sectionsOf nx
       Match _ bs -> goB bs
       DMatch _ _ bs -> goB bs
       NMatch _ _ bs -> goB bs
-      RMatch _ s bs -> go s ++ concatMap goB (map snd (EC.mapToList bs))
+      RMatch _ p bs -> sectionsOf p ++ concatMap goB (map snd (EC.mapToList bs))
       _ -> []
     goB = \case
-      Test1 _ s d -> go s ++ go d
-      Test2 _ s _ t d -> go s ++ go t ++ go d
-      TestW d m -> go d ++ concatMap go (map snd (EC.mapToList m))
-      TestT d m -> go d ++ concatMap go (Map.elems m)
-      TestY d m -> go d ++ concatMap go (Map.elems m)
+      Test1 _ a d -> sectionsOf a ++ sectionsOf d
+      Test2 _ a _ b d -> sectionsOf a ++ sectionsOf b ++ sectionsOf d
+      TestW d m -> sectionsOf d ++ concatMap sectionsOf (map snd (EC.mapToList m))
+      TestT d m -> sectionsOf d ++ concatMap sectionsOf (Map.elems m)
+      TestY d m -> sectionsOf d ++ concatMap sectionsOf (Map.elems m)
+
+-- | The cells carried by every Let in a section tree.
+letCellsOf :: MSection -> [Ptr NativeCell]
+letCellsOf s = [c | Let _ _ _ _ c <- sectionsOf s]
+
+-- | The constants a section tree needs from the pool.
+poolKeysOf :: MSection -> [PoolKey]
+poolKeysOf s = concat [keys i | Ins i _ <- sectionsOf s]
+  where
+    keys = \case
+      Pack r t ZArgs -> [KeyEnum r t]
+      Pack r _ _ -> [KeyEnum r (PackedTag 0)]
+      Lit l@(MT _) -> [KeyLit l]
+      Lit l@(MM _) -> [KeyLit l]
+      Lit l@(MY _) -> [KeyLit l]
+      _ -> []
 
 -- | What compilation needs, found once at startup.
 data JITState = JITState
   { jsLayouts :: Layouts,
-    jsCtx :: CtxOffsets
+    jsCtx :: CtxOffsets,
+    jsRts :: RtsFacts
   }
 
 -- | Compiles the combinators of one top-level definition as one module.
 -- Combinators the code generator can't handle are left interpreted.
-compileGroup :: JITState -> Reference -> Word64 -> MCombs -> IO ()
-compileGroup st ref grp combs = do
+compileGroup :: JITState -> Map.Map Reference [Int] -> Reference -> Word64 -> MCombs -> IO ()
+compileGroup st types ref grp combs = do
   t0 <- getMonotonicTimeNSec
-  let env (base, fbase) = CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) combs
+  poolIxs <- poolIndices (concat [poolKeysOf s | Comb (LamI _ _ s _) <- map snd (EC.mapToList combs)])
+  let env (base, fbase) = CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) combs poolIxs (jsRts st) types
       -- Let body combinators are only entered through the cell their Let
       -- carries, so those that no Let refers to (the ones inside bindings)
       -- are not worth compiling. Local functions have zero in the low bits.

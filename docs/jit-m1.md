@@ -71,3 +71,18 @@ exit. There are no non-tail native calls, so no frame records and no re-entry po
   background thread, is M5. Code loaded through `restoreCache` (compiled program files) isn't
   compiled in M1 either; it shares the "never compiled" cell.
 - **One module per top-level definition** (D17), functions in it call each other directly.
+
+## Learnings and questions
+
+Written after the milestone (reconstructed later, so shorter than the others).
+
+- **Optimization flags change closure layouts.** The layout probe only passes on optimized
+  builds of `Stack.hs` and `MCode.hs`, hence the `OPTIONS_GHC` pragmas under `UNISON_JIT`; and
+  pool entries and probe samples must be forced, or the probe sees thunks.
+- **The `Lam` pattern synonym silently drops the cell.** Rebuilding a combinator through it
+  gives it the shared "never compiled" cell; the `Bitraversable` instance had to use the real
+  constructor. Anything that rebuilds combinators must be checked for this.
+- **The poll load must be `volatile`,** or LLVM hoists it out of the loop.
+- **Exits that re-enter must name the function that exited,** not the one the trampoline
+  entered, because tail calls change functions; `GrowStack` and `Reenter` carry the cell.
+- **Never overlap Stack builds,** and a configure step can hang on a macOS permission prompt.

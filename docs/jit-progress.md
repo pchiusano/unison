@@ -14,7 +14,8 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M0: spikes | done |
 | M1: skeleton and numeric loops | done 2026-09-30. Test matrix passes; "Sum 0 to 1 million" 104× faster; everything else exits and is the same or slower until M2-M4 |
 | M2: calls and frames | done 2026-09-30. Test matrix (7 configurations) passes; "fib 20" 16× faster; "depth 1000000" runs natively with the C stack guard. Data and list code is slower until M3/M4. See [jit-m2.md](jit-m2.md) |
-| M3: data | not started |
+| M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
+| M4: call-outs and function values | not started |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
 | M0 spike 3: interpreter overhead | done: under 2%, cell field and check kept |
@@ -59,6 +60,14 @@ Update it whenever a step finishes or something non-obvious is learned.
   running a binary that Cabal's configure step invokes (`pkg-config --version` was the case on
   2026-09-30). The process sits in an unkillable state until the prompt is answered. Answer the
   prompt; nothing in the project is wrong.
+- **Heap sanity checking** (GC-checked runs, M3): link the executable against the debug RTS by
+  adding `-debug` to the `ghc-options` in `unison-cli-main/package.yaml`, deleting
+  `unison-cli-main/unison-cli-main.cabal` (the committed one was made by a newer hpack, so Stack
+  ignores package.yaml until it is regenerated), then `stack build --fast --flag unison-runtime:jit
+  --force-dirty unison-cli-main`. `stack exec unison -- +RTS --info` must say `rts_thr_debug`.
+  Then run transcripts with `+RTS -DS -RTS` at the end of the command line: the RTS checks every
+  heap object at every GC, which catches a bad info pointer, tag, or a missed write barrier. About
+  10× slower. Revert the package.yaml change and relink the same way afterwards; don't commit it.
 - **Never run two Stack builds at once, and never leave a killed one behind.** A build killed by a
   timeout leaves `Cabal-simple` and `ghc` processes holding the build lock, and later builds hang
   silently on it ("still blocking for directory lock"). Check with `pgrep -fl "stack build|Cabal-simple"`
@@ -227,6 +236,28 @@ The tree and list entries got slower than in M1 because functions that used to b
 and exit there; each exit and re-entry costs more than interpreting the whole function. M3
 removes those exits.
 
+## M3 measurements
+
+2026-09-30, optimized build with the `jit` flag, `jitSuite`, best of three runs. The machine was
+busy with a system process during these runs, so the absolute numbers are 1.5-2× worse than
+the M2 ones (the interpreter's "Sum 0 to 1 million" went from 67 ms to 106 ms); compare within
+the row, and re-measure on an idle machine before quoting.
+
+| Benchmark | `UNISON_JIT=off` | `UNISON_JIT=eager` | Change |
+| --- | --- | --- | --- |
+| Sum 0 to 1 million | 106 ms | 0.53 ms | 200× faster (inflated by the noisy baseline) |
+| fib 20 | 2.20 ms | 145 µs | 15× faster |
+| Cons list: map with a lambda | 153 µs | 409 µs | slower: the call to `f` is an `App` to a function value (M4) |
+| Cons list: foldLeft with a lambda | 169 µs | 222 µs | slower: same |
+| Binary tree: 1000 inserts | 3.47 ms | 547 µs | 6× faster (M3 target was 3×) |
+| Binary tree: 1000 lookups | 1.52 ms | 139 µs | 11× faster |
+| Apply a function argument 10000 times | 2.20 ms | 2.90 ms | slower: unknown calls exit (M4) |
+| Mutate a Ref 10000 times | 1.84 ms | 3.09 ms | slower: `Ref` ops are foreign calls (M4) |
+
+Against the M2 interpreter numbers (measured on a quiet machine) the tree entries are 3× and
+5.5× faster, so the exit criterion holds either way. What's left slow is exactly M4's list:
+calls to function values and foreign calls.
+
 ## Baseline: interpreter only
 
 Measured 2026-09-29 on the optimized build of branch `jit` (commit c5bcd5ae7, no JIT code yet),
@@ -318,6 +349,11 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   reserve, roughly 1600 frames of a small function; "depth 1000000" hits the C stack guard 615
   times and each hit costs one interpreted `Let`. The Unison stack growth policy matters more:
   see the `GrowStack` note in [jit-m2.md](jit-m2.md).
+- 2026-09-30: M3 complete. Lessons: a `Seg`'s arrays are behind lifted boxes (see jit-m3.md);
+  `allocate` per `Pack` rather than per run because of the sanity checker; the interface
+  registers data type arities with the JIT since `DMatch` arms need them; a second runtime in
+  the same process calls `startJIT` twice, so it now no-ops the second time; LLJIT resolves
+  process symbols by itself, so C helpers called from IR need no `defineSymbol`.
 - 2026-09-30: M2 step 7 (inline `Let` bindings). The benchmark transcript then failed with
   "applying non-function" although the test matrix passed: a `Let` inside a binding has a body
   combinator whose arity isn't the interpreter's frame depth (see the decision in jit-m2.md), so

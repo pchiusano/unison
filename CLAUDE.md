@@ -9,6 +9,8 @@ Before doing anything on the JIT, read these in order:
    non-obvious, since sessions run out of context and this file is how work carries over.
 2. `docs/jit-design.md`: what is being built and why.
 3. `docs/jit-implementation-plan.md`: the signed-off decisions (D1 to D19) and milestones (M0 to M6).
+4. `docs/jit-optimization-ideas.md`: ideas not in any milestone yet. Add to it whenever you notice
+   something worth trying later; don't let such observations live only in chat.
 
 Rules:
 

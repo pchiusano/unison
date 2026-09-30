@@ -296,12 +296,25 @@ shapes n =
       go (acc + area s) (i + 1)
   go 0 0
 
+-- sums a fresh list of n cells, k times: allocates far more than the
+-- nursery, so it needs many collections while native code holds the loop
+Cons.sum : Cons Nat -> Nat
+Cons.sum = cases
+  Cons.Nil -> 0
+  Cons.Cons h t -> h + Cons.sum t
+
+churn : Nat -> Nat -> Nat
+churn k n =
+  go i acc = if i == 0 then acc else go (i - 1) (acc + Cons.sum (Cons.range 0 n))
+  go k 0
+
 > Cons.size (Cons.range 0 100000)
 > Cons.foldLeft (+) 0 (Cons.map (x -> x * 2) (Cons.range 0 1000))
 > Tree.size (Tree.build 5000)
 > (Tree.lookup 7919 (Tree.build 5000), Tree.lookup 10008 (Tree.build 5000))
 > shapes 10000
 > (1, "two", 3.0, ?4, +5, (6, 7))
+> churn 40 50000
 ```
 
 ``` ucm :added-by-ucm
@@ -312,10 +325,12 @@ shapes n =
   + structural type Tree
 
   + area          : Shape -> Nat
+  + churn         : Nat -> Nat -> Nat
   + Cons.foldLeft : (b ->{g} a ->{g} b) -> b -> Cons a ->{g} b
   + Cons.map      : (a ->{g} b) -> Cons a ->{g} Cons b
   + Cons.range    : Nat -> Nat -> Cons Nat
   + Cons.size     : Cons a -> Nat
+  + Cons.sum      : Cons Nat -> Nat
   + shapes        : Nat -> Nat
   + Tree.build    : Nat -> Tree
   + Tree.insert   : Nat -> Nat -> Tree -> Tree
@@ -324,29 +339,33 @@ shapes n =
 
   Run `update` to apply these changes to your codebase.
 
-    76 | > Cons.size (Cons.range 0 100000)
+    88 | > Cons.size (Cons.range 0 100000)
            ⧩
            100000
 
-    77 | > Cons.foldLeft (+) 0 (Cons.map (x -> x * 2) (Cons.range 0 1000))
+    89 | > Cons.foldLeft (+) 0 (Cons.map (x -> x * 2) (Cons.range 0 1000))
            ⧩
            999000
 
-    78 | > Tree.size (Tree.build 5000)
+    90 | > Tree.size (Tree.build 5000)
            ⧩
            5000
 
-    79 | > (Tree.lookup 7919 (Tree.build 5000), Tree.lookup 10008 (Tree.build 5000))
+    91 | > (Tree.lookup 7919 (Tree.build 5000), Tree.lookup 10008 (Tree.build 5000))
            ⧩
            (Some 1, None)
 
-    80 | > shapes 10000
+    92 | > shapes 10000
            ⧩
            249912515000
 
-    81 | > (1, "two", 3.0, ?4, +5, (6, 7))
+    93 | > (1, "two", 3.0, ?4, +5, (6, 7))
            ⧩
            (1, "two", 3.0, ?4, +5, (6, 7))
+
+    94 | > churn 40 50000
+           ⧩
+           49999000000
 ```
 
 ## Calls to function values

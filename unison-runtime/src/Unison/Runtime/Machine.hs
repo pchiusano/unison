@@ -54,7 +54,7 @@ import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.Frames
 import Unison.Runtime.JIT.Native
-import Unison.Runtime.JIT.Pool (globalPool)
+import Unison.Runtime.JIT.Pool (currentPool)
 import Foreign.Storable qualified as Store
 import GHC.Conc as STM (unsafeIOToSTM)
 import GHC.Float (double2Float, float2Double)
@@ -940,7 +940,8 @@ runNative ::
 runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
   where
     go (Stack ap fp sp ustk bstk) = do
-      (status, ap', fp', sp', records) <- enterNative fn ustk bstk globalPool ap fp sp
+      pool <- currentPool
+      (status, ap', fp', sp', records) <- enterNative fn ustk bstk pool ap fp sp
       let stk = Stack ap' fp' sp' ustk bstk
       when (JIT.trace JIT.config) $
         JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")" ++ concatMap (("\n  frame record " ++) . show) records)

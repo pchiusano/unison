@@ -37,6 +37,12 @@ typedef struct UnisonJitCtx {
 
   // Lowest C stack pointer native code may make a non-tail call at.
   int64_t cstack_limit;
+
+  // The capability running this thread, for allocate(). Set at entry.
+  void *cap;
+  // Allocation budget in words; native code charges it and the entry poll
+  // fires when it is exhausted. Refilled by the trampoline.
+  int64_t alloc_left;
 } UnisonJitCtx;
 
 // Status values returned by native code. Positive values are exit indices.

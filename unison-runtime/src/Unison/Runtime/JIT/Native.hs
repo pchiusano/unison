@@ -14,6 +14,7 @@ module Unison.Runtime.JIT.Native
     enterNative,
     configureNative,
     ctxLayout,
+    rtsFacts,
     probeClosure,
     hplimValue,
   )
@@ -64,7 +65,16 @@ foreign import ccall unsafe "unison_jit_enter"
     Ptr Int64 ->
     IO Int64
 
-foreign import ccall unsafe "unison_jit_configure" c_configure :: Int64 -> Int64 -> Int64 -> Int64 -> IO ()
+foreign import ccall unsafe "unison_jit_configure" c_configure :: Int64 -> Int64 -> Int64 -> Int64 -> Int64 -> IO ()
+
+foreign import ccall unsafe "unison_jit_rts_facts" c_rtsFacts :: Ptr Int64 -> Int64 -> IO Int64
+
+-- | Facts about the runtime that generated code needs: see
+-- unison_jit_rts_facts in jit_rt.c for what each entry is.
+rtsFacts :: IO [Int]
+rtsFacts = allocaBytes (8 * 16) $ \out -> do
+  n <- c_rtsFacts out 16
+  map fromIntegral <$> mapM (peekElemOff out) [0 .. fromIntegral n - 1]
 
 foreign import ccall unsafe "unison_jit_ctx_layout" c_ctxLayout :: Ptr Int64 -> Int64 -> IO Int64
 
@@ -115,16 +125,16 @@ enterNative fn (MutableByteArray ustk) bstk@(MutableArray bstk#) (MutableArray p
 -- | Passes stress settings to the C side: poll every N entries, treat every
 -- Nth callee as uncompiled, C stack budget in bytes (0 for the default),
 -- trace. Called once at startup.
-configureNative :: Int -> Int -> Int -> Bool -> IO ()
-configureNative pollEvery calleeEvery cstack tr =
-  c_configure (fromIntegral pollEvery) (fromIntegral calleeEvery) (fromIntegral cstack) (if tr then 1 else 0)
+configureNative :: Int -> Int -> Int -> Int -> Bool -> IO ()
+configureNative pollEvery calleeEvery cstack alloc tr =
+  c_configure (fromIntegral pollEvery) (fromIntegral calleeEvery) (fromIntegral cstack) (fromIntegral alloc) (if tr then 1 else 0)
 
 -- | The offsets of the fields of the C @Ctx@, in the order they are
 -- declared, and its total size. The code generator uses these.
 ctxLayout :: IO ([Int], Int)
 ctxLayout = allocaBytes (8 * 32) $ \out -> do
   size <- c_ctxLayout out 32
-  offs <- mapM (peekElemOff out) [0 .. 16]
+  offs <- mapM (peekElemOff out) [0 .. 18]
   pure (map fromIntegral offs, fromIntegral size)
 
 -- | Inspects a closure. Element 0 of the array is the sample, the rest are
@@ -150,8 +160,11 @@ enterNative ::
   IO (Status, Int, Int, Int, [FrameRecord])
 enterNative _ _ _ _ _ _ _ = error "JIT: not built in, but a native code cell holds code"
 
-configureNative :: Int -> Int -> Int -> Bool -> IO ()
-configureNative _ _ _ _ = pure ()
+configureNative :: Int -> Int -> Int -> Int -> Bool -> IO ()
+configureNative _ _ _ _ _ = pure ()
+
+rtsFacts :: IO [Int]
+rtsFacts = pure []
 
 ctxLayout :: IO ([Int], Int)
 ctxLayout = pure ([], 0)

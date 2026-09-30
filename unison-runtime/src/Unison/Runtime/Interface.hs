@@ -81,7 +81,7 @@ import Unison.Runtime.Decompile qualified as Decomp
 import Unison.Runtime.Exception (RuntimeExn (BU, PE), die)
 import Unison.Runtime.Foreign.Function (functionUnreplacements)
 import Unison.Runtime.InternalError (CompileExn (CE))
-import Unison.Runtime.JIT (printJITStats, startJIT)
+import Unison.Runtime.JIT (printJITStats, registerDataTypes, startJIT)
 import Unison.Runtime.MCode
   ( newNativeCellPool,
     Args (..),
@@ -205,7 +205,8 @@ allocType ::
   IO EvalCtx
 allocType _ b@(RF.Builtin _) _ =
   die [] $ "Unknown builtin type reference: " ++ show b
-allocType ctx r cons =
+allocType ctx r cons = do
+  registerDataTypes (Map.singleton r (either id id cons))
   pure $ ctx {dspec = Map.insert r cons $ dspec ctx}
 
 recursiveDeclDeps ::
@@ -878,6 +879,7 @@ data RuntimeHost
 startRuntime :: Bool -> RuntimeHost -> Text -> IO (Runtime Symbol)
 startRuntime sandboxed runtimeHost version = do
   startJIT
+  registerDataTypes (fmap (either id id) builtinDataSpec)
   ctxVar <- newIORef =<< baseContext sandboxed
   (activeThreads, cleanupThreads) <- case runtimeHost of
     -- Don't bother tracking open threads when running standalone, they'll all be cleaned up
