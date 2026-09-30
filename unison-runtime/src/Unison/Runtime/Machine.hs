@@ -28,6 +28,7 @@ module Unison.Runtime.Machine
 where
 
 import Control.Concurrent (ThreadId)
+import Control.Concurrent qualified as Conc
 import Control.Concurrent.STM as STM
 import Control.Exception
 import Control.Lens
@@ -48,6 +49,11 @@ import Foreign.LibFFI.Internal
 import Foreign.Marshal (alloca)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr
+import Unison.Runtime.JIT (jitCompileGroup)
+import Unison.Runtime.JIT.Config qualified as JIT
+import Unison.Runtime.JIT.Exits
+import Unison.Runtime.JIT.Native
+import Unison.Runtime.JIT.Pool (globalPool)
 import Foreign.Storable qualified as Store
 import GHC.Conc as STM (unsafeIOToSTM)
 import GHC.Float (double2Float, float2Double)
@@ -902,13 +908,69 @@ enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
         stk <- moveArgs stk args
         stk <- acceptArgs stk a
         eval yld env henv activeThreads stk k cref entry
-      else die [] "native code entry is not implemented yet"
+      else do
+        when (JIT.trace JIT.config) $
+          JIT.jitDump ("enter native " ++ show cref ++ " arity " ++ show a ++ " args " ++ show args ++ " cell " ++ show cell ++ " code " ++ show native ++ " stack before " ++ show stk)
+        stk <- if sck then pure stk else ensure stk f
+        stk <- moveArgs stk args
+        stk <- acceptArgs stk a
+        when (JIT.trace JIT.config) $ JIT.jitDump ("  stack after " ++ show stk)
+        runNative yld env henv activeThreads stk k (castPtrToFunPtr native)
   (RComb (CachedVal _ val)) -> do
     stk <- discardFrame stk
     stk <- bump stk
     poke stk val
     yield yld env henv activeThreads stk k
 {-# INLINE enter #-}
+
+-- The trampoline: runs compiled code for a combinator whose frame has
+-- been set up as `enter` sets it up, then acts on the status it returns.
+-- See docs/jit-design.md, "How the interpreter interacts with native code".
+runNative ::
+  (RuntimeProfiler prof) =>
+  Ticker prof ->
+  CCache prof ->
+  HEnv ->
+  ActiveThreads ->
+  Stack ->
+  K ->
+  FunPtr NativeFn ->
+  IO ()
+runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
+  where
+    go (Stack ap fp sp ustk bstk) = do
+      (status, ap', fp', sp') <- enterNative fn ustk bstk globalPool ap fp sp
+      let stk = Stack ap' fp' sp' ustk bstk
+      when (JIT.trace JIT.config) $
+        JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")")
+      if status == statusOK
+        then yield yld env henv activeThreads stk k
+        else
+          if status == statusError
+            then die [] "native code reported an error"
+            else do
+              when (JIT.stats JIT.config) (countExit status)
+              act stk =<< lookupExit status
+    act stk = \case
+      Named _ e -> act stk e
+      Resume cix sect -> do
+        when (JIT.trace JIT.config) $ JIT.jitDump ("resume " ++ show cix ++ " at\n" ++ prettySection 4 sect "")
+        eval yld env henv activeThreads stk k cix sect
+      GrowStack n cell -> do
+        when (JIT.trace JIT.config) $ JIT.jitDump ("grow stack by " ++ show n)
+        stk <- ensure stk n
+        again cell stk
+      Reenter cell -> do
+        when (JIT.trace JIT.config) $ JIT.jitDump "reenter"
+        Conc.yield
+        again cell stk
+    -- The exit says which function to call again. It is the one that took
+    -- the exit, which after tail calls need not be the one entered here.
+    again cell stk = do
+      code <- readNativeCode cell
+      if code == nullPtr
+        then die [] "native code disappeared from its cell"
+        else runNative yld env henv activeThreads stk k (castPtrToFunPtr code)
 
 -- fast path by-name delaying
 name :: Stack -> Args -> Val -> IO Stack
@@ -1615,7 +1677,12 @@ cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = go
           pool' <- growNativeCellPool needed pool
           atomically $ writeTVar (nativeCells cc) pool'
           go
-        Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs) ->
+        Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs, newCombs, newCombRefs) -> do
+          when (JIT.dumpMCode JIT.config) $
+            for_ (EC.mapToList (unresolvedCacheableCombs <> unresolvedNonCacheableCombs)) \(w, cmbs) ->
+              for_ (EC.mapToList cmbs) \(i, c) -> JIT.jitDump (prettyComb w i c "")
+          for_ (EC.mapToList newCombs) \(w, cmbs) ->
+            for_ (EC.lookup w newCombRefs) \r -> jitCompileGroup r w cmbs
           preEvalTopLevelConstants unresolvedCacheableCombs unresolvedNonCacheableCombs cc
 
     transaction = do
@@ -1667,7 +1734,7 @@ cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = go
           writeTVar (optInfos cc) optInfos'
           rtm' <- updateMap newRefTm (refTm cc)
           newCombRefs <- updateMap combRefUpdates (combRefs cc)
-          (unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs) <- stateTVar (combs cc) \oldCombs ->
+          (unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, newCombs, updatedCombs) <- stateTVar (combs cc) \oldCombs ->
             let unresolvedNewCombs :: EnumMap Word64 (GCombs any CombIx)
                 unresolvedNewCombs = absurdCombs (snd (attachNativeCells cells uncelled))
                 (unresolvedCacheableCombs, unresolvedNonCacheableCombs) =
@@ -1678,13 +1745,13 @@ cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = go
                 newCombs :: EnumMap Word64 MCombs
                 newCombs = resolveCombs (Just oldCombs) $ unresolvedNewCombs
                 updatedCombs = newCombs <> oldCombs
-             in ((unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs), updatedCombs)
+             in ((unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, newCombs, updatedCombs), updatedCombs)
           nsc <- updateMap unresolvedNewCombs (srcCombs cc)
           nsn <- updateMap (M.fromList sands) (sandbox cc)
           ncc <- updateMap newCacheableCombs (cacheableCombs cc)
           -- Now that the code cache is primed with everything we need,
           -- we can pre-evaluate the top-level constants.
-          pure $ int' `seq` rtm' `seq` newCombRefs `seq` updatedCombs `seq` nsn `seq` ncc `seq` nsc `seq` Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs)
+          pure $ int' `seq` rtm' `seq` newCombRefs `seq` updatedCombs `seq` nsn `seq` ncc `seq` nsc `seq` Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs, newCombs, newCombRefs)
 
 preEvalTopLevelConstants ::
   (RuntimeProfiler p) =>

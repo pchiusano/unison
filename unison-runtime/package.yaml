@@ -28,6 +28,12 @@ flags:
     manual: true
     default: false
 
+  # Build the JIT (see docs/jit-design.md). Needs LLVM; its paths are in stack.yaml.
+  # Off by default so that nobody else needs LLVM installed.
+  jit:
+    manual: true
+    default: false
+
 when:
   - condition: flag(arraychecks)
     cpp-options: -DARRAY_CHECK
@@ -42,6 +48,15 @@ when:
     ghc-options: -DCODE_SERIAL_CHECK
   - condition: flag(dumpcore)
     ghc-options: -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-coercions -dsuppress-idinfo -dsuppress-module-prefixes -ddump-str-signatures -ddump-simpl-stats # -dsuppress-type-applications -dsuppress-type-signatures
+  - condition: flag(jit)
+    cpp-options: -DUNISON_JIT
+    c-sources:
+      - cbits/jit_llvm.c
+      - cbits/jit_rt.c
+    extra-libraries:
+      - LLVM
+    # so the binary finds LLVM's shared library at run time without DYLD/LD settings
+    ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
 
 library:
   source-dirs: src

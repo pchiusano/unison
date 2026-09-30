@@ -1,10 +1,16 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PatternSynonyms #-}
+
+#ifdef UNISON_JIT
+-- See the note in Stack.hs: the JIT relies on GCombInfo's optimized layout.
+{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
+#endif
 
 module Unison.Runtime.MCode
   ( Args' (..),
@@ -21,8 +27,9 @@ module Unison.Runtime.MCode
     GCombInfo (..),
     NativeCell,
     readNativeCode,
+    writeNativeCode,
     bumpNativeCount,
-    NativeCellPool,
+    NativeCellPool (..),
     newNativeCellPool,
     takeNativeCells,
     growNativeCellPool,
@@ -55,6 +62,7 @@ module Unison.Runtime.MCode
     combTypes,
     prettyCombs,
     prettyComb,
+    prettySection,
   )
 where
 
@@ -712,6 +720,11 @@ readNativeCode :: Ptr NativeCell -> IO (Ptr ())
 readNativeCode cell = peekByteOff cell 0
 {-# INLINE readNativeCode #-}
 
+-- | Installs compiled code. A single pointer write; readers on other
+-- threads see either the old value or the new one.
+writeNativeCode :: Ptr NativeCell -> Ptr () -> IO ()
+writeNativeCode cell code = pokeByteOff cell 0 code
+
 -- | Counts a call made while the cell had no compiled code. Not atomic;
 -- a lost count under contention does not matter.
 bumpNativeCount :: Ptr NativeCell -> IO ()
@@ -775,6 +788,9 @@ data GComb val comb
     CachedVal !Word64 {- top level comb ix -} !val
   deriving stock (Show, Eq, Ord, Functor, Foldable, Traversable)
 
+-- | Matches any combinator, ignoring its native code cell. Building one
+-- with this gives it the shared "never compiled" cell, so don't use it to
+-- rebuild a combinator that already has a cell of its own.
 pattern Lam ::
   Int -> Int -> GSection comb -> GComb val comb
 pattern Lam a f sect <- Comb (LamI a f sect _)
@@ -792,7 +808,7 @@ instance Bifoldable GComb where
 
 instance Bitraversable GComb where
   bitraverse f _ (CachedVal cix c) = CachedVal cix <$> f c
-  bitraverse _ f (Lam a fr s) = Lam a fr <$> traverse f s
+  bitraverse _ f (Comb (LamI a fr s cell)) = Comb . (\s' -> LamI a fr s' cell) <$> traverse f s
 
 type RCombs val = GCombs val (RComb val)
 

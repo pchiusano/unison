@@ -41,7 +41,7 @@ import Network.HTTP.Client.TLS qualified as HTTP
 import Network.Socket qualified as Socket
 import Stats (recordRtsStats)
 import System.Directory (canonicalizePath, getCurrentDirectory, removeDirectoryRecursive)
-import System.Environment (getProgName, lookupEnv, withArgs)
+import System.Environment (getProgName, lookupEnv, setEnv, withArgs)
 import System.Exit (ExitCode (..))
 import System.Exit qualified as Exit
 import System.Exit qualified as System
@@ -159,7 +159,9 @@ main version = do
       progName <- getProgName
       -- hSetBuffering stdout NoBuffering -- cool
       (renderUsageInfo, globalOptions, command) <- parseCLIArgs progName (Text.unpack (Version.gitDescribeWithDate version))
-      let GlobalOptions {codebasePathOption = mCodePathOption, exitOption, lspFormattingConfig} = globalOptions
+      let GlobalOptions {codebasePathOption = mCodePathOption, exitOption, lspFormattingConfig, jitOption} = globalOptions
+      -- The runtime reads its JIT settings from the environment, once, at startup.
+      for_ jitOption (setEnv "UNISON_JIT")
       currentDir <- getCurrentDirectory
       case command of
         PrintVersion ->

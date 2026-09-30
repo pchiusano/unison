@@ -548,6 +548,41 @@ bits n =
            [13, 11, 12, 10]
 ```
 
+## Preemption
+
+A thread stuck in a loop that never allocates must still be killable. Compiled code polls at
+every function entry for this.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+spin : Nat -> Nat
+spin n = spin (n + 1)
+
+killTest : '{IO} Text
+killTest = do
+  t = IO.forkComp '(spin 0)
+  _ = IO.delay.impl 200000
+  match IO.kill.impl t with
+    Right _ -> "killed"
+    Left _ -> "could not kill"
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + killTest : '{IO} Text
+  + spin     : Nat -> Nat
+
+  Run `update` to apply these changes to your codebase.
+```
+
+``` ucm
+scratch/main> run killTest
+
+  "killed"
+```
+
 ## Mutable state and errors
 
 ``` unison

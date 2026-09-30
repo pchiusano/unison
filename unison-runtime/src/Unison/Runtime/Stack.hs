@@ -4,6 +4,12 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE UnboxedTuples #-}
+#ifdef UNISON_JIT
+-- The JIT's code generator relies on the optimized layout of GClosure and
+-- Val (strict fields unboxed), so this module is always compiled with
+-- optimization when the JIT is built in, even under `stack build --fast`.
+{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
+#endif
 
 module Unison.Runtime.Stack
   ( K (..),
@@ -221,6 +227,7 @@ import Unison.Runtime.ANF (Code, PackedTag, Value, maskTags)
 import Unison.Runtime.Array as PA
 import Unison.Runtime.FFI.DLL
 import Unison.Runtime.Foreign.Dynamic
+import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.MCode
 import Unison.Runtime.Referenced (Referenced, dereference)
 import Unison.Runtime.TypeTags qualified as TT
@@ -1007,8 +1014,11 @@ type Seg = (USeg, BSeg)
 
 alloc :: IO Stack
 alloc = do
-  ustk <- newByteArray 4096
-  bstk <- newArray 512 BlackHole
+  -- The JIT's `ustack` stress mode starts with a tiny stack, so that
+  -- growing it is exercised constantly.
+  let slots = fromMaybe 512 (JIT.stressStack JIT.config)
+  ustk <- newByteArray (bytes slots)
+  bstk <- newArray slots BlackHole
   pure $ Stack {ap = -1, fp = -1, sp = -1, ustk, bstk}
 {-# INLINE alloc #-}
 

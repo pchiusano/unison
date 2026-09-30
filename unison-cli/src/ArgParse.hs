@@ -130,7 +130,9 @@ data Command
 data GlobalOptions = GlobalOptions
   { codebasePathOption :: Maybe CodebasePathOption,
     exitOption :: ShouldExit,
-    lspFormattingConfig :: LspFormattingConfig
+    lspFormattingConfig :: LspFormattingConfig,
+    -- | JIT mode: "off", "on" or "eager". Overrides the UNISON_JIT environment variable.
+    jitOption :: Maybe String
   }
   deriving (Show, Eq)
 
@@ -290,9 +292,10 @@ globalOptionsParser = do
   codebasePathOption <- codebasePathParser <|> codebaseCreateParser
   exitOption <- exitParser
   lspFormattingConfig <- lspFormattingParser
+  jitOption <- jitParser
 
   pure
-    GlobalOptions {codebasePathOption, exitOption, lspFormattingConfig}
+    GlobalOptions {codebasePathOption, exitOption, lspFormattingConfig, jitOption}
 
 codebasePathParser :: Parser (Maybe CodebasePathOption)
 codebasePathParser = do
@@ -318,6 +321,13 @@ exitParser :: Parser ShouldExit
 exitParser = flag DoNotExit Exit (long "exit" <> help exitHelp)
   where
     exitHelp = "Exit repl after the command."
+
+jitParser :: Parser (Maybe String)
+jitParser =
+  optional . strOption $
+    long "jit"
+      <> metavar "MODE"
+      <> help "[Experimental] JIT compilation mode: off, on, or eager. Same as the UNISON_JIT environment variable."
 
 lspFormattingParser :: Parser LspFormattingConfig
 lspFormattingParser = flag LspFormatDisabled LspFormatEnabled (long "lsp-format" <> help lspFormatHelp)

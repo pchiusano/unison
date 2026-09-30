@@ -81,6 +81,7 @@ import Unison.Runtime.Decompile qualified as Decomp
 import Unison.Runtime.Exception (RuntimeExn (BU, PE), die)
 import Unison.Runtime.Foreign.Function (functionUnreplacements)
 import Unison.Runtime.InternalError (CompileExn (CE))
+import Unison.Runtime.JIT (printJITStats, startJIT)
 import Unison.Runtime.MCode
   ( newNativeCellPool,
     Args (..),
@@ -576,11 +577,15 @@ interpEval ::
   ProfileSpec ->
   Term Symbol ->
   IO (Either Error (Response DecompError, Term Symbol))
-interpEval actThr cleanThr ctxVar cl ppe = \case
-  NoProf ->
-    interpEvalDirect actThr cleanThr ctxVar Nothing cl ppe
-  MiniProf -> profileEval actThr cleanThr ctxVar cl ppe Nothing
-  FullProf file -> profileEval actThr cleanThr ctxVar cl ppe $ Just file
+interpEval actThr cleanThr ctxVar cl ppe spec tm = do
+  r <- case spec of
+    NoProf ->
+      interpEvalDirect actThr cleanThr ctxVar Nothing cl ppe tm
+    MiniProf -> profileEval actThr cleanThr ctxVar cl ppe Nothing tm
+    FullProf file -> profileEval actThr cleanThr ctxVar cl ppe (Just file) tm
+  -- nothing calls the runtime's `terminate`, so JIT statistics are printed here
+  printJITStats
+  pure r
 
 -- Slightly inefficient method of encoding text. Matches the old way of
 -- encoding e.g. the compiled version below. Compiled code is not
@@ -872,6 +877,7 @@ data RuntimeHost
 
 startRuntime :: Bool -> RuntimeHost -> Text -> IO (Runtime Symbol)
 startRuntime sandboxed runtimeHost version = do
+  startJIT
   ctxVar <- newIORef =<< baseContext sandboxed
   (activeThreads, cleanupThreads) <- case runtimeHost of
     -- Don't bother tracking open threads when running standalone, they'll all be cleaned up

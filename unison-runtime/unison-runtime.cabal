@@ -1,6 +1,6 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.38.1.
+-- This file has been generated from package.yaml by hpack version 0.37.0.
 --
 -- see: https://github.com/sol/hpack
 
@@ -26,6 +26,10 @@ flag codeserialchecks
   default: False
 
 flag dumpcore
+  manual: True
+  default: False
+
+flag jit
   manual: True
   default: False
 
@@ -65,6 +69,15 @@ library
       Unison.Runtime.Interface
       Unison.Runtime.InternalError
       Unison.Runtime.IOSource
+      Unison.Runtime.JIT
+      Unison.Runtime.JIT.Codegen
+      Unison.Runtime.JIT.Compile
+      Unison.Runtime.JIT.Config
+      Unison.Runtime.JIT.Exits
+      Unison.Runtime.JIT.Layout
+      Unison.Runtime.JIT.LLVM
+      Unison.Runtime.JIT.Native
+      Unison.Runtime.JIT.Pool
       Unison.Runtime.Machine
       Unison.Runtime.Machine.Primops
       Unison.Runtime.Machine.Types
@@ -188,6 +201,14 @@ library
     ghc-options: -DCODE_SERIAL_CHECK
   if flag(dumpcore)
     ghc-options: -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-coercions -dsuppress-idinfo -dsuppress-module-prefixes -ddump-str-signatures -ddump-simpl-stats
+  if flag(jit)
+    cpp-options: -DUNISON_JIT
+    c-sources:
+        cbits/jit_llvm.c
+        cbits/jit_rt.c
+    extra-libraries:
+        LLVM
+    ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
 
 test-suite runtime-tests
   type: exitcode-stdio-1.0
@@ -278,3 +299,11 @@ test-suite runtime-tests
     ghc-options: -DCODE_SERIAL_CHECK
   if flag(dumpcore)
     ghc-options: -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-coercions -dsuppress-idinfo -dsuppress-module-prefixes -ddump-str-signatures -ddump-simpl-stats
+  if flag(jit)
+    cpp-options: -DUNISON_JIT
+    c-sources:
+        cbits/jit_llvm.c
+        cbits/jit_rt.c
+    extra-libraries:
+        LLVM
+    ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
