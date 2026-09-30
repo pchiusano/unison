@@ -12,6 +12,7 @@ module Unison.Runtime.Machine
     Tracer (..),
     apply0,
     baseCCache,
+    initialNativeCells,
     cacheAdd,
     cacheAdd0,
     eval0,
@@ -891,12 +892,17 @@ enter ::
   MComb ->
   IO ()
 enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
-  (RComb (Lam a f entry)) -> do
-    -- check for stack check _skip_
-    stk <- if sck then pure stk else ensure stk f
-    stk <- moveArgs stk args
-    stk <- acceptArgs stk a
-    eval yld env henv activeThreads stk k cref entry
+  (RComb (Comb (LamI a f entry cell))) -> do
+    native <- readNativeCode cell
+    if native == nullPtr
+      then do
+        bumpNativeCount cell
+        -- check for stack check _skip_
+        stk <- if sck then pure stk else ensure stk f
+        stk <- moveArgs stk args
+        stk <- acceptArgs stk a
+        eval yld env henv activeThreads stk k cref entry
+      else die [] "native code entry is not implemented yet"
   (RComb (CachedVal _ val)) -> do
     stk <- discardFrame stk
     stk <- bump stk
@@ -956,7 +962,7 @@ apply !yld env henv !activeThreads !stk !k !ck !args !val =
   case val of
     BoxedVal (PAp cix comb seg) ->
       case comb of
-        LamI a f entry
+        LamI a f entry _
           | ck || a <= ac -> do
               stk <- ensure stk f
               stk <- moveArgs stk args
@@ -1591,64 +1597,94 @@ cacheAdd0 ::
   [(Reference, Set Reference)] ->
   CCache p ->
   IO ()
-cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = do
-  let toAdd = M.fromList (termSuperGroups <&> second codeGroup)
-  (unresolvedCacheableCombs, unresolvedNonCacheableCombs) <- atomically $ do
-    have <- readTVar (intermed cc)
-    let new = M.difference toAdd have
-    let sz = fromIntegral $ M.size new
-    let rs = M.keys new
-    int <- updateMap new (intermed cc)
-    let replace =
-          ANF.replaceConstructors pseudoConstructors
-            . ANF.replaceFunctions functionReplacements
-        haff (cmbs, opts) =
-          (M.mapWithKey (ANF.optimizeHandler Builtin opts) cmbs, opts)
-    opt <-
-      stateTVar (optInfos cc) $ haff . ANF.optimize (fmap replace new)
-    rty <- addRefs (freshTy cc) (refTy cc) (tagRefs cc) ntys0
-    ntm <- stateTVar (freshTm cc) $ \i -> (i, i + sz)
-    rtm <- updateMap (M.fromList $ zip rs [ntm ..]) (refTm cc)
-    -- check for missing references
-    let arities = fmap (head . ANF.arities) int <> builtinArities
-        rns = RN (refLookup "ty" rty) (refLookup "tm" rtm) (flip M.lookup arities)
-        combinate :: Word64 -> (Reference, SuperGroup Reference Symbol) -> (Word64, EnumMap Word64 Comb)
-        combinate n (r, g) = (n, emitCombs rns r n g)
-    let combRefUpdates = (mapFromList $ zip [ntm ..] rs)
-    let combIdFromRefMap = (M.fromList $ zip rs [ntm ..])
-    let newCacheableCombs =
-          termSuperGroups
-            & mapMaybe
-              ( \case
-                  (ref, CodeRep _ Cacheable) ->
-                    M.lookup ref combIdFromRefMap
-                  _ -> Nothing
-              )
-            & EC.setFromList
-    newCombRefs <- updateMap combRefUpdates (combRefs cc)
-    (unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs) <- stateTVar (combs cc) \oldCombs ->
-      let unresolvedNewCombs :: EnumMap Word64 (GCombs any CombIx)
-          unresolvedNewCombs =
-            absurdCombs
-              . sanitizeCombsOfForeignFuncs (sandboxed cc) sandboxedForeignFuncs
+cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = go
+  where
+    toAdd = M.fromList (termSuperGroups <&> second codeGroup)
+
+    -- Every new combinator gets a native code cell (see docs/jit-design.md).
+    -- Cells come from the cache's pool, so the transaction never allocates
+    -- memory, which a retried transaction would leak. If the pool is too
+    -- small, the transaction makes no changes to the code and reports how
+    -- many cells it needs; the pool is grown outside the transaction and
+    -- the whole thing is tried again.
+    go = do
+      result <- atomically transaction
+      case result of
+        Left needed -> do
+          pool <- readTVarIO (nativeCells cc)
+          pool' <- growNativeCellPool needed pool
+          atomically $ writeTVar (nativeCells cc) pool'
+          go
+        Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs) ->
+          preEvalTopLevelConstants unresolvedCacheableCombs unresolvedNonCacheableCombs cc
+
+    transaction = do
+      have <- readTVar (intermed cc)
+      let new = M.difference toAdd have
+      let sz = fromIntegral $ M.size new
+      let rs = M.keys new
+      let int = new <> have
+      let replace =
+            ANF.replaceConstructors pseudoConstructors
+              . ANF.replaceFunctions functionReplacements
+          haff (cmbs, opts) =
+            (M.mapWithKey (ANF.optimizeHandler Builtin opts) cmbs, opts)
+      (opt, optInfos') <- haff . ANF.optimize (fmap replace new) <$> readTVar (optInfos cc)
+      -- These two number things. Numbering is harmless to commit even if the
+      -- pool turns out to be too small: the numbers are simply used or skipped.
+      rty <- addRefs (freshTy cc) (refTy cc) (tagRefs cc) ntys0
+      ntm <- stateTVar (freshTm cc) $ \i -> (i, i + sz)
+      let newRefTm = M.fromList $ zip rs [ntm ..]
+      rtm <- (newRefTm <>) <$> readTVar (refTm cc)
+      -- check for missing references
+      let arities = fmap (head . ANF.arities) int <> builtinArities
+          rns = RN (refLookup "ty" rty) (refLookup "tm" rtm) (flip M.lookup arities)
+          combinate :: Word64 -> (Reference, SuperGroup Reference Symbol) -> (Word64, EnumMap Word64 Comb)
+          combinate n (r, g) = (n, emitCombs rns r n g)
+      let combRefUpdates = (mapFromList $ zip [ntm ..] rs)
+      let combIdFromRefMap = (M.fromList $ zip rs [ntm ..])
+      let newCacheableCombs =
+            termSuperGroups
+              & mapMaybe
+                ( \case
+                    (ref, CodeRep _ Cacheable) ->
+                      M.lookup ref combIdFromRefMap
+                    _ -> Nothing
+                )
+              & EC.setFromList
+      let uncelled =
+            sanitizeCombsOfForeignFuncs (sandboxed cc) sandboxedForeignFuncs
               . mapFromList
               $ zipWith combinate [ntm ..] (M.toList opt)
-          (unresolvedCacheableCombs, unresolvedNonCacheableCombs) =
-            EC.mapToList unresolvedNewCombs & foldMap \(w, gcombs) ->
-              if EC.member w newCacheableCombs
-                then (EC.mapSingleton w gcombs, mempty)
-                else (mempty, EC.mapSingleton w gcombs)
-          newCombs :: EnumMap Word64 MCombs
-          newCombs = resolveCombs (Just oldCombs) $ unresolvedNewCombs
-          updatedCombs = newCombs <> oldCombs
-       in ((unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs), updatedCombs)
-    nsc <- updateMap unresolvedNewCombs (srcCombs cc)
-    nsn <- updateMap (M.fromList sands) (sandbox cc)
-    ncc <- updateMap newCacheableCombs (cacheableCombs cc)
-    -- Now that the code cache is primed with everything we need,
-    -- we can pre-evaluate the top-level constants.
-    pure $ int `seq` rtm `seq` newCombRefs `seq` updatedCombs `seq` nsn `seq` ncc `seq` nsc `seq` (unresolvedCacheableCombs, unresolvedNonCacheableCombs)
-  preEvalTopLevelConstants unresolvedCacheableCombs unresolvedNonCacheableCombs cc
+          (cellCount, _) = attachNativeCells nullPtr uncelled
+      pool <- readTVar (nativeCells cc)
+      case takeNativeCells cellCount pool of
+        Nothing -> pure (Left cellCount)
+        Just (cells, pool') -> do
+          -- Everything is in hand. From here on the transaction only writes.
+          writeTVar (nativeCells cc) pool'
+          int' <- updateMap new (intermed cc)
+          writeTVar (optInfos cc) optInfos'
+          rtm' <- updateMap newRefTm (refTm cc)
+          newCombRefs <- updateMap combRefUpdates (combRefs cc)
+          (unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs) <- stateTVar (combs cc) \oldCombs ->
+            let unresolvedNewCombs :: EnumMap Word64 (GCombs any CombIx)
+                unresolvedNewCombs = absurdCombs (snd (attachNativeCells cells uncelled))
+                (unresolvedCacheableCombs, unresolvedNonCacheableCombs) =
+                  EC.mapToList unresolvedNewCombs & foldMap \(w, gcombs) ->
+                    if EC.member w newCacheableCombs
+                      then (EC.mapSingleton w gcombs, mempty)
+                      else (mempty, EC.mapSingleton w gcombs)
+                newCombs :: EnumMap Word64 MCombs
+                newCombs = resolveCombs (Just oldCombs) $ unresolvedNewCombs
+                updatedCombs = newCombs <> oldCombs
+             in ((unresolvedNewCombs, unresolvedCacheableCombs, unresolvedNonCacheableCombs, updatedCombs), updatedCombs)
+          nsc <- updateMap unresolvedNewCombs (srcCombs cc)
+          nsn <- updateMap (M.fromList sands) (sandbox cc)
+          ncc <- updateMap newCacheableCombs (cacheableCombs cc)
+          -- Now that the code cache is primed with everything we need,
+          -- we can pre-evaluate the top-level constants.
+          pure $ int' `seq` rtm' `seq` newCombRefs `seq` updatedCombs `seq` nsn `seq` ncc `seq` nsc `seq` Right (unresolvedCacheableCombs, unresolvedNonCacheableCombs)
 
 preEvalTopLevelConstants ::
   (RuntimeProfiler p) =>

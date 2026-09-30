@@ -19,6 +19,15 @@ module Unison.Runtime.MCode
     Section,
     GComb (.., Lam),
     GCombInfo (..),
+    NativeCell,
+    readNativeCode,
+    bumpNativeCount,
+    NativeCellPool,
+    newNativeCellPool,
+    takeNativeCells,
+    growNativeCellPool,
+    noNativeCell,
+    attachNativeCells,
     Comb,
     RComb (..),
     RCombInfo,
@@ -95,6 +104,11 @@ import Unison.Runtime.ANF
     pattern TVar,
   )
 import Unison.Runtime.ANF qualified as ANF
+import Control.Monad.State.Strict (runState, state)
+import Foreign.Marshal.Alloc (callocBytes)
+import Foreign.Ptr (Ptr, plusPtr)
+import Foreign.Storable (peekByteOff, pokeByteOff)
+import System.IO.Unsafe (unsafePerformIO)
 import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..), foreignFuncBuiltinName)
 import Unison.Runtime.InternalError (internalBug)
 import Unison.Util.Bytes (Bytes)
@@ -681,7 +695,79 @@ data GCombInfo comb
       !Int -- Number of arguments
       !Int -- Maximum needed frame size
       !(GSection comb) -- Entry
+      !(Ptr NativeCell) -- Where the JIT keeps this combinator's compiled code
   deriving stock (Show, Eq, Ord, Functor, Foldable, Traversable)
+
+-- | A native code cell (see docs/jit-design.md). 16 bytes outside the
+-- Haskell heap: a pointer to the combinator's compiled code, null until
+-- it is compiled, followed by a count of calls made while it was null.
+-- Cells never move, so generated code can refer to them by address.
+data NativeCell
+
+nativeCellSize :: Int
+nativeCellSize = 16
+
+-- | Reads the compiled code pointer of a cell. Null means "interpret".
+readNativeCode :: Ptr NativeCell -> IO (Ptr ())
+readNativeCode cell = peekByteOff cell 0
+{-# INLINE readNativeCode #-}
+
+-- | Counts a call made while the cell had no compiled code. Not atomic;
+-- a lost count under contention does not matter.
+bumpNativeCount :: Ptr NativeCell -> IO ()
+bumpNativeCount cell = do
+  n <- peekByteOff cell 8 :: IO Int
+  pokeByteOff cell 8 (n + 1)
+{-# INLINE bumpNativeCount #-}
+
+-- | Allocates zeroed cells for @n@ combinators, as one block that is
+-- never freed.
+newNativeCells :: Int -> IO (Ptr NativeCell)
+newNativeCells n = callocBytes (max 1 n * nativeCellSize)
+
+-- | The cell at index @i@ of a block from 'newNativeCells'.
+nativeCellAt :: Ptr NativeCell -> Int -> Ptr NativeCell
+nativeCellAt base i = base `plusPtr` (i * nativeCellSize)
+
+-- | A shared cell for combinators that are never compiled: builtins,
+-- and combinators that were not loaded through the code cache.
+noNativeCell :: Ptr NativeCell
+noNativeCell = unsafePerformIO (newNativeCells 1)
+{-# NOINLINE noNativeCell #-}
+
+-- | Cells are handed out from a pool, so that loading code (an STM
+-- transaction) never has to allocate memory: a retried transaction
+-- would leak it. The pool is a block of cells and a count of how many
+-- are in use. When it runs out, a new block is allocated outside the
+-- transaction with 'growNativeCellPool'. Old blocks stay in use, and
+-- are never freed.
+data NativeCellPool = NativeCellPool !(Ptr NativeCell) !Int !Int -- block, used, capacity
+
+newNativeCellPool :: Int -> IO NativeCellPool
+newNativeCellPool capacity = do
+  block <- newNativeCells capacity
+  pure (NativeCellPool block 0 capacity)
+
+-- | Takes @n@ cells from the pool, or fails if it has fewer left.
+takeNativeCells :: Int -> NativeCellPool -> Maybe (Ptr NativeCell, NativeCellPool)
+takeNativeCells n (NativeCellPool block used capacity)
+  | used + n <= capacity = Just (nativeCellAt block used, NativeCellPool block (used + n) capacity)
+  | otherwise = Nothing
+
+-- | A fresh block with room for at least @n@ cells, and at least twice
+-- the old capacity so that growing stays rare.
+growNativeCellPool :: Int -> NativeCellPool -> IO NativeCellPool
+growNativeCellPool n (NativeCellPool _ _ capacity) = newNativeCellPool (max n (2 * capacity))
+
+-- | Gives every combinator in a group of freshly loaded code its own
+-- cell from @base@, numbering them in order. Returns the count used.
+attachNativeCells ::
+  Ptr NativeCell -> EnumMap Word64 (GCombs val comb) -> (Int, EnumMap Word64 (GCombs val comb))
+attachNativeCells base groups = (n, groups')
+  where
+    (groups', n) = runState (traverse (traverse attach) groups) 0
+    attach (Comb (LamI a f s _)) = state \i -> (Comb (LamI a f s (nativeCellAt base i)), i + 1)
+    attach c = pure c
 
 data GComb val comb
   = Comb {-# UNPACK #-} !(GCombInfo comb)
@@ -691,7 +777,9 @@ data GComb val comb
 
 pattern Lam ::
   Int -> Int -> GSection comb -> GComb val comb
-pattern Lam a f sect = Comb (LamI a f sect)
+pattern Lam a f sect <- Comb (LamI a f sect _)
+  where
+    Lam a f sect = Comb (LamI a f sect noNativeCell)
 
 -- it seems GHC can't figure this out itself
 {-# COMPLETE CachedVal, Lam #-}

@@ -82,7 +82,8 @@ import Unison.Runtime.Exception (RuntimeExn (BU, PE), die)
 import Unison.Runtime.Foreign.Function (functionUnreplacements)
 import Unison.Runtime.InternalError (CompileExn (CE))
 import Unison.Runtime.MCode
-  ( Args (..),
+  ( newNativeCellPool,
+    Args (..),
     CombIx (..),
     GInstr (..),
     GSection (..),
@@ -97,7 +98,8 @@ import Unison.Runtime.MCode
   )
 import Unison.Runtime.MCode.Serialize
 import Unison.Runtime.Machine
-  ( ActiveThreads,
+  ( initialNativeCells,
+    ActiveThreads,
     CCache (..),
     Combs,
     Tracer (..),
@@ -974,6 +976,7 @@ restoreCache sandboxed (SCache cs crs cacheableCombs opt trs ftm fty int rtm rty
       <*> newTVarIO (rtm <> builtinTermNumbering)
       <*> newTVarIO (rty <> builtinTypeNumbering)
       <*> newTVarIO (sbs <> baseSandboxInfo)
+      <*> (newTVarIO =<< newNativeCellPool initialNativeCells)
   let (unresolvedCacheableCombs, unresolvedNonCacheableCombs) =
         srcCombs
           & sanitizeCombsOfForeignFuncs sandboxed sandboxedForeignFuncs

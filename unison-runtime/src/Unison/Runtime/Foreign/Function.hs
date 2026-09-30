@@ -1244,7 +1244,7 @@ foreignCallHelper = \case
           df <- loadForeign dll spec sym
           let dummyRef = Builtin . TS.pack $ cName df
               dummyCix = CIx dummyRef maxBound 0
-              comb = LamI (n + 1) (n + 2) (Ins DLLCall . Yield $ VArg1 0)
+              comb = LamI (n + 1) (n + 2) (Ins DLLCall . Yield $ VArg1 0) noNativeCell
           evaluate $ PApV dummyCix comb [encodeVal df]
   FFI_getDLLSymPtr -> mkForeignExn $ \(dll, sym, spec :: FFSpec) ->
     let name = getDLLPath dll ++ "$" ++ sym

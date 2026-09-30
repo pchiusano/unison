@@ -176,7 +176,9 @@ data CCache prof = CCache
     intermed :: TVar (M.Map Reference (SuperGroup Reference Symbol)),
     refTm :: TVar (M.Map Reference Word64),
     refTy :: TVar (M.Map Reference Word64),
-    sandbox :: TVar (M.Map Reference (Set Reference))
+    sandbox :: TVar (M.Map Reference (Set Reference)),
+    -- native code cells for combinators loaded through this cache (see docs/jit-design.md)
+    nativeCells :: TVar NativeCellPool
   }
 
 refNumsTm :: CCache prof -> IO (M.Map Reference Word64)
@@ -190,6 +192,10 @@ refNumTm cc r =
   refNumsTm cc >>= \case
     (M.lookup r -> Just w) -> pure w
     _ -> Exception.die [] $ "refNumTm: unknown reference: " ++ show r
+
+-- | How many native code cells a fresh cache starts with. Each is 16 bytes.
+initialNativeCells :: Int
+initialNativeCells = 16384
 
 baseCCache :: Bool -> IO (CCache ())
 baseCCache sandboxed = do
@@ -206,6 +212,7 @@ baseCCache sandboxed = do
     <*> newTVarIO builtinTermNumbering
     <*> newTVarIO builtinTypeNumbering
     <*> newTVarIO baseSandboxInfo
+    <*> (newTVarIO =<< newNativeCellPool initialNativeCells)
   where
     cacheableCombs = mempty
     noTrace _ _ = NoTrace
