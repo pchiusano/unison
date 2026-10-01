@@ -20,12 +20,20 @@ import Text.Read (readMaybe)
 data Mode
   = -- | never compile
     Off
+  | -- | compile what gets hot, in the background
+    On
   | -- | compile everything as it is loaded (for testing)
     Eager
   deriving (Show, Eq)
 
 data Config = Config
   { mode :: Mode,
+    -- | with 'On': interpreted calls before a definition is compiled
+    -- (@UNISON_JIT_THRESHOLD@)
+    threshold :: Int,
+    -- | with 'On': the most definitions compiled together as one module
+    -- (@UNISON_JIT_BATCH@)
+    batch :: Int,
     -- | log each compiled module to stderr
     logging :: Bool,
     -- | directory to write each module's IR into, with the MCode of each
@@ -50,10 +58,16 @@ data Config = Config
     stressCStack :: Int,
     -- | allocation budget between polls, in words (stress mode @alloc=N@)
     stressAlloc :: Int,
+    -- | milliseconds to sleep between installing each function of a
+    -- module (stress mode @install=N@)
+    stressInstall :: Int,
+    -- | size of the constant pool before it has to grow (stress mode @pool=N@)
+    stressPool :: Maybe Int,
     -- | features turned off for debugging, from @UNISON_JIT_DISABLE@
     -- (comma separated): @app@ (closure calls), @apply@ (the interpreter
     -- entering native code for a closure), @ref@, @array@, @cmp@
-    -- (universal comparison), @callout@ (call-outs become resumes)
+    -- (universal comparison), @callout@ (call-outs become resumes), @direct@
+    -- (calls within a module go through cells)
     disabled :: [String]
   }
   deriving (Show)
@@ -65,6 +79,8 @@ config = unsafePerformIO $ do
   dump <- lookupEnv "UNISON_JIT_DUMP_IR"
   stats <- lookupEnv "UNISON_JIT_STATS"
   every <- lookupEnv "UNISON_JIT_STATS_EVERY"
+  thresh <- lookupEnv "UNISON_JIT_THRESHOLD"
+  batchSize <- lookupEnv "UNISON_JIT_BATCH"
   mcode <- lookupEnv "UNISON_JIT_DUMP_MCODE"
   tr <- lookupEnv "UNISON_JIT_TRACE"
   stress <- maybe [] (splitOn ',') <$> lookupEnv "UNISON_JIT_STRESS"
@@ -74,7 +90,10 @@ config = unsafePerformIO $ do
     Config
       { mode = case map toLower (fromMaybe "off" mode) of
           "eager" -> Eager
+          "on" -> On
           _ -> Off,
+        threshold = max 1 (fromMaybe 100 (thresh >>= readMaybe)),
+        batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
         logging = maybe False (not . null) logging,
         dumpIR = dump,
         dumpMCode = maybe False (not . null) mcode,
@@ -85,6 +104,8 @@ config = unsafePerformIO $ do
         stressCallee = fromMaybe 0 (setting "callee"),
         stressCStack = fromMaybe 0 (setting "cstack"),
         stressAlloc = fromMaybe 0 (setting "alloc"),
+        stressInstall = fromMaybe 0 (setting "install"),
+        stressPool = setting "pool",
         statsEvery = fromMaybe 0 (every >>= readMaybe),
         disabled = disabledFeatures
       }

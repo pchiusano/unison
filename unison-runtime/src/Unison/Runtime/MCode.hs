@@ -3,6 +3,8 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE UnboxedTuples #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PatternSynonyms #-}
@@ -29,6 +31,13 @@ module Unison.Runtime.MCode
     readNativeCode,
     writeNativeCode,
     bumpNativeCount,
+    readNativeCount,
+    writeNativeCount,
+    initialNativeCount,
+    claimNativeCell,
+    releaseNativeCell,
+    takeNativeCell,
+    nativeCellRequested,
     NativeCellPool (..),
     newNativeCells,
     nativeCellAt,
@@ -115,9 +124,14 @@ import Unison.Runtime.ANF
     pattern TVar,
   )
 import Unison.Runtime.ANF qualified as ANF
+import Control.Monad (forM_, when)
 import Control.Monad.State.Strict (runState, state)
+import Unison.Runtime.JIT.Config qualified as JIT
 import Foreign.Marshal.Alloc (callocBytes)
-import Foreign.Ptr (Ptr, plusPtr)
+import Foreign.Ptr (plusPtr)
+import GHC.Exts (Word#, atomicCasWordAddr#, eqWord#, isTrue#, plusAddr#)
+import GHC.IO (IO (..))
+import GHC.Ptr (Ptr (..))
 import Foreign.Storable (peekByteOff, pokeByteOff)
 import System.IO.Unsafe (unsafePerformIO)
 import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..), foreignFuncBuiltinName)
@@ -710,14 +724,22 @@ data GCombInfo comb
       !(Ptr NativeCell) -- Where the JIT keeps this combinator's compiled code
   deriving stock (Show, Eq, Ord, Functor, Foldable, Traversable)
 
--- | A native code cell (see docs/jit-design.md). 16 bytes outside the
--- Haskell heap: a pointer to the combinator's compiled code, null until
--- it is compiled, followed by a count of calls made while it was null.
+-- | A native code cell (see docs/jit-design.md): the mutable part of a
+-- combinator, 24 bytes outside the Haskell heap. A pointer to the
+-- combinator's compiled code, null until it is compiled; a count of calls
+-- made while it was null; and a state: 0 until the JIT has been asked to
+-- compile it, 1 while the request is queued, 2 once the compile thread has
+-- taken it. It only moves forward, so a combinator is asked for only once.
 -- Cells never move, so generated code can refer to them by address.
+--
+-- The count starts at minus the JIT's compilation threshold when the JIT
+-- compiles what gets hot, so that "hot" is the count reaching zero: the
+-- interpreter's test is one comparison with a constant. A count that
+-- starts at zero or above never gets there.
 data NativeCell
 
 nativeCellSize :: Int
-nativeCellSize = 16
+nativeCellSize = 24
 
 -- | Reads the compiled code pointer of a cell. Null means "interpret".
 readNativeCode :: Ptr NativeCell -> IO (Ptr ())
@@ -729,13 +751,59 @@ readNativeCode cell = peekByteOff cell 0
 writeNativeCode :: Ptr NativeCell -> Ptr () -> IO ()
 writeNativeCode cell code = pokeByteOff cell 0 code
 
--- | Counts a call made while the cell had no compiled code. Not atomic;
--- a lost count under contention does not matter.
-bumpNativeCount :: Ptr NativeCell -> IO ()
+-- | Counts a call made while the cell had no compiled code, and says
+-- whether that made it hot (the count reached zero). Not atomic; a lost
+-- count under contention does not matter.
+bumpNativeCount :: Ptr NativeCell -> IO Bool
 bumpNativeCount cell = do
   n <- peekByteOff cell 8 :: IO Int
   pokeByteOff cell 8 (n + 1)
+  pure (n == -1)
 {-# INLINE bumpNativeCount #-}
+
+readNativeCount :: Ptr NativeCell -> IO Int
+readNativeCount cell = peekByteOff cell 8
+
+-- | Sets a cell's count: negative, to make it hot after that many more
+-- calls.
+writeNativeCount :: Ptr NativeCell -> Int -> IO ()
+writeNativeCount cell n = pokeByteOff cell 8 n
+
+-- | Marks the cell as requested (state 0 to 1), atomically, and says
+-- whether this call was the one that did. Whoever does owns the request,
+-- and queues it.
+claimNativeCell :: Ptr NativeCell -> IO Bool
+claimNativeCell cell = casNativeState cell 0## 1##
+
+-- | Puts the state back to 0: for a request that could not be queued.
+releaseNativeCell :: Ptr NativeCell -> IO ()
+releaseNativeCell cell = pokeByteOff cell 16 (0 :: Int)
+
+-- | The compile thread takes the cell (state 2), whether it was requested
+-- or not, and says whether this call was the one that did. A combinator
+-- that is taken is being compiled, or has been, or can't be. A request
+-- found already taken when it comes off the queue is dropped: its
+-- combinator went into an earlier batch.
+takeNativeCell :: Ptr NativeCell -> IO Bool
+takeNativeCell cell = do
+  wasRequested <- casNativeState cell 1## 2##
+  if wasRequested then pure True else casNativeState cell 0## 2##
+
+casNativeState :: Ptr NativeCell -> Word# -> Word# -> IO Bool
+casNativeState (Ptr cell) from to = IO $ \s ->
+  case atomicCasWordAddr# (plusAddr# cell 16#) from to s of
+    (# s', old #) -> (# s', isTrue# (eqWord# old from) #)
+
+-- | Whether a request for the cell is queued.
+nativeCellRequested :: Ptr NativeCell -> IO Bool
+nativeCellRequested cell = (== (1 :: Int)) <$> peekByteOff cell 16
+
+-- | The count a combinator's cell starts with: minus the threshold in the
+-- JIT's @on@ mode, zero (never hot) otherwise.
+initialNativeCount :: Int
+initialNativeCount = case JIT.mode JIT.config of
+  JIT.On -> negate (JIT.threshold JIT.config)
+  _ -> 0
 
 -- | Allocates zeroed cells for @n@ combinators, as one block that is
 -- never freed.
@@ -763,6 +831,8 @@ data NativeCellPool = NativeCellPool !(Ptr NativeCell) !Int !Int -- block, used,
 newNativeCellPool :: Int -> IO NativeCellPool
 newNativeCellPool capacity = do
   block <- newNativeCells capacity
+  when (initialNativeCount /= 0) $
+    forM_ [0 .. capacity - 1] $ \i -> writeNativeCount (nativeCellAt block i) initialNativeCount
   pure (NativeCellPool block 0 capacity)
 
 -- | Takes @n@ cells from the pool, or fails if it has fewer left.

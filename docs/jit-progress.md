@@ -16,6 +16,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M2: calls and frames | done 2026-09-30. Test matrix (7 configurations) passes; "fib 20" 16× faster; "depth 1000000" runs natively with the C stack guard. Data and list code is slower until M3/M4. See [jit-m2.md](jit-m2.md) |
 | M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
 | M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
+| M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
 | M0 spike 3: interpreter overhead | done: under 2%, cell field and check kept |
@@ -46,13 +47,19 @@ Update it whenever a step finishes or something non-obvious is learned.
   `--flag unison-runtime:jit`, otherwise Stack reconfigures the package without it (and rebuilds).
 - Iterating: `stack build --fast --flag unison-runtime:jit unison-runtime` (compile errors fast),
   then `stack build --flag unison-runtime:jit` to relink the executable.
-- Running with the JIT: `UNISON_JIT=eager` or `unison --jit eager`. Diagnostics: `UNISON_JIT_LOG=1`
+- Running with the JIT: `UNISON_JIT=on` (compile what gets hot, in the background; the mode
+  meant for use) or `UNISON_JIT=eager` (compile everything as it is loaded; for testing), or
+  `unison --jit on|eager`. `UNISON_JIT_THRESHOLD=N` (default 100) is the number of interpreted
+  calls before a definition, or a re-entry point, is compiled; `UNISON_JIT_BATCH=B` (default
+  32) the most definitions compiled together. Diagnostics: `UNISON_JIT_LOG=1`
   (compile log, including why a combinator or part of one was left to the interpreter),
   `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell sides; unusable
   on programs that load base, it exhausts memory during the load), `UNISON_JIT_DUMP_MCODE=1`,
   `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS_EVERY=N` (with
   stats: also every N exits, for evaluations that never finish), `UNISON_JIT_DISABLE=a,b,...`
-  (turn features off for bisecting a bug: `app`, `apply`, `ref`, `array`, `cmp`, `callout`).
+  (turn features off for bisecting a bug: `app`, `apply`, `ref`, `array`, `cmp`, `callout`,
+  `direct`). With stats, the first line is the compile totals: modules, functions, auxiliary
+  functions, re-entry functions generated on demand and never asked for, IR size, time.
 - Seeing the generated code: `--jit-dump-ir DIR` (or `UNISON_JIT_DUMP_IR=DIR`) writes one `.ll`
   file per definition into `DIR`, with the MCode of each function as a comment above its IR and a
   line for each combinator that wasn't compiled and why; `--jit-dump-ir -` prints to stderr. Two
@@ -95,6 +102,20 @@ Update it whenever a step finishes or something non-obvious is learned.
   identical each time. All passed on 2026-09-30 after M2 step 6 (about 2 minutes each).
   `UNISON_JIT_STATS=1` prints exit counts after every evaluation; the counts for "depth 1000000"
   are the quickest way to see whether frames are unwinding more than they should.
+- Since M5 the matrix also has `UNISON_JIT=on` with the default threshold, with
+  `UNISON_JIT_THRESHOLD=1` (every re-entry point is generated on first use, which tests the lazy
+  path), and `on` with `THRESHOLD=1` and `UNISON_JIT_STRESS=install=5` alone and together with
+  `pool=8,callee=2,cstack=4096,poll=5,ustack=4,alloc=64`. `install=N` sleeps N ms before each
+  function of a module is installed; `pool=N` makes the constant pool's first array N entries,
+  so that it grows and functions check its size. Eager mode gets `pool=8` in its combined run.
+  All passed on 2026-09-30. On the debug runtime with `-DS`, these passed with no assertion
+  failures: the tests with `on` and `THRESHOLD=1`, with `on`, `THRESHOLD=2` and
+  `install=5,pool=8,alloc=64,poll=7`, and with `eager`; and the benchmark transcript with `on`
+  and `THRESHOLD=1`.
+  With the `--fast` binary, `off` takes about 160 s and `on` or `eager` 10 to 25 s, because the
+  tests are loops.
+- What `on` mode compiles depends on timing (the compile thread races the program), so two runs
+  don't exercise exactly the same paths. `THRESHOLD=1` is the most repeatable.
 - Running a transcript writes `<name>.output.md` next to it. For the idempotent one, copy the output
   over the `.md` when the change is intended. Delete stray `.output.md` files before committing.
 - The benchmark transcript takes about a minute. In its console output the first benchmark's label
@@ -290,6 +311,49 @@ functions; the loops themselves run without leaving native code. What the suite 
 exercise: partial application with captured arguments (`Name`, a call-out), ability handler
 calls (`App (Dyn i)`, a resume), and over-application.
 
+## M5 measurements
+
+2026-09-30, optimized build (`.stack-work-opt`) with the `jit` flag, `jitSuite`, best of three
+runs (two for `off`).
+
+| Benchmark | `UNISON_JIT=off` | `UNISON_JIT=on` | `UNISON_JIT=eager` |
+| --- | --- | --- | --- |
+| Sum 0 to 1 million | 66.4 ms | 313 µs | 314 µs |
+| fib 20 | 1.39 ms | 88.6 µs | 88.6 µs |
+| Cons list: map with a lambda | 86.3 µs | 21.2 µs | 20.6 µs |
+| Cons list: foldLeft with a lambda | 86.0 µs | 5.01 µs | 5.01 µs |
+| Binary tree: 1000 inserts | 1.67 ms | 248 µs | 252 µs |
+| Binary tree: 1000 lookups | 763 µs | 66.2 µs | 64.0 µs |
+| Apply a function argument 10000 times | 1.16 ms | 48.0 µs | 48.1 µs |
+| Mutate a Ref 10000 times | 828 µs | 59.8 µs | 60.3 µs |
+
+- `on` is within 3% of `eager` everywhere (the exit criterion was 90%), and `off` is where it
+  was at M4.
+- What was compiled during the benchmark transcript, with batches over callees only (the
+  table above): `on`, 65 modules, 45 functions, 10 call-out continuations, 20 re-entry
+  functions on demand (36 more never asked for), 1.3 MB of IR, 0.77 s of compile time. `eager`,
+  193 modules, 524 functions, 494 auxiliary functions, 45.6 MB of IR, 17 s.
+- 2026-10-01, batches over callers as well (and the "requested" flag in the cell, which is now
+  24 bytes): `on` compiles 58 modules, 99 functions, 44 call-out continuations, 26 re-entry
+  functions on demand, 4.0 MB of IR, 1.4 s. Speeds are the same as in the table (`on`: 314 µs,
+  88.5 µs, 21.0 µs, 5.01 µs, 248 µs, 63.0 µs, 48.1 µs, 59.6 µs; `off`: 66.0 ms, 1.38 ms,
+  85.2 µs, 85.1 µs, 1.66 ms, 760 µs, 1.15 ms, 827 µs). Those eight have no hot loop that calls
+  across definitions, so they only show what batching costs.
+- 2026-10-01, a ninth benchmark, "Calls across definitions: Collatz steps for 1 to 1000" (a
+  loop calling a loop calling a small function, three definitions, about 60000 calls):
+
+  | `off` | `on` | `on`, `UNISON_JIT_BATCH=1` | `on`, `UNISON_JIT_DISABLE=direct` | `eager` |
+  | --- | --- | --- | --- | --- |
+  | 7.85 ms | 267 µs | 290 µs | 286 µs | 291 µs |
+
+  Batching with direct calls is worth 8% here. What `on` compiled in that transcript: with
+  batching 49 modules, 106 functions, 4.1 MB of IR, 1.46 s; with `BATCH=1` 73 modules, 52
+  functions, 1.4 MB, 0.74 s.
+- The whole benchmark transcript takes 62 to 64 s with `off`, 66 s with `on`, 81 to 85 s with
+  `eager` (most of it is typechecking and the benchmark library's fixed running time).
+- Startup: a transcript with one small watch expression takes 1.16 to 1.19 s with `off`, 1.17 s
+  with `on`, 1.19 to 1.21 s with `eager`.
+
 ## Baseline: interpreter only
 
 Measured 2026-09-29 on the optimized build of branch `jit` (commit c5bcd5ae7, no JIT code yet),
@@ -416,3 +480,22 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   through an indirection and refused every closure call, silently. Segment boxes are now
   checked for an evaluated pointer tag before use. Also: the debug-RTS binary lives in its own
   work dir now (see "How to build and run"), and Stack work dirs replace `stack clean`.
+- 2026-09-30: M5 complete. Things worth remembering: (1) the interpreter's hot-count test
+  must be a comparison with a constant. The first version compared with the configured
+  threshold and counted in `yield` too, and made the interpreter 5 to 20% slower with the JIT
+  off; cells now count up from minus the threshold to zero. Re-measure `off` whenever `enter`,
+  `apply` or `yield` change. (2) Callees get hot before callers, so batches of more than one
+  definition are rare and direct calls only matter within a definition. (3) The constant pool
+  had to be made safe for code that is installed while native code runs (see jit-m5.md). (4)
+  The compile driver now works on *units* (one LLVM function each: a combinator or a re-entry
+  function), and a table of pending units, keyed by cell, holds the re-entry functions that
+  were not generated. (5) A definition is never queued twice (see the next entry).
+- 2026-10-01: after Paul's review of M5. Batches now walk callers as well as callees, as the
+  design said from the start (the M5 plan had narrowed it to callees); the compile thread
+  keeps the reverse index, since the code cache only records callees. The "requested" state
+  moved from a separate set to a flag in the native code cell, set by compare-and-swap
+  (`claimNativeCell`); a definition's flag is its entry combinator's. Then a benchmark with a
+  hot loop calling across definitions was added, and it showed that a batch missed exactly
+  the hottest callee (its own request had been queued while the caller's waited), so the flag
+  became three states and a batch takes a neighbour whose request is still queued. Result: 8%
+  on that benchmark for about twice the compile work.

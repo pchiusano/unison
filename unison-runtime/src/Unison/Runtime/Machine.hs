@@ -49,7 +49,7 @@ import Foreign.LibFFI.Internal
 import Foreign.Marshal (alloca)
 import Foreign.Marshal.Array (allocaArray)
 import Foreign.Ptr
-import Unison.Runtime.JIT (jitCompileGroup, printJITStats)
+import Unison.Runtime.JIT (jitCompileGroup, jitRequestCell, jitRequestGroup, printJITStats)
 import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.Frames
@@ -903,7 +903,7 @@ enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
     native <- readNativeCode cell
     if native == nullPtr
       then do
-        bumpNativeCount cell
+        countInterpreted env cref cell
         -- check for stack check _skip_
         stk <- if sck then pure stk else ensure stk f
         stk <- moveArgs stk args
@@ -923,6 +923,24 @@ enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
     poke stk val
     yield yld env henv activeThreads stk k
 {-# INLINE enter #-}
+
+-- Counts a call the interpreter is about to run itself because the
+-- combinator has no native code, and asks for the combinator's definition
+-- to be compiled when the count says it is hot (in the JIT's `on` mode).
+countInterpreted :: CCache prof -> CombIx -> Ptr NativeCell -> IO ()
+countInterpreted env cix cell = do
+  hot <- bumpNativeCount cell
+  when hot (jitRequestGroup env cix cell)
+{-# INLINE countInterpreted #-}
+
+-- Likewise for a re-entry point: counts a time the interpreter continued
+-- at a place where native code would have, had it been generated, and asks
+-- for it to be once that has happened often enough.
+countReentry :: Ptr NativeCell -> IO ()
+countReentry cell = do
+  hot <- bumpNativeCount cell
+  when hot (jitRequestCell cell)
+{-# INLINE countReentry #-}
 
 -- The trampoline: runs compiled code for a combinator whose frame has
 -- been set up as `enter` sets it up, then acts on the status it returns.
@@ -995,6 +1013,7 @@ runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
             | code /= nullPtr, sp stk' == sp stk + n, fp stk' == fp stk ->
                 runNative yld env henv activeThreads stk' k' (castPtrToFunPtr code)
             | otherwise -> do
+                when (code == nullPtr) (countReentry cell)
                 when (JIT.trace JIT.config) $ JIT.jitDump ("  no re-entry: pushed " ++ show (sp stk' - sp stk) ++ ", expected " ++ show n ++ "; fp " ++ show (fp stk, fp stk') ++ ", code " ++ show code)
                 eval yld env henv activeThreads stk' k' cix rest
     -- The exit says which function to call again. It is the one that took
@@ -1066,7 +1085,7 @@ apply !yld env henv !activeThreads !stk !k !ck !args !val =
               native <- readNativeCode cell
               if native == nullPtr || "apply" `elem` JIT.disabled JIT.config
                 then do
-                  bumpNativeCount cell
+                  countInterpreted env cix cell
                   eval yld env henv activeThreads stk k cix entry
                 else do
                   when (JIT.trace JIT.config) $
@@ -1330,7 +1349,9 @@ yield !yld env henv0 !activeThreads !stk = leap
       -- The Let body may have native code (the re-entry point).
       native <- readNativeCode cell
       if native == nullPtr
-        then eval yld env henv0 activeThreads stk k cix nx
+        then do
+          countReentry cell
+          eval yld env henv0 activeThreads stk k cix nx
         else runNative yld env henv0 activeThreads stk k (castPtrToFunPtr native)
     leap (Local henv asz k) = do
       stk <- restoreFrame stk 0 asz

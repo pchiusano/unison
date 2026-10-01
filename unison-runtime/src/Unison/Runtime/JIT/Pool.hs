@@ -5,12 +5,17 @@
 --
 -- Indices are assigned when a module is compiled ('poolIndices') and are
 -- constants in the generated code. The array grows by copying; the old
--- arrays are kept, so an address read at entry stays valid for as long
--- as that native run lasts.
+-- arrays are kept, and new entries are written to them too where they
+-- fit, so an address read at entry stays valid for as long as that native
+-- run lasts. A run can still meet code that was installed after it began
+-- and uses an index past the end of the array the run holds: a function
+-- that uses an index of 'poolStableSize' or more checks the array's size
+-- at entry, and exits to be entered again with the current array.
 module Unison.Runtime.JIT.Pool
   ( PoolKey (..),
     poolIndices,
     currentPool,
+    poolStableSize,
     poolIndexCharTag,
     poolIndexFloatTag,
     poolIndexIntTag,
@@ -20,7 +25,8 @@ module Unison.Runtime.JIT.Pool
   )
 where
 
-import Control.Monad (forM)
+import Control.Monad (forM, forM_, when)
+import Data.Maybe (fromMaybe)
 import Data.IORef
 import Data.Map.Strict qualified as Map
 import Data.Primitive.Array (MutableArray, copyMutableArray, newArray, sizeofMutableArray, writeArray)
@@ -28,6 +34,7 @@ import GHC.Exts (RealWorld)
 import System.IO.Unsafe (unsafePerformIO)
 import Unison.Reference (Reference)
 import Unison.Runtime.ANF (PackedTag)
+import Unison.Runtime.JIT.Config (config, stressPool)
 import Unison.Runtime.MCode (CombIx, GCombInfo, MLit (..))
 import Unison.Runtime.Machine.Types (MComb)
 import Unison.Runtime.Stack (Closure, Val (..), charTypeTag, falseVal, floatTypeTag, intTypeTag, natTypeTag, nullSeg, trueVal, pattern Enum, pattern Foreign, pattern PAp)
@@ -47,6 +54,11 @@ poolIndexFalse = 5
 
 fixedEntries :: Int
 fixedEntries = 6
+
+-- | The size of the first array: every array ever passed to native code
+-- has at least this many entries.
+poolStableSize :: Int
+poolStableSize = max fixedEntries (fromMaybe 4096 (stressPool config))
 
 -- | What a pool entry is. Entries are interned by key.
 data PoolKey
@@ -92,7 +104,7 @@ pool :: IORef Pool
 pool = unsafePerformIO $ do
   -- Everything is forced before it goes in: native code reads these
   -- objects' fields directly, so they must be values, not thunks.
-  arr <- newArray 256 $! natTypeTag
+  arr <- newArray poolStableSize $! natTypeTag
   let put i c = writeArray arr i $! c
   put poolIndexCharTag charTypeTag
   put poolIndexFloatTag floatTypeTag
@@ -118,7 +130,10 @@ poolIndices keys = do
       Nothing -> do
         p <- grow p
         let i = poolNext p
-        writeArray (poolArray p) i $! closureFor k
+            !c = closureFor k
+        writeArray (poolArray p) i c
+        -- a native run that began before the array last grew holds an old one
+        forM_ (poolOld p) $ \old -> when (i < sizeofMutableArray old) (writeArray old i c)
         writeIORef pool p {poolNext = i + 1, poolKeys = Map.insert k i (poolKeys p)}
         pure (k, i)
   pure (Map.fromList ixs)

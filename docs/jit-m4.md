@@ -138,9 +138,9 @@ Written as the milestone went along; to be tidied when it is done.
   binding more `if`s, with a call-out in every arm) made the generator eat all memory, and
   benchmarks that print a duration never finished. Auxiliary functions are now memoized per
   (section, depth, frame base). That group still compiles to 208 auxiliary functions in 6 s,
-  because each `Let` body inside a binding exists twice (inline, and as a function). An option
-  recorded in the ideas document: end an inline binding with a tail call to the body function
-  instead of inlining the body.
+  because each `Let` body inside a binding exists twice (inline, and as a function), and every
+  re-entry function contains the rest of its function. M5 step 2 generates them on demand; the
+  ideas document keeps a fallback (end an inline binding with a tail call to the body function).
 - **Diagnostics added on the way:** `UNISON_JIT_DISABLE=app,apply,ref,array,cmp,callout` turns
   features off one by one (how the bug above was bisected); `UNISON_JIT_STATS_EVERY=N` prints
   the exit counts every N exits, for evaluations that never finish; the compile log now has a
@@ -159,5 +159,5 @@ Written as the milestone went along; to be tidied when it is done.
   in the pool now. Partial applications *with* captured arguments (`Name`) are still call-outs;
   that is M6's under-application work.
 - **Open questions.** Eager compilation of base costs seconds for pathological functions
-  (`Duration.toText`: 6 s); a size cap or the tail-call idea in the ideas document would bound
-  it. `App (Dyn i)` (ability handler calls) still exits once per call, see the ideas document.
+  (`Duration.toText`: 6 s). Planned fix: M5 step 2 generates re-entry functions only when they
+  are used ([jit-m5.md](jit-m5.md)). `App (Dyn i)` (ability handler calls) still exits once per call, see the ideas document.

@@ -15,7 +15,11 @@ module Unison.Runtime.JIT.Codegen
     CtxOffsets (..),
     RtsFacts (..),
     Function (..),
+    Deferred (..),
+    AuxKey,
+    AuxMemo,
     genFunction,
+    genDeferred,
     modulePrelude,
     pushCount,
   )
@@ -89,7 +93,41 @@ data Env = Env
     -- | cells for the auxiliary functions (re-entry points), taken in order
     envCells :: [Ptr NativeCell],
     -- | features turned off for debugging (see Config)
-    envDisabled :: [String]
+    envDisabled :: [String],
+    -- | leave the re-entry points that are only used when something exits
+    -- (bodies of Lets inside bindings, slow paths of instructions with a
+    -- native fast path) to be generated when they turn out to be used:
+    -- each gets a cell and a 'Deferred', but no code
+    envLazy :: Bool,
+    -- | the auxiliary functions already known for the function this one
+    -- belongs to, generated or deferred: a re-entry function generated
+    -- later reuses the cells its parent handed out
+    envKnown :: AuxMemo,
+    -- | the functions defined in the module being generated, by cell: a
+    -- call to one of them is a direct call to its symbol, which LLVM can
+    -- inline, instead of a call through the cell
+    envLocal :: Map.Map (Ptr NativeCell) String
+  }
+
+-- | What an auxiliary function is generated from: the section (without its
+-- combinator references, which have no Ord; their CombIx stays), the depth
+-- it starts at, and the frame base.
+type AuxKey = (GSection (), Int, Int)
+
+type AuxMemo = Map.Map AuxKey (String, Ptr NativeCell)
+
+-- | A re-entry function that was given a cell but not generated: all that
+-- 'genDeferred' needs to generate it later.
+data Deferred = Deferred
+  { dName :: String,
+    dCix :: CombIx,
+    -- | slots on the stack at entry
+    dLoaded :: Int,
+    dFrameSize :: Int,
+    -- | the frame base (see 'feBase')
+    dBase :: Int,
+    dBody :: MSection,
+    dCell :: Ptr NativeCell
   }
 
 data Function = Function
@@ -103,6 +141,10 @@ data Function = Function
     -- | the auxiliary functions defined alongside (re-entry points after
     -- call-outs, bodies of Lets inside bindings) and their cells
     fnAux :: [(String, Ptr NativeCell)],
+    -- | the re-entry functions given a cell but left for later
+    fnDeferred :: [Deferred],
+    -- | every auxiliary function known after this one was generated
+    fnMemo :: AuxMemo,
     -- | why parts of the function fell back to the interpreter
     fnNotes :: [String]
   }
@@ -153,7 +195,11 @@ data GS = GS
     -- with the nesting of bindings.
     -- The combinator references are dropped from the key (their CombIx
     -- stays), since they have no Ord.
-    gsAuxMemo :: Map.Map (GSection (), Int, Int) (String, Ptr NativeCell)
+    gsAuxMemo :: AuxMemo,
+    -- | highest pool index the function being generated uses
+    gsMaxPool :: !Int,
+    -- | re-entry functions left for later, reversed
+    gsDeferred :: [Deferred]
   }
 
 type Gen = State GS
@@ -182,7 +228,7 @@ startBlock label = modify' $ \s ->
 -- | Generates a block off to the side, then returns to the current one.
 sideBlock :: String -> Gen () -> Gen String
 sideBlock base body = do
-  label <- if base == "grow" then pure base else freshLabel base
+  label <- if base `elem` ["grow", "stale"] then pure base else freshLabel base
   sideBlockNamed label body
   pure label
 
@@ -426,8 +472,12 @@ stressFire env oLeft oEvery = do
   pure fire
 
 -- | Loads the callee's code pointer from its cell. Gives the pointer and
--- an i1 saying whether the callee must be treated as not compiled.
+-- an i1 saying whether the callee must be treated as not compiled. A
+-- callee defined in this module is named directly, and is always there
+-- (except under the callee stress mode, which keeps the cell path tested).
 loadCallee :: Env -> Ptr NativeCell -> Gen (String, String)
+loadCallee env cell
+  | not (envStressCallee env), Just name <- Map.lookup cell (envLocal env) = pure ("@" ++ name, "false")
 loadCallee env cell = do
   let WordPtr addr = ptrToWordPtr cell
   fnp <- fresh "fn"
@@ -478,23 +528,32 @@ exitResume fe d sect = do
 genFunction :: Env -> String -> CombIx -> Int -> Int -> MSection -> Ptr NativeCell -> Either String Function
 genFunction env name cix arity frameSize body cell
   | not (startsSupported body) = Left "body starts with something the JIT doesn't compile"
-  | otherwise =
-      let fe = FnEnv env name cix arity frameSize cell (Just "head") 0 "%tag.char" "%tag.float" "%tag.int" "%tag.nat" []
-          gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity IM.empty Nothing [] [] 0 (envCells env) [] Nothing Map.empty
-          (text, gs) = runState (genFunctionText fe body) gs0
-       in case gsFailed gs of
-            Just why -> Left why
-            Nothing ->
-              Right
-                ( Function
-                    name
-                    (unlines (text : reverse (gsAuxText gs)))
-                    (reverse (gsExits gs))
-                    (reverse (gsFrames gs))
-                    cell
-                    (reverse (gsAuxCells gs))
-                    (reverse (gsNotes gs))
-                )
+  | otherwise = runFunction env name cix arity frameSize cell (Just "head") 0 body
+
+-- | Generates a re-entry function that was left for later.
+genDeferred :: Env -> Deferred -> Either String Function
+genDeferred env d = runFunction env (dName d) (dCix d) (dLoaded d) (dFrameSize d) (dCell d) Nothing (dBase d) (dBody d)
+
+runFunction :: Env -> String -> CombIx -> Int -> Int -> Ptr NativeCell -> Maybe String -> Int -> MSection -> Either String Function
+runFunction env name cix arity frameSize cell headL base body =
+  let fe = FnEnv env name cix arity frameSize cell headL base "%tag.char" "%tag.float" "%tag.int" "%tag.nat" []
+      gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity IM.empty Nothing [] [] 0 (envCells env) [] Nothing (envKnown env) (-1) []
+      (text, gs) = runState (genFunctionText fe body) gs0
+   in case gsFailed gs of
+        Just why -> Left why
+        Nothing ->
+          Right
+            ( Function
+                name
+                (unlines (text : reverse (gsAuxText gs)))
+                (reverse (gsExits gs))
+                (reverse (gsFrames gs))
+                cell
+                (reverse (gsAuxCells gs))
+                (reverse (gsDeferred gs))
+                (gsAuxMemo gs)
+                (reverse (gsNotes gs))
+            )
 
 -- | The text of one LLVM function for @body@, generated in the current
 -- state (which must hold no blocks yet). Its exits and frames join the
@@ -509,7 +568,7 @@ genFunctionText fe body = do
   gs <- get
   let blocks = [b | b@(l, _) <- reverse (gsBlocks gs), l /= "unreachable"]
       maxK = max (gsMaxK gs) (arity + feFrameSize fe)
-      entry = entryBlock env arity (feBase fe) maxK
+      entry = entryBlock env arity (feBase fe) maxK (gsMaxPool gs)
       -- the grow exit, the first this function added, asks for what the
       -- entry check demanded
       fixGrow i e
@@ -527,17 +586,32 @@ genFunctionText fe body = do
 -- by the interpreter with its frame pointer at frame offset @base@. Gives
 -- its name and cell, or Nothing if it can't be compiled or there are no
 -- cells left. Its exits and frames join this module's tables.
-genAuxFunction :: FnEnv -> Int -> Int -> MSection -> Gen (Maybe (String, Ptr NativeCell))
-genAuxFunction fe loaded base body = do
+--
+-- When @later@ is set and the module is generated lazily, the function
+-- only gets its name and cell, and a 'Deferred' to generate it from when
+-- the interpreter has found the cell empty often enough.
+genAuxFunction :: Bool -> FnEnv -> Int -> Int -> MSection -> Gen (Maybe (String, Ptr NativeCell))
+genAuxFunction later fe loaded base body = do
   s <- get
   let key = (void body, loaded, base)
   case (Map.lookup key (gsAuxMemo s), gsCells s) of
     (Just known, _) -> pure (Just known)
     (_, []) -> pure Nothing
+    (_, cell : cells)
+      | later && envLazy (feEnv fe) -> do
+          let name = feName fe ++ "_r" ++ show (gsNAux s)
+          put
+            s
+              { gsCells = cells,
+                gsNAux = gsNAux s + 1,
+                gsDeferred = Deferred name (feCix fe) loaded (feFrameSize fe) base body cell : gsDeferred s,
+                gsAuxMemo = Map.insert key (name, cell) (gsAuxMemo s)
+              }
+          pure (Just (name, cell))
     (_, cell : cells) -> do
       let name = feName fe ++ "_r" ++ show (gsNAux s)
           fe' = fe {feName = name, feArity = loaded, feCell = cell, feHead = Nothing, feBase = base, feEnclosing = []}
-          gs0 = s {gsFresh = 0, gsBlocks = [], gsCur = ("head", []), gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing}
+          gs0 = s {gsFresh = 0, gsBlocks = [], gsCur = ("head", []), gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1}
           (text, gs) = runState (genFunctionText fe' body) gs0
       case gsFailed gs of
         Just why -> put s {gsNotes = (name ++ ": " ++ why) : gsNotes gs} >> pure Nothing
@@ -553,6 +627,7 @@ genAuxFunction fe loaded base body = do
                 gsAuxCells = (name, cell) : gsAuxCells gs,
                 gsNAux = gsNAux gs,
                 gsCells = gsCells gs,
+                gsDeferred = gsDeferred gs,
                 gsAuxMemo = Map.insert key (name, cell) (gsAuxMemo gs)
               }
           pure (Just (name, cell))
@@ -587,8 +662,8 @@ callOutWorthwhile i rest = case (pushCount i, rest) of
 -- stack check, then a branch to the loop head. @maxK@ is the highest
 -- frame offset the function touches, which is at least the frame size and
 -- covers the arguments of every call it makes.
-entryBlock :: Env -> Int -> Int -> Int -> [String]
-entryBlock env arity base maxK =
+entryBlock :: Env -> Int -> Int -> Int -> Int -> [String]
+entryBlock env arity base maxK maxPool =
   map ("  " ++) $
     -- %fp is the combinator's frame pointer, %fpb the interpreter's (the
     -- one passed in); they differ by the frame base
@@ -622,6 +697,19 @@ entryBlock env arity base maxK =
            "%maxsp.new = select i1 %maxsp.gt, i64 %fpk" ++ show maxK ++ ", i64 %maxsp.old",
            "store i64 %maxsp.new, ptr %maxsp.a"
          ]
+      -- A constant past the pool's first array may not be in the array this
+      -- run was entered with, if this function was installed after the run
+      -- began (see Pool). Then exit, to be entered again with the current one.
+      ++ ( if maxPool < poolStableSize
+             then []
+             else
+               [ "%pool.n.a = getelementptr i64, ptr %pool, i64 " ++ show (rPtrsCount (envRts env) - rPtrsHeader (envRts env)),
+                 "%pool.n = load i64, ptr %pool.n.a",
+                 "%pool.ok = icmp ugt i64 %pool.n, " ++ show maxPool,
+                 "br i1 %pool.ok, label %entry.room, label %stale",
+                 "entry.room:"
+               ]
+         )
       -- the interpreter's check: sp + size + 1 < stack size, else grow
       ++ [ "%need = add i64 %sp, " ++ show (maxK - arity + 1),
            "%room = icmp slt i64 %need, %stack.size",
@@ -643,6 +731,8 @@ genHead fe body = do
   -- the entry block's stack check branches to %grow when the frame doesn't
   -- fit; the size asked for is fixed up in genFunction once it is known
   _ <- exitBlockNamed "grow" fe d (GrowStack (feFrameSize fe) (feCell fe))
+  -- likewise for the entry block's check of the constant pool
+  _ <- exitBlockNamed "stale" fe d (Named "stale constant pool" (Reenter (feCell fe)))
   -- poll
   -- The load is volatile: another thread sets HpLim, and without volatile
   -- LLVM would hoist the load out of the loop and the poll would never fire.
@@ -770,7 +860,7 @@ genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCom
       | cell /= noNativeCell = pure cell
       | otherwise = case EC.lookup w (envCombs env) of
           Just (Comb (LamI bodyArity _ _ _)) ->
-            maybe noNativeCell snd <$> genAuxFunction fe bodyArity (currentBase fe) body
+            maybe noNativeCell snd <$> genAuxFunction True fe bodyArity (currentBase fe) body
           _ -> pure noNativeCell
 
 -- | Loads @m@ results left on the stack above offset @base@ into their slots.
@@ -1487,17 +1577,19 @@ genInstr fe d instr sect k = case instr of
 -- interpreter then takes the whole section.
 genCallOut :: FnEnv -> Int -> GInstr (RComb Val) -> MSection -> Gen ()
 genCallOut fe d instr sect = do
-  l <- callOutExit fe d instr sect
+  l <- callOutExit False fe d instr sect
   emit ("br label %" ++ l)
 
 -- | The exit block for leaving an instruction to the interpreter: a
 -- call-out when one is possible, else a resume at the section. Also the
--- slow path of instructions with a native fast path.
-callOutExit :: FnEnv -> Int -> GInstr (RComb Val) -> MSection -> Gen String
-callOutExit fe d instr sect = case (pushCount instr, sect) of
+-- slow path of instructions with a native fast path (@slowPath@): the
+-- code after a slow path is only needed when the fast path misses, so its
+-- re-entry function can be left for later.
+callOutExit :: Bool -> FnEnv -> Int -> GInstr (RComb Val) -> MSection -> Gen String
+callOutExit slowPath fe d instr sect = case (pushCount instr, sect) of
   (Just n, Ins _ rest)
     | enabled fe "callout", callOutWorthwhile instr rest ->
-        genAuxFunction fe (d + n) (currentBase fe) rest >>= \case
+        genAuxFunction slowPath fe (d + n) (currentBase fe) rest >>= \case
           Nothing -> resume
           Just (_, cell) -> exitBlock fe d (CallOut (feCix fe) instr rest n cell)
   _ -> resume
@@ -1573,6 +1665,7 @@ genPack fe d refIx (PackedTag t) fields = do
   -- the fields, before the allocation call so nothing is held across it
   vals <- forM fields $ \k -> (,) <$> loadU k <*> loadB k
   -- the Reference: first field of the pool's Enum for this type
+  usePool refIx
   ea <- fresh "enum.a"
   emit (ea ++ " = getelementptr ptr, ptr %pool, i64 " ++ show refIx)
   ep <- fresh "enum"
@@ -1725,7 +1818,7 @@ refFields fe k slow = do
 -- | @Ref.read@: the Val's fields go to the result slot.
 genRefRead :: FnEnv -> Int -> Int -> GInstr (RComb Val) -> MSection -> Gen ()
 genRefRead fe d k instr sect = do
-  slow <- callOutExit fe d instr sect
+  slow <- callOutExit True fe d instr sect
   (_, u, b) <- refFields fe k slow
   storeU (d + 1) u
   storeB (d + 1) b
@@ -1738,7 +1831,7 @@ genRefWrite fe d k kv unitIx instr sect = do
       ls = envLayouts env
       layout = lVal ls
       words = 1 + lPtrs layout + lNptrs layout
-  slow <- callOutExit fe d instr sect
+  slow <- callOutExit True fe d instr sect
   -- the value, before anything else: the allocation call is a GC-safe
   -- point only for what is on the Unison stack, not for registers
   u <- loadU kv
@@ -1779,7 +1872,7 @@ genRefWrite fe d k kv unitIx instr sect = do
 -- an Int against a Nat, is left to the interpreter through the call-out.
 genUniversal :: FnEnv -> Int -> Prim2 -> Int -> Int -> GInstr (RComb Val) -> MSection -> Gen ()
 genUniversal fe d op ki kj instr sect = do
-  slow <- callOutExit fe d instr sect
+  slow <- callOutExit True fe d instr sect
   bi <- loadB ki
   bj <- loadB kj
   ui <- loadU ki
@@ -1926,7 +2019,7 @@ genArrayOp :: FnEnv -> Int -> Int -> Maybe Int -> Maybe (Int, Int) -> GInstr (RC
 genArrayOp fe d ka mki mwrite instr sect = do
   let ls = envLayouts (feEnv fe)
       rts = envRts (feEnv fe)
-  slow <- callOutExit fe d instr sect
+  slow <- callOutExit True fe d instr sect
   -- a value to write is boxed up front, before anything is loaded from the heap
   newVal <- traverse (allocVal fe . fst) mwrite
   p <- loadB ka
@@ -1972,9 +2065,14 @@ genArrayOp fe d ka mki mwrite instr sect = do
           storeU (d + 1) u
           storeB (d + 1) b
 
+-- | Records that the function uses this pool index.
+usePool :: Int -> Gen ()
+usePool ix = modify' (\s -> s {gsMaxPool = max (gsMaxPool s) ix})
+
 -- | Pushes a pool entry as a boxed value.
 poolConstant :: FnEnv -> Int -> Int -> Gen ()
 poolConstant _fe d ix = do
+  usePool ix
   a <- fresh "pool.a"
   emit (a ++ " = getelementptr ptr, ptr %pool, i64 " ++ show ix)
   v <- fresh "const"

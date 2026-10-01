@@ -85,6 +85,21 @@ refLoop n =
       go (i + 1)
   go 0
 
+-- A hot loop that calls small functions from other definitions: what
+-- batching and direct calls are for.
+collatzStep : Nat -> Nat
+collatzStep n = if Nat.mod n 2 == 0 then n / 2 else 3 * n + 1
+
+collatzSteps : Nat -> Nat
+collatzSteps n =
+  go steps x = if x == 1 then steps else go (steps + 1) (collatzStep x)
+  go 0 n
+
+collatzTotal : Nat -> Nat
+collatzTotal n =
+  go acc i = if i > n then acc else go (acc + collatzSteps i) (i + 1)
+  go 0 1
+
 jitSuite : '{IO, Exception} ()
 jitSuite = do
   printTime "Sum 0 to 1 million" 1 (n -> repeat n do sumTo 1000000)
@@ -101,6 +116,7 @@ jitSuite = do
     n -> repeat n do Tree.lookupAll 1000 t
   printTime "Apply a function argument 10000 times" 1 (n -> repeat n do applyN 10000 (x -> x + 3) 0)
   printTime "Mutate a Ref 10000 times" 1 (n -> repeat n do refLoop 10000)
+  printTime "Calls across definitions: Collatz steps for 1 to 1000" 1 (n -> repeat n do collatzTotal 1000)
 ```
 
 ``` ucm
