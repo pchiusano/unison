@@ -590,11 +590,15 @@ are listed per step; the full table comes at step 8.
   (3) With the JIT on, `Map.fromList` reads 1.13× the interpreter (1.09× in a second run;
   it was 1.07×). It is interpreted in both modes, and its only exits are the benchmark
   harness calling it (`repeat`'s call to its argument), the shape step 8 found to differ by
-  7 to 15% between runs for no reason found. (4) **`Remote.Ref` with the JIT on got worse
-  and erratic: 34.3 ms, then 61.9 ms in a second run, against 26 to 27 ms before** and
-  19.6 ms interpreted. It is a single run of 20 ms early in the suite that takes 20 exits,
-  so the time is going to something concurrent with it (the compile thread, or a major GC
-  it provokes), not to exits. Not investigated yet; first thing to look at next.
+  7 to 15% between runs for no reason found. (4) `Remote.Ref` with the JIT on read 34.3 ms, then 61.9 ms and 28.4 ms in two more
+  runs, against 26 to 27 ms before and 19.6 ms interpreted. It is a single run of 20 ms
+  early in the suite, and what varies is whether a major GC lands inside it: with
+  `+RTS -S`, the 28 ms run has none in its window, and a major GC at that point (about
+  90 MB live, the loaded codebase) takes 28 ms. Run by itself (`run localCloud`) it reads
+  35 to 65 ms with the JIT on, because then the JIT's own startup (LLVM, the layout
+  checks) and the major GC that startup's allocation brings forward both fall inside it;
+  native lists on or off makes no difference. So this entry measures where collections
+  fall, not the code, and is no use as a one-shot timing.
 
   `jitSuite` (`off`, then `on`): 66.9 ms / 320 µs, 1.39 ms / 41.2 µs, 86.7 µs / 17.2 µs,
   87.3 µs / 4.87 µs, 1.70 ms / 224 µs, 786 µs / 62.4 µs, 1.17 ms / 48.6 µs, 849 µs / 51.2 µs,
