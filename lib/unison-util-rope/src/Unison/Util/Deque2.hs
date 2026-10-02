@@ -11,10 +11,15 @@
 --
 -- The shape is Hinze and Paterson's: a prefix digit, a middle that is a
 -- sequence of nodes, a suffix digit.  The differences are that the middle is
--- strict, digits are short lists of up to 'maxD' items that may be empty, and
--- nodes are mostly eight wide.  There are no other invariants: a digit that
--- fills up sheds a node of eight into the middle, and an operation that needs
--- an item from an empty digit takes a node out of the middle.
+-- strict, digits hold up to 'maxD' items and may be empty, and nodes are
+-- mostly eight wide.  There are no other invariants: a digit that fills up
+-- sheds a node of eight into the middle, and an operation that needs an item
+-- from an empty digit takes a node out of the middle.
+--
+-- Digits are short lists, so that adding or removing an item at an end
+-- allocates one cell or none.  A node's children are in an array (or, for the
+-- nodes of eight leaves, in the node itself): a node is built once and then
+-- only read.
 module Unison.Util.Deque2
   ( -- * The type
     Deque
@@ -44,109 +49,19 @@ import Control.DeepSeq (NFData (..))
 import Control.Monad (unless, when)
 import Data.Bits (unsafeShiftL, unsafeShiftR, (.&.), (.|.))
 import Data.Functor.Classes (Eq1 (..), Ord1 (..), Show1 (..))
-import GHC.Exts (Int (I#), Int#)
+import GHC.Exts
+  ( Int (I#), Int#, RealWorld, SmallArray#, SmallMutableArray#, State#
+  , cloneSmallArray#, indexSmallArray#, newSmallArray#, runRW#
+  , sizeofSmallArray#, unsafeFreezeSmallArray#, writeSmallArray#
+  )
 import qualified Data.Foldable as F
 import qualified Data.List as L
 import qualified GHC.Exts as Exts
 
 ------------------------------------------------------------------------
--- Strict lists (digits) and nodes
+-- Strict lists: the digits
 
 data SList a = SNil | SCons !a !(SList a)
-
--- A node's first field is the number of leaves under it.  Digits that fill
--- up make nodes of eight; 'append' makes the smaller ones.
-data Node a
-  = N8 !Int !a !a !a !a !a !a !a !a
-  | N7 !Int !a !a !a !a !a !a !a
-  | N6 !Int !a !a !a !a !a !a
-  | N5 !Int !a !a !a !a !a
-  | N4 !Int !a !a !a !a
-  | N3 !Int !a !a !a
-  | N2 !Int !a !a
-
-nodeSize :: Node a -> Int
-nodeSize (N8 n _ _ _ _ _ _ _ _) = n
-nodeSize (N7 n _ _ _ _ _ _ _) = n
-nodeSize (N6 n _ _ _ _ _ _) = n
-nodeSize (N5 n _ _ _ _ _) = n
-nodeSize (N4 n _ _ _ _) = n
-nodeSize (N3 n _ _ _) = n
-nodeSize (N2 n _ _) = n
-{-# INLINE nodeSize #-}
-
-nodeArity :: Node a -> Int
-nodeArity (N8 {}) = 8
-nodeArity (N7 {}) = 7
-nodeArity (N6 {}) = 6
-nodeArity (N5 {}) = 5
-nodeArity (N4 {}) = 4
-nodeArity (N3 {}) = 3
-nodeArity (N2 {}) = 2
-{-# INLINE nodeArity #-}
-
--- a node's children in sequence order, and in reverse
-nodeToFwd, nodeToBwd :: Node a -> SList a
-nodeToFwd (N8 _ a b c d e f g h) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h SNil)))))))
-nodeToFwd (N7 _ a b c d e f g) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g SNil))))))
-nodeToFwd (N6 _ a b c d e f) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f SNil)))))
-nodeToFwd (N5 _ a b c d e) = SCons a (SCons b (SCons c (SCons d (SCons e SNil))))
-nodeToFwd (N4 _ a b c d) = SCons a (SCons b (SCons c (SCons d SNil)))
-nodeToFwd (N3 _ a b c) = SCons a (SCons b (SCons c SNil))
-nodeToFwd (N2 _ a b) = SCons a (SCons b SNil)
-nodeToBwd (N8 _ a b c d e f g h) = SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil)))))))
-nodeToBwd (N7 _ a b c d e f g) = SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil))))))
-nodeToBwd (N6 _ a b c d e f) = SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil)))))
-nodeToBwd (N5 _ a b c d e) = SCons e (SCons d (SCons c (SCons b (SCons a SNil))))
-nodeToBwd (N4 _ a b c d) = SCons d (SCons c (SCons b (SCons a SNil)))
-nodeToBwd (N3 _ a b c) = SCons c (SCons b (SCons a SNil))
-nodeToBwd (N2 _ a b) = SCons b (SCons a SNil)
-
--- the k-th child (0-based)
-nodeAt :: Int -> Node a -> a
-nodeAt k (N8 _ a b c d e f g h) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; 6 -> g; _ -> h }
-nodeAt k (N7 _ a b c d e f g) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; _ -> g }
-nodeAt k (N6 _ a b c d e f) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; _ -> f }
-nodeAt k (N5 _ a b c d e) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; _ -> e }
-nodeAt k (N4 _ a b c d) = case k of { 0 -> a; 1 -> b; 2 -> c; _ -> d }
-nodeAt k (N3 _ a b c) = case k of { 0 -> a; 1 -> b; _ -> c }
-nodeAt k (N2 _ a b) = case k of { 0 -> a; _ -> b }
-
--- a node of the first k items of a list, and the rest of the list; the
--- items are leaves
-leafNode :: Int -> SList a -> (# Node a, SList a #)
-leafNode 8 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) = (# N8 8 a b c d e f g h, r #)
-leafNode 7 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g r))))))) = (# N7 7 a b c d e f g, r #)
-leafNode 6 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f r)))))) = (# N6 6 a b c d e f, r #)
-leafNode 5 (SCons a (SCons b (SCons c (SCons d (SCons e r))))) = (# N5 5 a b c d e, r #)
-leafNode 4 (SCons a (SCons b (SCons c (SCons d r)))) = (# N4 4 a b c d, r #)
-leafNode 3 (SCons a (SCons b (SCons c r))) = (# N3 3 a b c, r #)
-leafNode 2 (SCons a (SCons b r)) = (# N2 2 a b, r #)
-leafNode _ _ = error "Deque2: short list"
-
--- the same where the items are nodes
-innerNode :: Int -> SList (Node a) -> (# Node (Node a), SList (Node a) #)
-innerNode 8 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) = (# N8 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h) a b c d e f g h, r #)
-innerNode 7 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g r))))))) = (# N7 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g) a b c d e f g, r #)
-innerNode 6 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f r)))))) = (# N6 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f) a b c d e f, r #)
-innerNode 5 (SCons a (SCons b (SCons c (SCons d (SCons e r))))) = (# N5 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e) a b c d e, r #)
-innerNode 4 (SCons a (SCons b (SCons c (SCons d r)))) = (# N4 (nodeSize a + nodeSize b + nodeSize c + nodeSize d) a b c d, r #)
-innerNode 3 (SCons a (SCons b (SCons c r))) = (# N3 (nodeSize a + nodeSize b + nodeSize c) a b c, r #)
-innerNode 2 (SCons a (SCons b r)) = (# N2 (nodeSize a + nodeSize b) a b, r #)
-innerNode _ _ = error "Deque2: short list"
-
--- the first k children, back to front
-nodeTakeRev :: Int -> Node a -> SList a
-nodeTakeRev k nd = go 0 SNil
-  where go !i acc | i == k    = acc
-                  | otherwise = go (i + 1) (SCons (nodeAt i nd) acc)
-
--- all but the first k children, front to back
-nodeDropFwd :: Int -> Node a -> SList a
-nodeDropFwd k nd = go k
-  where !n = nodeArity nd
-        go !i | i >= n    = SNil
-              | otherwise = SCons (nodeAt i nd) (go (i + 1))
 
 takeS :: Int -> SList a -> SList a
 takeS 0 _            = SNil
@@ -179,15 +94,153 @@ nthS k (SCons x r) | k == 0    = x
                    | otherwise = nthS (k - 1) r
 nthS _ SNil = error "Deque2: index past the end of a digit"
 
+listS :: SList a -> [a]
+listS SNil = []
+listS (SCons x r) = x : listS r
+
+------------------------------------------------------------------------
+-- Arrays: the children of most nodes.  Every element is evaluated before
+-- it is stored.  They are filled with single writes, which compile to a
+-- store each; the bulk copy operations are calls into the runtime that cost
+-- more than they save at these sizes.
+
+data Arr a = Arr (SmallArray# a)
+
+lenA :: Arr a -> Int
+lenA (Arr a) = I# (sizeofSmallArray# a)
+{-# INLINE lenA #-}
+
+ixA :: Arr a -> Int -> a
+ixA (Arr a) (I# i) = case indexSmallArray# a i of (# x #) -> x
+{-# INLINE ixA #-}
+
+hole :: a
+hole = error "Deque2: an array element that was never written"
+{-# NOINLINE hole #-}
+
+-- an array of n elements, all x to begin with, then filled in
+newA :: Int -> a -> (SmallMutableArray# RealWorld a -> State# RealWorld -> State# RealWorld) -> Arr a
+newA (I# n) x fill = runRW# (\s -> case newSmallArray# n x s of
+  (# s1, m #) -> case unsafeFreezeSmallArray# m (fill m s1) of
+    (# _, a #) -> Arr a)
+{-# INLINE newA #-}
+
+arr8 :: a -> a -> a -> a -> a -> a -> a -> a -> Arr a
+arr8 !a !b !c !d !e !f !g !h = newA 8 a (\m s ->
+  writeSmallArray# m 7# h (writeSmallArray# m 6# g (writeSmallArray# m 5# f (writeSmallArray# m 4# e
+    (writeSmallArray# m 3# d (writeSmallArray# m 2# c (writeSmallArray# m 1# b s)))))))
+
+-- n elements starting at off; n is not 0
+sliceA :: Arr a -> Int -> Int -> Arr a
+sliceA (Arr a) (I# off) (I# n) = Arr (cloneSmallArray# a off n)
+
+-- items of a list go into slots i, i + 1, ...
+writeUp :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
+writeUp m (I# i#) (SCons x r) s = writeUp m (I# i# + 1) r (writeSmallArray# m i# x s)
+writeUp _ _ SNil s = s
+
+-- items of a list go into slots i, i - 1, ...
+writeDown :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
+writeDown m (I# i#) (SCons x r) s = writeDown m (I# i# - 1) r (writeSmallArray# m i# x s)
+writeDown _ _ SNil s = s
+
+-- the first n items of a list that has at least n; n is not 0
+fromSListA :: Int -> SList a -> Arr a
+fromSListA n l = newA n hole (\m s -> go m 0 l s)
+  where
+    go :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
+    go m i@(I# i#) (SCons x r) s | i < n = go m (i + 1) r (writeSmallArray# m i# x s)
+    go _ _ _ s = s
+
+-- A list that runs back to front, then two that run front to back, as one
+-- array of c items: c is the three lengths added up, and the first list has
+-- nb items.
+gather :: Int -> Int -> SList a -> SList a -> SList a -> Arr a
+gather c nb back mid front = newA c hole (\m s -> writeUp m (nb + lenS mid) front (writeUp m nb mid (writeDown m (nb - 1) back s)))
+
+mapA :: (a -> b) -> Arr a -> Arr b
+mapA f a = newA n hole (\m s -> go m 0 s)
+  where
+    !n = lenA a
+    go m i@(I# i#) s
+      | i >= n    = s
+      | otherwise = case f (ixA a i) of !x -> go m (i + 1) (writeSmallArray# m i# x s)
+{-# INLINE mapA #-}
+
+foldrA :: (a -> r -> r) -> r -> Arr a -> r
+foldrA f z a = go 0
+  where !n = lenA a
+        go i | i >= n    = z
+             | otherwise = f (ixA a i) (go (i + 1))
+
+foldlA :: (r -> a -> r) -> r -> Arr a -> r
+foldlA f z0 a = go 0 z0
+  where !n = lenA a
+        go !i !z | i >= n    = z
+                 | otherwise = go (i + 1) (f z (ixA a i))
+
+------------------------------------------------------------------------
+-- Nodes.  A node made by a top-level digit that filled up has eight leaves.
+-- Every other node has two to eight children in an array, and the number of
+-- leaves under it: the nodes below the first level of nodes, and the nodes
+-- that 'append' makes.
+
+data Node a
+  = N8 !a !a !a !a !a !a !a !a
+  | NA !Int !(Arr a)
+
+nodeSize :: Node a -> Int
+nodeSize (N8 {}) = 8
+nodeSize (NA n _) = n
+{-# INLINE nodeSize #-}
+
+nodeArity :: Node a -> Int
+nodeArity (N8 {}) = 8
+nodeArity (NA _ a) = lenA a
+{-# INLINE nodeArity #-}
+
+-- the k-th child (0-based)
+nodeAt :: Int -> Node a -> a
+nodeAt k (N8 a b c d e f g h) = case k of
+  0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; 6 -> g; _ -> h
+nodeAt k (NA _ a) = ixA a k
+
+-- the first k children, back to front
+nodeTakeRev :: Int -> Node a -> SList a
+nodeTakeRev k nd = go 0 SNil
+  where go !i acc | i == k    = acc
+                  | otherwise = go (i + 1) (SCons (nodeAt i nd) acc)
+
+-- all but the first k children, front to back
+nodeDropFwd :: Int -> Node a -> SList a
+nodeDropFwd k nd = go k
+  where !n = nodeArity nd
+        go !i | i >= n    = SNil
+              | otherwise = SCons (nodeAt i nd) (go (i + 1))
+
+sumA :: Arr (Node a) -> Int
+sumA a = go 0 0
+  where !n = lenA a
+        go !i !s | i >= n    = s
+                 | otherwise = go (i + 1) (s + nodeSize (ixA a i))
+
 sumS :: SList (Node a) -> Int
 sumS = go 0 where go !n SNil = n
                   go !n (SCons x r) = go (n + nodeSize x) r
 
+-- the index of the node holding leaf number i, and the leaves before it
+scanA :: Int -> Arr (Node a) -> (# Int#, Int# #)
+scanA i a = go 0 0
+  where go !q !sb = let !s = nodeSize (ixA a q)
+                    in if i < sb + s then (case q of I# q# -> case sb of I# sb# -> (# q#, sb# #))
+                       else go (q + 1) (sb + s)
+{-# INLINE scanA #-}
+
 ------------------------------------------------------------------------
 -- The tree.
 --
--- A prefix runs front to back and a suffix back to front, so the item at the
--- outer end of either is the head of its list.
+-- A prefix runs front to back and a suffix back to front, so the item at
+-- the outer end of either is the head of its list.
 --
 -- The first field of 'Deep' and 'MDeep' packs three numbers: the number of
 -- leaves in the tree (bits 8 and up), the number of items in the suffix (bits
@@ -196,8 +249,7 @@ sumS = go 0 where go !n SNil = n
 -- without reading it.
 --
 -- 'Mid' is the same thing as 'Deque' one level down, where the items are
--- nodes.  Having two types costs nothing, since every function needs a
--- version for leaves (which all have size one) and a version for nodes.
+-- nodes.
 
 data Deque a
   = Nil
@@ -260,36 +312,36 @@ snoc (Deep t pr m sf) x
 -- A full prefix keeps its two outermost items and sheds the other eight.
 consFull :: a -> Int -> SList a -> Mid a -> SList a -> Deque a
 consFull x !t (SCons p1 (SCons p2 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h _)))))))))) m sf
-  = Deep (t + 0x100 - 7) (SCons x (SCons p1 (SCons p2 SNil))) (consM (N8 8 a b c d e f g h) m) sf
+  = Deep (t + 0x100 - 7) (SCons x (SCons p1 (SCons p2 SNil))) (consM (N8 a b c d e f g h) m) sf
 consFull _ _ _ _ _ = error "Deque2.cons: short prefix"
 {-# NOINLINE consFull #-}
 
 snocFull :: a -> Int -> SList a -> Mid a -> SList a -> Deque a
 snocFull x !t pr m (SCons s1 (SCons s2 (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a _))))))))))
-  = Deep (t + 0x100 - 0x70) pr (snocM m (N8 8 a b c d e f g h)) (SCons x (SCons s1 (SCons s2 SNil)))
+  = Deep (t + 0x100 - 0x70) pr (snocM m (N8 a b c d e f g h)) (SCons x (SCons s1 (SCons s2 SNil)))
 snocFull _ _ _ _ _ = error "Deque2.snoc: short suffix"
 {-# NOINLINE snocFull #-}
 
 consM :: Node a -> Mid a -> Mid a
-consM n MNil = let !s = nodeSize n in MDeep (mk s 1 0) s (SCons n SNil) MNil SNil
+consM !n MNil = let !s = nodeSize n in MDeep (mk s 1 0) s (SCons n SNil) MNil SNil
 consM n (MDeep t ps pr m sf)
   | t .&. 15 < maxD = MDeep (t + (s `unsafeShiftL` 8) + 1) (ps + s) (SCons n pr) m sf
   | otherwise = case pr of
       SCons p1 (SCons p2 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h _))))))))) ->
-        let !sn = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-        in MDeep (t + (s `unsafeShiftL` 8) - 7) (ps + s - sn) (SCons n (SCons p1 (SCons p2 SNil)))
-                 (consM (N8 sn a b c d e f g h) m) sf
+        let !keep = nodeSize p1 + nodeSize p2
+        in MDeep (t + (s `unsafeShiftL` 8) - 7) (s + keep) (SCons n (SCons p1 (SCons p2 SNil)))
+                 (consM (NA (ps - keep) (arr8 a b c d e f g h)) m) sf
       _ -> error "Deque2.consM: short prefix"
   where !s = nodeSize n
 
 snocM :: Mid a -> Node a -> Mid a
-snocM MNil n = MDeep (mk (nodeSize n) 0 1) 0 SNil MNil (SCons n SNil)
+snocM MNil !n = MDeep (mk (nodeSize n) 0 1) 0 SNil MNil (SCons n SNil)
 snocM (MDeep t ps pr m sf) n
   | t .&. 0xF0 < maxD * 16 = MDeep (t + (s `unsafeShiftL` 8) + 0x10) ps pr m (SCons n sf)
   | otherwise = case sf of
       SCons s1 (SCons s2 (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a _))))))))) ->
-        let !sn = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-        in MDeep (t + (s `unsafeShiftL` 8) - 0x70) ps pr (snocM m (N8 sn a b c d e f g h))
+        let !shed = tsize t - ps - sizeM m - nodeSize s1 - nodeSize s2
+        in MDeep (t + (s `unsafeShiftL` 8) - 0x70) ps pr (snocM m (NA shed (arr8 a b c d e f g h)))
                  (SCons n (SCons s1 (SCons s2 SNil)))
       _ -> error "Deque2.snocM: short suffix"
   where !s = nodeSize n
@@ -329,7 +381,7 @@ unconsSlow !t MNil sf
   where !sc = tsc t
 unconsSlow t m sf = case unconsM m of
   (# nd, m' #) -> case nd of
-    N8 _ a b c d e f g h ->
+    N8 a b c d e f g h ->
       Just (a, Deep (t - 0x100 + 7) (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h SNil))))))) m' sf)
     _ -> Just (nodeAt 0 nd, Deep (t - 0x100 + (nodeArity nd - 1)) (nodeDropFwd 1 nd) m' sf)
 {-# NOINLINE unconsSlow #-}
@@ -348,7 +400,7 @@ unsnocSlow !t pr MNil
   where !pc = tpc t
 unsnocSlow t pr m = case unsnocM m of
   (# m', nd #) -> case nd of
-    N8 _ a b c d e f g h ->
+    N8 a b c d e f g h ->
       Just (Deep (t - 0x100 + 0x70) pr m' (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil))))))), h)
     _ -> let !k = nodeArity nd - 1
          in Just (Deep (t - 0x100 + (k `unsafeShiftL` 4)) pr m' (nodeTakeRev k nd), nodeAt k nd)
@@ -373,11 +425,10 @@ unconsM (MDeep t ps pr m sf) = case pr of
              | otherwise -> (# n, MDeep (mk (tsize t - nodeSize n) p q) (sumS pr') pr' MNil (takeS q sf) #)
            SNil -> error "Deque2.unconsM: empty"
     _ -> case unconsM m of
-      (# nn, m' #) -> case nodeToFwd nn of
-        SCons n pr' ->
-          let !s = nodeSize n
-          in (# n, MDeep (t - (s `unsafeShiftL` 8) + (nodeArity nn - 1)) (nodeSize nn - s) pr' m' sf #)
-        SNil -> error "Deque2.unconsM: empty node"
+      (# nn, m' #) ->
+        let !n = nodeAt 0 nn
+            !s = nodeSize n
+        in (# n, MDeep (t - (s `unsafeShiftL` 8) + (nodeArity nn - 1)) (nodeSize nn - s) (nodeDropFwd 1 nn) m' sf #)
 
 unsnocM :: Mid a -> (# Mid a, Node a #)
 unsnocM MNil = error "Deque2.unsnocM: empty"
@@ -398,10 +449,10 @@ unsnocM (MDeep t ps pr m sf) = case sf of
                  in (# MDeep (mk (tsize t - nodeSize n) p q) (sumS pr') pr' MNil sf', n #)
            SNil -> error "Deque2.unsnocM: empty"
     _ -> case unsnocM m of
-      (# m', nn #) -> case nodeToBwd nn of
-        SCons n sf' ->
-          (# MDeep (t - (nodeSize n `unsafeShiftL` 8) + ((nodeArity nn - 1) `unsafeShiftL` 4)) ps pr m' sf', n #)
-        SNil -> error "Deque2.unsnocM: empty node"
+      (# m', nn #) ->
+        let !k = nodeArity nn - 1
+            !n = nodeAt k nn
+        in (# MDeep (t - (nodeSize n `unsafeShiftL` 8) + (k `unsafeShiftL` 4)) ps pr m' (nodeTakeRev k nn), n #)
 
 ------------------------------------------------------------------------
 -- Lookup.  Results flow upward in unboxed tuples: a level hands back the
@@ -425,7 +476,15 @@ lookM :: Int -> Int -> Mid a -> (# Node a, Int# #)
 lookM !_ !_ MNil = error "Deque2.lookup: empty middle"
 lookM sh i (MDeep t ps pr m sf)
   | i < ps    = scanFwd i pr
-  | i' < ms   = case lookM (sh + 3) i' m of (# nn, off# #) -> childAt (sh + 3) (I# off#) nn
+  | i' < ms   = case lookM (sh + 3) i' m of
+      (# nn, off# #) -> case nn of
+        NA s kids
+          | s == 8 `unsafeShiftL` (sh + 3), lenA kids == 8 ->
+              case I# off# .&. ((1 `unsafeShiftL` (sh + 3)) - 1) of
+                I# o# -> (# ixA kids (I# off# `unsafeShiftR` (sh + 3)), o# #)
+          | otherwise -> case scanA (I# off#) kids of
+              (# q#, sb# #) -> case I# off# - I# sb# of I# o# -> (# ixA kids (I# q#), o# #)
+        N8 {} -> error "Deque2.lookup: a node of leaves below the first level"
   | otherwise = scanBwd (tsize t - 1 - i) sf
   where !i' = i - ps
         !ms = sizeM m
@@ -445,16 +504,11 @@ scanBwd !r (SCons n rest)
   where !s = nodeSize n
 scanBwd _ SNil = error "Deque2.lookup: past the end of a suffix"
 
--- the child holding leaf number off; a full child has 2^sh leaves
-childAt :: Int -> Int -> Node (Node a) -> (# Node a, Int# #)
-childAt !sh !off nn
-  | nodeSize nn == 8 `unsafeShiftL` sh =
-      case off .&. ((1 `unsafeShiftL` sh) - 1) of
-        I# o# -> (# nodeAt (off `unsafeShiftR` sh) nn, o# #)
-  | otherwise = go 0 off
-  where go !i !o = let !c = nodeAt i nn
-                       !s = nodeSize c
-                   in if o < s then (case o of I# o# -> (# c, o# #)) else go (i + 1) (o - s)
+-- the index of the child holding leaf number i, and the leaves before it
+scanKids :: Int -> Node (Node a) -> (# Int#, Int# #)
+scanKids i (NA _ kids) = scanA i kids
+scanKids _ (N8 {}) = error "Deque2: a node of leaves below the first level"
+{-# INLINE scanKids #-}
 
 ------------------------------------------------------------------------
 -- take and drop.  The cut falls in a prefix, in a suffix, or in the middle;
@@ -501,7 +555,16 @@ takeM !_ MNil = error "Deque2.take: empty middle"
 takeM j (MDeep t ps pr m sf)
   | j <= ps = goP 0 0 pr
   | j <= ps + ms = case takeM (j - ps) m of
-      (# m', nn, k# #) -> goC m' (I# k#) 0 0 SNil (nodeToFwd nn)
+      (# m', nn, k# #) -> case scanKids (I# k# - 1) nn of
+        -- the children of the node the level below cut in: those before the
+        -- one holding the cut make the new suffix
+        (# q#, sb# #) ->
+          let !q = I# q#
+              !sb = I# sb#
+              !total = ps + sizeM m' + sb
+          in case I# k# - sb of
+               I# k'# | total == 0 -> (# MNil, nodeAt q nn, k'# #)
+                      | otherwise  -> (# MDeep (mk total pc q) ps pr m' (nodeTakeRev q nn), nodeAt q nn, k'# #)
   | otherwise = goS (n - j) sc sf
   where
     !n = tsize t
@@ -516,16 +579,6 @@ takeM j (MDeep t ps pr m sf)
                   | otherwise -> (# MDeep (mk sb q 0) sb (takeS q pr) MNil SNil, nd, k# #)
       | otherwise = goP (q + 1) (sb + nodeSize nd) r
     goP _ _ SNil = error "Deque2.take: past the end of a prefix"
-    -- the children of the node the level below cut in: q of them, with sb
-    -- leaves, are kept whole and make the new suffix
-    goC m' !k !q !sb acc (SCons c r)
-      | k <= sb + nodeSize c =
-          let !total = ps + sizeM m' + sb
-          in case k - sb of
-               I# k# | total == 0 -> (# MNil, c, k# #)
-                     | otherwise  -> (# MDeep (mk total pc q) ps pr m' acc, c, k# #)
-      | otherwise = goC m' k (q + 1) (sb + nodeSize c) (SCons c acc) r
-    goC _ _ _ _ _ SNil = error "Deque2.take: past the end of a node"
     -- r leaves are to go from the back; cnt nodes of the suffix are left
     goS !r !cnt (SCons nd rest)
       | r >= s = goS (r - s) (cnt - 1) rest
@@ -545,7 +598,19 @@ dropM !_ MNil = error "Deque2.drop: empty middle"
 dropM j (MDeep t ps pr m sf)
   | j < ps = goP j pc ps n pr
   | j < ps + ms = case dropM (j - ps) m of
-      (# nn, k#, m' #) -> goC m' (I# k#) (nodeToFwd nn)
+      (# nn, k#, m' #) -> case scanKids (I# k#) nn of
+        -- the children of the node the level below cut in: those after the
+        -- one holding the cut make the new prefix
+        (# q#, sb# #) ->
+          let !q = I# q#
+              !sb = I# sb#
+              !nd = nodeAt q nn
+              !c = nodeArity nn - q - 1
+              !sa = nodeSize nn - sb - nodeSize nd
+              !total = sa + sizeM m' + (n - ps - ms)
+          in case I# k# - sb of
+               I# k'# | total == 0 -> (# nd, k'#, MNil #)
+                      | otherwise  -> (# nd, k'#, MDeep (mk total c sc) sa (nodeDropFwd (q + 1) nn) m' sf #)
   | otherwise = goS (n - 1 - j) 0 0 sf
   where
     !n = tsize t
@@ -562,17 +627,6 @@ dropM j (MDeep t ps pr m sf)
                   | otherwise -> (# nd, k#, MDeep (mk (tot - s) (cnt - 1) sc) (psz - s) r m sf #)
       where !s = nodeSize nd
     goP _ _ _ _ SNil = error "Deque2.drop: past the end of a prefix"
-    -- the children of the node the level below cut in: those after the one
-    -- holding the cut make the new prefix
-    goC m' !k (SCons c r)
-      | k >= nodeSize c = goC m' (k - nodeSize c) r
-      | otherwise =
-          let !sa = sumS r
-              !total = sa + sizeM m' + (n - ps - ms)
-          in case k of
-               I# k# | total == 0 -> (# c, k#, MNil #)
-                     | otherwise  -> (# c, k#, MDeep (mk total (lenS r) sc) sa r m' sf #)
-    goC _ _ SNil = error "Deque2.drop: past the end of a node"
     -- r leaves come after leaf j; c nodes of the suffix, with sa leaves, are
     -- wholly after it
     goS !r !c !sa (SCons nd rest)
@@ -617,8 +671,7 @@ append a@(Deep t1 pr1 m1 sf1) b@(Deep t2 pr2 m2 sf2) = case m1 of
     _ | c == 1 -> if tsc t1 == 0 then append (refillBack t1 pr1 m1) b
                                  else append a (refillFront t2 m2 sf2)
       | otherwise ->
-          let !ns = packLeaves c (revOnto sf1 pr2)
-          in Deep (mk n (tpc t1) (tsc t2)) pr1 (appM m1 ns m2) sf2
+          Deep (mk n (tpc t1) (tsc t2)) pr1 (appM m1 c (packLeaves c (tsc t1) sf1 pr2) m2) sf2
       where !c = tsc t1 + tpc t2
   where !n = tsize t1 + tsize t2
 
@@ -626,28 +679,78 @@ append a@(Deep t1 pr1 m1 sf1) b@(Deep t2 pr2 m2 sf2) = case m1 of
 consLeaves8 :: Int -> SList a -> Mid a -> Mid a
 consLeaves8 0 _ m = m
 consLeaves8 k (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) m =
-  consM (N8 8 a b c d e f g h) (consLeaves8 (k - 1) r m)
+  consM (N8 a b c d e f g h) (consLeaves8 (k - 1) r m)
 consLeaves8 _ _ _ = error "Deque2.append: short list"
 
 -- 8k items, back to front, go on the back of a middle as k nodes
 snocLeaves8 :: Int -> SList a -> Mid a -> Mid a
 snocLeaves8 0 _ m = m
 snocLeaves8 k (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a r)))))))) m =
-  snocM (snocLeaves8 (k - 1) r m) (N8 8 a b c d e f g h)
+  snocM (snocLeaves8 (k - 1) r m) (N8 a b c d e f g h)
 snocLeaves8 _ _ _ = error "Deque2.append: short list"
 
+-- an empty digit gets the nearest node of a middle that is not empty
+refillBack :: Int -> SList a -> Mid a -> Deque a
+refillBack t pr m = case unsnocM m of
+  (# m', nd #) -> let !k = nodeArity nd in Deep (t + (k `unsafeShiftL` 4)) pr m' (nodeTakeRev k nd)
+
+refillFront :: Int -> Mid a -> SList a -> Deque a
+refillFront t m sf = case unconsM m of
+  (# nd, m' #) -> Deep (t + nodeArity nd) (nodeDropFwd 0 nd) m' sf
+
+-- A node of the first k items of a list, which are leaves.
+leafNode :: Int -> SList a -> Node a
+leafNode 8 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h _)))))))) = N8 a b c d e f g h
+leafNode k l = NA k (fromSListA k l)
+
+-- The leaves between two middles, as nodes: a suffix (back to front, nb
+-- items) and then a prefix, c items in all.  c is 0 or 2 to 2 * maxD.  The
+-- nodes have eight leaves while that leaves none or at least two for the
+-- next (nine make a five and a four).
+packLeaves :: Int -> Int -> SList a -> SList a -> SList (Node a)
+packLeaves c nb back front
+  | c == 0 = SNil
+  | c < 8  = SCons (NA c (gather c nb back SNil front)) SNil
+  | otherwise = go c (revOnto back front)
+  where
+    go !left l
+      | left == 0 = SNil
+      | left <= 8 = SCons (leafNode left l) SNil
+      | left == 9 = SCons (leafNode 5 l) (SCons (leafNode 4 (dropS 5 l)) SNil)
+      | otherwise = SCons (leafNode 8 l) (go (left - 8) (dropS 8 l))
+
+-- The same one level down: a suffix, the nodes handed down, a prefix; c
+-- nodes in all, at least 2, with sz leaves under them.
+packNodes :: Int -> Int -> Int -> SList (Node a) -> SList (Node a) -> SList (Node a) -> SList (Node (Node a))
+packNodes c sz nb back mid front
+  | c <= 8    = SCons (NA sz items) SNil
+  | otherwise =
+      -- two or three nodes of about the same number of children
+      let !q = (c + 7) `unsafeShiftR` 3
+          !k1 = (c + q - 1) `div` q
+          !x = sliceA items 0 k1
+          !sx = sumA x
+      in if q == 2 then SCons (NA sx x) (SCons (NA (sz - sx) (sliceA items k1 (c - k1))) SNil)
+         else let !k2 = (c - k1 + 1) `div` 2
+                  !y = sliceA items k1 k2
+                  !sy = sumA y
+              in SCons (NA sx x) (SCons (NA sy y) (SCons (NA (sz - sx - sy) (sliceA items (k1 + k2) (c - k1 - k2))) SNil))
+  where !items = gather c nb back mid front
+
+-- 8k nodes, front to back, go on the front of a middle as k nodes
 consNodes8 :: Int -> SList (Node a) -> Mid (Node a) -> Mid (Node a)
 consNodes8 0 _ m = m
 consNodes8 k (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) m =
   let !s = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-  in consM (N8 s a b c d e f g h) (consNodes8 (k - 1) r m)
+  in consM (NA s (arr8 a b c d e f g h)) (consNodes8 (k - 1) r m)
 consNodes8 _ _ _ = error "Deque2.append: short list"
 
+-- 8k nodes, back to front, go on the back of a middle as k nodes
 snocNodes8 :: Int -> SList (Node a) -> Mid (Node a) -> Mid (Node a)
 snocNodes8 0 _ m = m
 snocNodes8 k (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a r)))))))) m =
   let !s = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-  in snocM (snocNodes8 (k - 1) r m) (N8 s a b c d e f g h)
+  in snocM (snocNodes8 (k - 1) r m) (NA s (arr8 a b c d e f g h))
 snocNodes8 _ _ _ = error "Deque2.append: short list"
 
 consEachM :: SList (Node a) -> Mid a -> Mid a
@@ -658,20 +761,11 @@ snocEachM :: Mid a -> SList (Node a) -> Mid a
 snocEachM d SNil = d
 snocEachM d (SCons x r) = snocEachM (snocM d x) r
 
--- an empty digit gets the nearest node of a middle that is not empty
-refillBack :: Int -> SList a -> Mid a -> Deque a
-refillBack t pr m = case unsnocM m of
-  (# m', nd #) -> Deep (t + (nodeArity nd `unsafeShiftL` 4)) pr m' (nodeToBwd nd)
-
-refillFront :: Int -> Mid a -> SList a -> Deque a
-refillFront t m sf = case unconsM m of
-  (# nd, m' #) -> Deep (t + nodeArity nd) (nodeToFwd nd) m' sf
-
--- the nodes between the two middles run front to back
-appM :: Mid a -> SList (Node a) -> Mid a -> Mid a
-appM MNil ns b = consEachM (revS ns) b
-appM a ns MNil = snocEachM a ns
-appM a@(MDeep t1 ps1 pr1 m1 sf1) ns b@(MDeep t2 ps2 pr2 m2 sf2) = case m1 of
+-- The nodes between the two middles run front to back and hold sns leaves.
+appM :: Mid a -> Int -> SList (Node a) -> Mid a -> Mid a
+appM MNil _ ns b = consEachM (revS ns) b
+appM a _ ns MNil = snocEachM a ns
+appM a@(MDeep t1 ps1 pr1 m1 sf1) sns ns b@(MDeep t2 ps2 pr2 m2 sf2) = case m1 of
   MNil ->
     let !c = tpc t1 + tsc t1 + k + tpc t2
         !f = appendS pr1 (revOnto sf1 (appendS ns pr2))
@@ -690,38 +784,22 @@ appM a@(MDeep t1 ps1 pr1 m1 sf1) ns b@(MDeep t2 ps2 pr2 m2 sf2) = case m1 of
            else let !kk = (c - maxD + 7) `unsafeShiftR` 3
                     !q = c - 8 * kk
                 in MDeep (mk n (tpc t1) q) ps1 pr1 (snocNodes8 kk (dropS q r) m1) (takeS q r)
-    _ | c == 1 ->
+    _ | c == 0 -> MDeep (mk n (tpc t1) (tsc t2)) ps1 pr1 (appM m1 0 SNil m2) sf2
+      | c == 1 ->
           if tsc t1 == 0
             then case unsnocM m1 of
               (# m1', nd #) ->
-                appM (MDeep (t1 + (nodeArity nd `unsafeShiftL` 4)) ps1 pr1 m1' (nodeToBwd nd)) ns b
+                let !kk = nodeArity nd
+                in appM (MDeep (t1 + (kk `unsafeShiftL` 4)) ps1 pr1 m1' (nodeTakeRev kk nd)) sns ns b
             else case unconsM m2 of
               (# nd, m2' #) ->
-                appM a ns (MDeep (t2 + nodeArity nd) (nodeSize nd) (nodeToFwd nd) m2' sf2)
+                appM a sns ns (MDeep (t2 + nodeArity nd) (nodeSize nd) (nodeDropFwd 0 nd) m2' sf2)
       | otherwise ->
-          let !nns = packNodes c (revOnto sf1 (appendS ns pr2))
-          in MDeep (mk n (tpc t1) (tsc t2)) ps1 pr1 (appM m1 nns m2) sf2
+          let !sz = (tsize t1 - ps1 - sizeM m1) + sns + ps2
+          in MDeep (mk n (tpc t1) (tsc t2)) ps1 pr1 (appM m1 sz (packNodes c sz (tsc t1) sf1 ns pr2) m2) sf2
       where !c = tsc t1 + k + tpc t2
   where !k = lenS ns
-        !sns = sumS ns
         !n = tsize t1 + sns + tsize t2
-
--- c items, front to back, as nodes: eights while that leaves none or at
--- least two, then one node of what is left (nine make a five and a four).
--- c is not 1.
-packLeaves :: Int -> SList a -> SList (Node a)
-packLeaves c l
-  | c == 0 = SNil
-  | c == 9 = case leafNode 5 l of (# x, r #) -> case leafNode 4 r of (# y, _ #) -> SCons x (SCons y SNil)
-  | c <= 8 = case leafNode c l of (# x, _ #) -> SCons x SNil
-  | otherwise = case leafNode 8 l of (# x, r #) -> SCons x (packLeaves (c - 8) r)
-
-packNodes :: Int -> SList (Node a) -> SList (Node (Node a))
-packNodes c l
-  | c == 0 = SNil
-  | c == 9 = case innerNode 5 l of (# x, r #) -> case innerNode 4 r of (# y, _ #) -> SCons x (SCons y SNil)
-  | c <= 8 = case innerNode c l of (# x, _ #) -> SCons x SNil
-  | otherwise = case innerNode 8 l of (# x, r #) -> SCons x (packNodes (c - 8) r)
 
 ------------------------------------------------------------------------
 -- Lists
@@ -730,19 +808,10 @@ packNodes c l
 toList :: Deque a -> [a]
 toList = foldrI (:) []
 
+-- | O(n).  A fold, so that it fuses with a list that is being produced.
 fromList :: [a] -> Deque a
-fromList xs = case shortL 0 xs of
-  (# n#, pl #) | n <= maxD -> if n == 0 then Nil else Deep (mk n n 0) pl MNil SNil
-               | otherwise -> fromListN (L.length xs) xs
-    where n = I# n#
-
--- the length of a list and its items, if there are at most maxD; a larger
--- number otherwise
-shortL :: Int -> [a] -> (# Int#, SList a #)
-shortL (I# k#) [] = (# k#, SNil #)
-shortL k (y : ys)
-  | k >= maxD = case k + 1 of I# k# -> (# k#, SNil #)
-  | otherwise = case shortL (k + 1) ys of (# n#, l #) -> (# n#, SCons y l #)
+fromList = L.foldl' snoc Nil
+{-# INLINE fromList #-}
 
 -- | 'fromList' for a list whose length is known.  O(n).  Builds the levels
 -- directly: each gets a prefix of two to nine items and a suffix of five, and
@@ -776,7 +845,7 @@ leafNodes :: Int -> [a] -> (# SList (Node a), [a] #)
 leafNodes = go SNil
   where
     go acc 0 ys = (# revS acc, ys #)
-    go acc k (a : b : c : d : e : f : g : h : ys) = go (SCons (N8 8 a b c d e f g h) acc) (k - 1) ys
+    go acc k (a : b : c : d : e : f : g : h : ys) = go (SCons (N8 a b c d e f g h) acc) (k - 1) ys
     go _ _ _ = error "Deque2.fromList: the list is shorter than its length"
 
 -- c nodes of s leaves each, in order
@@ -795,7 +864,7 @@ buildMid !s !c ns
 innerNodes :: Int -> SList (Node (Node a)) -> Int -> SList (Node a) -> (# SList (Node (Node a)), SList (Node a) #)
 innerNodes !_ acc 0 ys = (# revS acc, ys #)
 innerNodes s acc k (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h ys))))))))
-  = innerNodes s (SCons (N8 s a b c d e f g h) acc) (k - 1) ys
+  = innerNodes s (SCons (NA s (arr8 a b c d e f g h)) acc) (k - 1) ys
 innerNodes _ _ _ _ = error "Deque2.fromList: short list of nodes"
 
 -- | @fromFunction n f@ is @f 0, f 1, ..., f (n - 1)@.
@@ -805,8 +874,11 @@ fromFunction n f
   | otherwise = fromListN n (L.map f [0 .. n - 1])
 
 ------------------------------------------------------------------------
--- Folds
+-- Folds.  Each walks the prefix, then the middle, then the suffix.  Below
+-- the top level an item is a node, so the function handed down folds over a
+-- node's children.
 
+-- | Right fold, lazy in the accumulator.
 foldrD :: (a -> r -> r) -> r -> Deque a -> r
 foldrD _ z Nil = z
 foldrD f z (Deep _ pr m sf) = foldrS f (foldrM (foldrNode f) (foldrRev f z sf) m) pr
@@ -820,13 +892,8 @@ foldrI f z (Deep _ pr m sf) = foldrS f (foldrM (\nd acc -> foldrNodeI f nd acc) 
 {-# INLINE foldrI #-}
 
 foldrNodeI :: (a -> r -> r) -> Node a -> r -> r
-foldrNodeI fn (N8 _ a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
-foldrNodeI fn (N7 _ a b c d e f g) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g z))))))
-foldrNodeI fn (N6 _ a b c d e f) z = fn a (fn b (fn c (fn d (fn e (fn f z)))))
-foldrNodeI fn (N5 _ a b c d e) z = fn a (fn b (fn c (fn d (fn e z))))
-foldrNodeI fn (N4 _ a b c d) z = fn a (fn b (fn c (fn d z)))
-foldrNodeI fn (N3 _ a b c) z = fn a (fn b (fn c z))
-foldrNodeI fn (N2 _ a b) z = fn a (fn b z)
+foldrNodeI fn (N8 a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
+foldrNodeI fn (NA _ a) z = foldrA fn z a
 {-# INLINE foldrNodeI #-}
 
 foldrM :: (Node a -> r -> r) -> r -> Mid a -> r
@@ -843,14 +910,10 @@ foldrRev f = go where go acc SNil = acc
                       go acc (SCons x r) = go (f x acc) r
 
 foldrNode :: (a -> r -> r) -> Node a -> r -> r
-foldrNode fn (N8 _ a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
-foldrNode fn (N7 _ a b c d e f g) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g z))))))
-foldrNode fn (N6 _ a b c d e f) z = fn a (fn b (fn c (fn d (fn e (fn f z)))))
-foldrNode fn (N5 _ a b c d e) z = fn a (fn b (fn c (fn d (fn e z))))
-foldrNode fn (N4 _ a b c d) z = fn a (fn b (fn c (fn d z)))
-foldrNode fn (N3 _ a b c) z = fn a (fn b (fn c z))
-foldrNode fn (N2 _ a b) z = fn a (fn b z)
+foldrNode fn (N8 a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
+foldrNode fn (NA _ a) z = foldrA fn z a
 
+-- | Strict left fold.
 foldlD' :: (r -> a -> r) -> r -> Deque a -> r
 foldlD' _ !z Nil = z
 foldlD' f z (Deep _ pr m sf) = foldlRev f (foldlM (foldlNode f) (foldlS f z pr) m) sf
@@ -869,13 +932,10 @@ foldlRev f !z = go where go SNil = z
                          go (SCons x r) = let !a = go r in f a x
 
 foldlNode :: (r -> a -> r) -> r -> Node a -> r
-foldlNode fn !z (N8 _ a b c d e f g h) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e; !z6 = fn z5 f; !z7 = fn z6 g in fn z7 h
-foldlNode fn !z (N7 _ a b c d e f g) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e; !z6 = fn z5 f in fn z6 g
-foldlNode fn !z (N6 _ a b c d e f) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e in fn z5 f
-foldlNode fn !z (N5 _ a b c d e) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d in fn z4 e
-foldlNode fn !z (N4 _ a b c d) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c in fn z3 d
-foldlNode fn !z (N3 _ a b c) = let !z1 = fn z a; !z2 = fn z1 b in fn z2 c
-foldlNode fn !z (N2 _ a b) = let !z1 = fn z a in fn z1 b
+foldlNode fn !z (N8 a b c d e f g h) =
+  let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e; !z6 = fn z5 f; !z7 = fn z6 g
+  in fn z7 h
+foldlNode fn !z (NA _ a) = foldlA fn z a
 
 ------------------------------------------------------------------------
 -- Mapping keeps the shape
@@ -891,17 +951,10 @@ mapM' f (MDeep t ps pr m sf) = MDeep t ps (mapS f pr) (mapM' (mapNode f) m) (map
 mapS :: (a -> b) -> SList a -> SList b
 mapS f = go where go SNil = SNil
                   go (SCons x r) = SCons (f x) (go r)
-{-# INLINE mapS #-}
 
 mapNode :: (a -> b) -> Node a -> Node b
-mapNode fn (N8 n a b c d e f g h) = N8 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f) (fn g) (fn h)
-mapNode fn (N7 n a b c d e f g) = N7 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f) (fn g)
-mapNode fn (N6 n a b c d e f) = N6 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f)
-mapNode fn (N5 n a b c d e) = N5 n (fn a) (fn b) (fn c) (fn d) (fn e)
-mapNode fn (N4 n a b c d) = N4 n (fn a) (fn b) (fn c) (fn d)
-mapNode fn (N3 n a b c) = N3 n (fn a) (fn b) (fn c)
-mapNode fn (N2 n a b) = N2 n (fn a) (fn b)
-{-# INLINE mapNode #-}
+mapNode fn (N8 a b c d e f g h) = N8 (fn a) (fn b) (fn c) (fn d) (fn e) (fn f) (fn g) (fn h)
+mapNode fn (NA n a) = NA n (mapA fn a)
 
 ------------------------------------------------------------------------
 -- Invariant checker, for tests
@@ -926,23 +979,25 @@ validM lvl chk (MDeep t ps pr m sf) = do
   unless (lenS pr == tpc t) $ Left (at "prefix count")
   unless (lenS sf == tsc t) $ Left (at "suffix count")
   when (tpc t > maxD || tsc t > maxD) $ Left (at "digit too long")
-  psz <- sum <$> traverse (checkNode chk) (listS pr)
+  psz <- sum <$> traverse (checkNode lvl chk) (listS pr)
   unless (psz == ps) $ Left (at "prefix size")
-  ssz <- sum <$> traverse (checkNode chk) (listS sf)
-  ms <- validM (lvl + 1) (checkNode chk) m
+  ssz <- sum <$> traverse (checkNode lvl chk) (listS sf)
+  ms <- validM (lvl + 1) (checkNode lvl chk) m
   unless (n == psz + ms + ssz) $ Left (at ("size: " ++ show n ++ " /= " ++ show (psz, ms, ssz)))
   pure n
 
-checkNode :: (a -> Either String Int) -> Node a -> Either String Int
-checkNode chk nd = do
-  s <- sum <$> traverse chk (listS (nodeToFwd nd))
+-- lvl: the level of the digit the node is in; only at the first are a
+-- node's children leaves
+checkNode :: Int -> (a -> Either String Int) -> Node a -> Either String Int
+checkNode lvl chk nd = do
+  let kids = [nodeAt i nd | i <- [0 .. nodeArity nd - 1]]
+  s <- sum <$> traverse chk kids
   unless (s == nodeSize nd) $ Left "node size"
-  when (s <= 0) $ Left "empty node"
+  when (L.length kids < 2 || L.length kids > 8) $ Left "node arity"
+  case nd of
+    N8 {} | lvl /= 1 -> Left "a node of eight leaves below the first level"
+    _ -> pure ()
   pure s
-
-listS :: SList a -> [a]
-listS SNil = []
-listS (SCons x r) = x : listS r
 
 ------------------------------------------------------------------------
 -- The names Data.Sequence uses, so that this module can stand in for it.

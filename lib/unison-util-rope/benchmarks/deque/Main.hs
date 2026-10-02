@@ -32,6 +32,7 @@ group n =
       "deque"
       [ bench "snoc" $ whnf (L.foldl' D.snoc D.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip D.cons) D.empty) xs,
+        bench "fromList" $ whnf D.fromList xs,
         bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + D.size (D.fromList [1 .. i])) 0) nearEnds,
         let x = d in bench "uncons" $ whnf unconsAllD x,
         let x = d in bench "unsnoc" $ whnf unsnocAllD x,
@@ -52,6 +53,7 @@ group n =
       "deque2"
       [ bench "snoc" $ whnf (L.foldl' D2.snoc D2.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip D2.cons) D2.empty) xs,
+        bench "fromList" $ whnf D2.fromList xs,
         bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + D2.size (D2.fromList [1 .. i])) 0) nearEnds,
         let x = d2 in bench "uncons" $ whnf unconsAllD2 x,
         let x = d2 in bench "unsnoc" $ whnf unsnocAllD2 x,
@@ -72,6 +74,7 @@ group n =
       "seq"
       [ bench "snoc" $ whnf (L.foldl' (Seq.|>) Seq.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip (Seq.<|)) Seq.empty) xs,
+        bench "fromList" $ whnf Seq.fromList xs,
         bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + Seq.length (Seq.fromList [1 .. i])) 0) nearEnds,
         let x = s in bench "uncons" $ whnf unconsAllS x,
         let x = s in bench "unsnoc" $ whnf unsnocAllS x,
