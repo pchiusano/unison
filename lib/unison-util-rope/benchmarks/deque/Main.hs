@@ -13,7 +13,6 @@ import Data.Sequence qualified as Seq
 import Test.Tasty.Bench
 import Unison.Util.Deque (Deque)
 import Unison.Util.Deque qualified as D
-import Unison.Util.Deque2 qualified as D2
 
 -- positions to index or cut at: 1000 of them, spread over 0..n-1
 positions :: Int -> [Int]
@@ -50,27 +49,6 @@ group n =
         let x = d in bench "==" $ whnf (\(y, z) -> y == z) (x, L.foldl' (flip D.cons) D.empty (reverse xs))
       ],
     bgroup
-      "deque2"
-      [ bench "snoc" $ whnf (L.foldl' D2.snoc D2.empty) xs,
-        bench "cons" $ whnf (L.foldl' (flip D2.cons) D2.empty) xs,
-        bench "fromList" $ whnf D2.fromList xs,
-        bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + D2.size (D2.fromList [1 .. i])) 0) nearEnds,
-        let x = d2 in bench "uncons" $ whnf unconsAllD2 x,
-        let x = d2 in bench "unsnoc" $ whnf unsnocAllD2 x,
-        bench "snoc then uncons" $ whnf (unconsAllD2 . L.foldl' D2.snoc D2.empty) xs,
-        bench "cons then unsnoc" $ whnf (unsnocAllD2 . L.foldl' (flip D2.cons) D2.empty) xs,
-        let x = d2 in bench "queue" $ whnf (queueD2 n) x,
-        let x = d2 in bench "index" $ whnf (\ps -> L.foldl' (\acc i -> acc + maybe 0 id (D2.lookup i x)) 0 ps) ps,
-        let x = d2 in bench "take" $ whnf (\ps -> L.foldl' (\acc i -> acc + D2.size (D2.take i x)) 0 ps) ps,
-        let x = d2 in bench "drop" $ whnf (\ps -> L.foldl' (\acc i -> acc + D2.size (D2.drop i x)) 0 ps) ps,
-        let x = d2 in bench "split near ends" $ whnf (\ks -> L.foldl' (\acc i -> acc + D2.size (D2.drop i x) + D2.size (D2.take i x) + D2.size (D2.drop (n - i) x) + D2.size (D2.take (n - i) x)) 0 ks) nearEnds,
-        let x = d2 in bench "append" $ whnf (L.foldl' (\acc (a, b) -> acc + D2.size (D2.append a b)) 0) (pairsD2 x),
-        let x = d2 in bench "append small" $ whnf (\ks -> L.foldl' (\acc i -> acc + D2.size (D2.append x (D2.fromList [1 .. i])) + D2.size (D2.append (D2.fromList [1 .. i]) x)) 0 ks) nearEnds,
-        let x = d2 in bench "sum" $ whnf sum x,
-        let x = d2 in bench "toList" $ whnf (L.foldl' (+) 0 . D2.toList) x,
-        let x = d2 in bench "==" $ whnf (\(y, z) -> y == z) (x, L.foldl' (flip D2.cons) D2.empty (reverse xs))
-      ],
-    bgroup
       "seq"
       [ bench "snoc" $ whnf (L.foldl' (Seq.|>) Seq.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip (Seq.<|)) Seq.empty) xs,
@@ -96,13 +74,11 @@ group n =
     xs = [1 .. n]
     ps = positions n
     -- 100 pairs of pieces to append
-    pairsD x = [(D.take i x, D.drop i x) | i <- L.take 100 ps]
     pairsS x = [(Seq.take i x, Seq.drop i x) | i <- L.take 100 ps]
     -- cuts one to four elements from an end, as list patterns make: 250 rounds of four
     nearEnds = concat (replicate 250 [1, 2, 3, 4 :: Int])
     d = D.fromList xs
-    d2 = D2.fromList xs
-    pairsD2 x = [(D2.take i x, D2.drop i x) | i <- L.take 100 ps]
+    pairsD x = [(D.take i x, D.drop i x) | i <- L.take 100 ps]
     s = Seq.fromList xs
 
 unconsAllD :: Deque Int -> Int
@@ -112,24 +88,10 @@ unconsAllD = go 0
       Nothing -> acc
       Just (e, x') -> go (acc + e) x'
 
-unconsAllD2 :: D2.Deque Int -> Int
-unconsAllD2 = go 0
-  where
-    go !acc x = case D2.uncons x of
-      Nothing -> acc
-      Just (e, x') -> go (acc + e) x'
-
 unsnocAllD :: Deque Int -> Int
 unsnocAllD = go 0
   where
     go !acc x = case D.unsnoc x of
-      Nothing -> acc
-      Just (x', e) -> go (acc + e) x'
-
-unsnocAllD2 :: D2.Deque Int -> Int
-unsnocAllD2 = go 0
-  where
-    go !acc x = case D2.unsnoc x of
       Nothing -> acc
       Just (x', e) -> go (acc + e) x'
 
@@ -154,16 +116,6 @@ queueD n = go 0 0
     go !i !acc x
       | i == n = acc
       | otherwise = case D.uncons (D.snoc x i) of
-          Just (e, x') -> go (i + 1) (acc + e) x'
-          Nothing -> acc
-
--- n rounds of: add one at the back, remove one from the front
-queueD2 :: Int -> D2.Deque Int -> Int
-queueD2 n = go 0 0
-  where
-    go !i !acc x
-      | i == n = acc
-      | otherwise = case D2.uncons (D2.snoc x i) of
           Just (e, x') -> go (i + 1) (acc + e) x'
           Nothing -> acc
 

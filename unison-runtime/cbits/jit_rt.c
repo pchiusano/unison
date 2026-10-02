@@ -161,16 +161,16 @@ int64_t unison_jit_rts_facts(int64_t *out, int64_t n) {
 // ---------------------------------------------------------------------------
 // Lists
 //
-// A Unison list is a Unison.Util.Deque2 of Val (a strict finger tree), held
+// A Unison list is a Unison.Util.Deque of Val (a strict finger tree), held
 // as Foreign (WrapSeq deque). Every field is strict, so everything reachable
 // from a list is an evaluated, tagged constructor and can be read and built
 // here without evaluating anything. These helpers are ports of the Haskell
-// operations in lib/unison-util-rope's Deque2.hs (same results, structure
+// operations in lib/unison-util-rope's Deque.hs (same results, structure
 // included) and take every case: a helper answers "not handled" (NULL, or a
 // negative size) only for a closure that isn't a list. They allocate with
 // allocate(), like generated code, and never call into Haskell.
 //
-// The layouts are GHC's for the constructors in Deque2.hs (pointer fields
+// The layouts are GHC's for the constructors in Deque.hs (pointer fields
 // first, in declaration order, then the unpacked words):
 //
 //   SList: SNil (tag 1), SCons x rest (tag 2)
@@ -204,7 +204,7 @@ static ListFacts LF;
 #define LP(c, i) (LUN(c)->payload[i])
 #define LW(c, i) ((StgInt)LUN(c)->payload[i])
 
-// the most items in a digit (Deque2.maxD)
+// the most items in a digit (Deque.maxD)
 #define MAXD 10
 #define TSIZE(t) ((t) >> 8)
 #define TPC(t) ((t)&15)

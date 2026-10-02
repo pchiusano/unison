@@ -31,7 +31,7 @@ import Unison.Runtime.MCode (CombIx (..), GCombInfo (..), GSection (..), noNativ
 import Unison.Runtime.Stack
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
-import Unison.Util.Deque2 qualified as Sq
+import Unison.Util.Deque qualified as Sq
 import Unison.Util.Text qualified as UText
 import Unsafe.Coerce (unsafeCoerce)
 
@@ -157,7 +157,7 @@ probeLayouts = do
     summary l = show (lPtrTag l, lPtrs l, lNptrs l)
 
 -- | Lists: teaches the C helpers (jit_rt.c) the constructors of
--- Unison.Util.Deque2 from samples, checks the structure of a range of lists
+-- Unison.Util.Deque from samples, checks the structure of a range of lists
 -- against what the helpers assume, and then runs every helper against the
 -- Haskell operation it stands in for; each list a helper builds is checked
 -- for its structure too. Returns an explanation if anything differs.

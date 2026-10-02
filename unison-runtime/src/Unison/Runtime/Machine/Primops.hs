@@ -7,7 +7,7 @@ import Data.Bits
 import Data.IORef (IORef)
 import Data.IORef qualified as IORef
 import Data.Map.Strict qualified as M
-import Unison.Util.Deque2 qualified as Sq
+import Unison.Util.Deque qualified as Sq
 import Data.Set qualified as S
 import Data.Word
 import Unison.Builtin.Decls qualified as Ty

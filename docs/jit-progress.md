@@ -17,7 +17,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
 | M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
 | M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are a strict structure now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes` |
-| After M6: lists on `Unison.Util.Deque2` | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
+| After M6: lists on a strict finger tree (`Unison.Util.Deque`) | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -618,12 +618,15 @@ are listed per step; the full table comes at step 8.
 - A last `suite` and `jitSuite` with `on` after step 7: no entry moved (`fib 20` read
   45.7 µs in that run, 41.2 µs in the one before).
 
-## The list representation: `Unison.Util.Deque2` (2026-10-02)
+## The list representation: `Unison.Util.Deque` (2026-10-02)
 
-A Unison `List` is a `Unison.Util.Deque2 Val`: a strict finger tree (in
+A Unison `List` is a `Unison.Util.Deque Val`: a strict finger tree (in
 `lib/unison-util-rope`; every field strict, so native code can read and build lists without
-meeting a thunk). It replaced `Unison.Util.Deque`, which had replaced `Data.Sequence` the day
-before; the old module is still in the package, used only by the benchmark. `USeq`,
+meeting a thunk). It was written as `Deque2` beside an earlier structure called `Deque`
+(which had replaced `Data.Sequence` the day before), took over the runtime, and then took
+the name when the earlier one was deleted (Paul, 2026-10-02). **In the measurements and
+log entries of this file, "Deque2" is this structure and "the old Deque" is the deleted
+one**, which is in the branch's history (the M5a commit). `USeq`,
 `WrapSeq` and the runtime modules that touch lists import it; `ANF.Value`'s lists and
 `Term.List` are still `Data.Sequence` and convert at the boundary.
 
@@ -633,13 +636,12 @@ before; the old module is still in the package, used only by the benchmark. `USe
   O(1) when a list is used once and O(log n) in the worst case, which a program can only hit
   repeatedly by going back to the same old version.
 - Tests: `stack build --fast --flag unison-runtime:jit --test unison-util-rope` (about a
-  minute) runs the same tests on both structures (`util-rope-tests` and `deque2-tests`).
-  They compare with `Data.Sequence` as a model and check the structure's invariants
+  minute). They compare with `Data.Sequence` as a model and check the structure's invariants
   (`valid`) after every step.
-- Benchmark against `Data.Sequence` and the old Deque:
+- Benchmark against `Data.Sequence`:
   `stack build --work-dir .stack-work-opt --flag unison-runtime:jit --bench unison-util-rope`
-  (about 10 minutes; `--ba "--csv FILE"` for the numbers).
-- `Deque2.hs` is compiled with `-O2 -funbox-strict-fields` in every build: the JIT's C
+  (about 6 minutes; `--ba "--csv FILE"` for the numbers).
+- `Deque.hs` is compiled with `-O2 -funbox-strict-fields` in every build: the JIT's C
   helpers depend on its constructor layouts.
 - Because every package depends on `unison-util-rope`, a change to it rebuilds all the local
   packages in whichever work dir is built next (about 5 minutes for `--fast`).

@@ -173,7 +173,7 @@ than deleting it.
   foreign function rather than a primitive. The exit counts of a text-heavy program say
   which to do next.
 - **What is left of lists.** Every list primitive is native since 2026-10-02 (the C
-  helpers are ports of `Unison.Util.Deque2`). What still leaves native code or costs more
+  helpers are ports of `Unison.Util.Deque`). What still leaves native code or costs more
   than it should:
   - The list operations that are foreign functions rather than primitives (`List.sort`,
     conversions from `Text` and `Bytes`): call-outs like any other foreign function.
@@ -193,8 +193,9 @@ than deleting it.
   needs a second continuation that joins the body with the new closure instead of a call's
   result. The helper already handles closures with arguments captured. Also: more than
   four arguments at once.
-- **The list structure itself** (`Unison.Util.Deque2`, the runtime's list since
-  2026-10-02; numbers in the progress log):
+- **The list structure itself** (`Unison.Util.Deque`, a strict finger tree, the runtime's
+  list since 2026-10-02; numbers in the progress log, where it is called Deque2, its name
+  while the structure it replaced still existed):
   - *JSON parsing is slower than it was on `Data.Sequence`, and the list is not why.* With
     the JIT off: 7.2 µs per document on `Data.Sequence`, 10.2 µs on the old Deque, 10.1 µs
     on Deque2, whose pushes are faster than both; complex parsing 10.7, 18.1, 18.1 µs. So
@@ -217,9 +218,9 @@ than deleting it.
     `toList` 60 to 70%).
   - Any change here has to be made in the C helpers too (see the progress log).
 
-  `Unison.Util.Deque`, the structure Deque2 replaced (worst-case O(1) pushes and pops,
-  about twice the code, slower on every operation measured), is still in the package and
-  in the benchmark; nothing else uses it.
+  The structure it replaced (worst-case O(1) pushes and pops, about twice the code, slower
+  on every operation measured) was deleted on 2026-10-02; it is in the branch's history,
+  in the M5a commit.
   `Unison.Util.Skews` (two skew binary lists back to back, also Paul's) is in the same
   package as a possible alternative: it compiles, nothing uses it, and it hasn't been
   measured against either structure.
