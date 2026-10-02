@@ -233,6 +233,7 @@ import Unison.Runtime.MCode
 import Unison.Runtime.Referenced (Referenced, dereference)
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
+import Unison.Util.Deque (Deque)
 import Unison.Util.Bytes (Bytes)
 import Unison.Util.EnumContainers as EC
 import Unison.Util.Monoid qualified as Monoid
@@ -382,7 +383,9 @@ instance Monoid HEnv where
   mappend = (<>)
 
 -- | Implementation for Unison sequences.
-type USeq = Seq Val
+-- | The runtime's lists.  A strict deque: no thunks inside, so its structure can
+-- be read without evaluating anything.
+type USeq = Deque Val
 
 type IxClosure = GClosure CombIx
 
@@ -1860,7 +1863,7 @@ data Foreign
   | WrapForeignPtr !(Ptr.ForeignPtr ())
   | WrapReference !Reference
   | WrapReferent !Referent
-  | WrapSeq !(Seq Val)
+  | WrapSeq !(Deque Val)
   | WrapSocket !Socket
   | WrapText !U.Text
   | WrapThreadId !ThreadId
@@ -2288,7 +2291,7 @@ instance BuiltinForeign DLL where
     _ -> Nothing
   {-# INLINE maybeUnwrapBuiltin #-}
 
-instance BuiltinForeign (Seq Val) where
+instance BuiltinForeign (Deque Val) where
   builtinName = Tagged "Seq"
   wrapBuiltin = WrapSeq
   maybeUnwrapBuiltin = \case

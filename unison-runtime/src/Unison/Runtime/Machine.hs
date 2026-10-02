@@ -38,7 +38,8 @@ import Data.HashMap.Lazy qualified as HM
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as M
 import Data.Map.Strict.Internal qualified as M
-import Data.Sequence qualified as Sq
+import Data.Sequence qualified as Seq
+import Unison.Util.Deque qualified as Sq
 import Data.Set qualified as S
 import Data.Set qualified as Set
 import Data.Text qualified as DTx
@@ -2081,7 +2082,7 @@ reflectValue0 rty rtm = goV0
     goF = \case
       WrapText t -> pure (ANF.Text t)
       WrapBytes b -> pure (ANF.Bytes b)
-      WrapSeq s -> ANF.List <$> traverse goV s
+      WrapSeq s -> ANF.List . Seq.fromList <$> traverse goV (toList s)
       WrapReferent l -> ANF.TmLink <$> canonicalizeReferent l
       WrapReference l -> ANF.TyLink <$> canonicalizeReference True l
       WrapValue v -> ANF.Quote <$> canonicalizeReferenced v
@@ -2192,8 +2193,8 @@ reifyValue0Canon combs tys tms rty rtm = goV
     goVArr :: Array (ANF.Value RefNum) -> IO (Array Val)
     goVArr vs = traverseArrayIO goV vs
 
-    goVSeq :: Seq (ANF.Value RefNum) -> IO (Seq Val)
-    goVSeq vs = traverse goV vs
+    goVSeq :: Seq (ANF.Value RefNum) -> IO USeq
+    goVSeq vs = Sq.fromList <$> traverse goV (toList vs)
 
     goV :: ANF.Value RefNum -> IO Val
     goV (ANF.Partial gr vs) =
@@ -2345,7 +2346,7 @@ reifyValue0 (combs, rty, rtm) = goV
 
     goL :: ANF.BLit Reference -> IO Val
     goL (ANF.Text t) = pure $ encodeVal t
-    goL (ANF.List l) = boxedVal . Foreign . WrapSeq <$> traverse goV l
+    goL (ANF.List l) = boxedVal . Foreign . WrapSeq . Sq.fromList <$> traverse goV (toList l)
     goL (ANF.TmLink r) = pure $ encodeVal r
     goL (ANF.TyLink r) = pure $ encodeVal r
     goL (ANF.Bytes b) = pure $ encodeVal b

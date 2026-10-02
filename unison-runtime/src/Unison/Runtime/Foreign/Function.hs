@@ -52,7 +52,7 @@ import Data.IP (IP)
 import Data.Map.Strict qualified as Map
 import Data.Map.Strict.Internal qualified as Map
 import Data.PEM (PEM, pemContent, pemParseLBS)
-import Data.Sequence qualified as Sq
+import Unison.Util.Deque qualified as Sq
 import Data.Tagged (Tagged (..))
 import Data.Text qualified as TS
 import Data.Text.IO qualified as Text.IO
@@ -1116,7 +1116,7 @@ foreignCallHelper = \case
           | otherwise = 0
         mk i = NatVal $ m + fromIntegral i
      in evaluate . forceListSpine $ Sq.fromFunction sz mk
-  List_sort -> mkForeign $ \(l :: Seq Val) -> pure $ Sq.unstableSort l
+  List_sort -> mkForeign $ \(l :: USeq) -> pure $ Sq.unstableSort l
   Multimap_fromList -> mkForeign $ \(l :: [(Val, Val)]) -> do
     let listVals = l <&> \(k, v) -> (k, Sq.singleton v)
     -- Haskell Map.fromList calls the semigroup in reverse order, so we correct for it by flipping.
@@ -2068,7 +2068,7 @@ checkedIndex64 byteOrder name (arr, i) =
 
 -- JSON replacement implementations
 jsonNull, jsonTrue, jsonFalse :: Val
-jsonArr, jsonObj :: Seq Val -> Val
+jsonArr, jsonObj :: USeq -> Val
 -- Avro replacement implementations
 avroNull, avroTrue, avroFalse :: Val
 no'buf, line'buf, block'buf :: Closure
@@ -2307,7 +2307,7 @@ emitJson0 = \case
         Util.Text.foldMapChunks TB.fromText tx
     | TT.jsonObjTag == t,
       BoxedVal (Foreign f) <- v,
-      Just sq <- maybeUnwrapBuiltin @(Seq Val) f ->
+      Just sq <- maybeUnwrapBuiltin @USeq f ->
         renderObject $ fmap emitPair sq
     | TT.jsonTextTag == t,
       BoxedVal (Foreign f) <- v,
@@ -2315,7 +2315,7 @@ emitJson0 = \case
         literalForm tx
     | TT.jsonArrTag == t,
       BoxedVal (Foreign f) <- v,
-      Just sq <- maybeUnwrapBuiltin @(Seq Val) f ->
+      Just sq <- maybeUnwrapBuiltin @USeq f ->
         renderArray $ fmap emitJsonVal sq
   c -> exn [] $ "Json.toText: unrecognized Json value: " ++ show c
   where

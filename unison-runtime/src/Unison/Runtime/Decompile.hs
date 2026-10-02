@@ -18,6 +18,7 @@ import Numeric.Natural (Natural)
 import Unison.ABT (substs)
 import Unison.Builtin.Decls qualified as DD
 import Unison.ConstructorReference (GConstructorReference (..))
+import Data.Sequence qualified as Seq
 import Unison.Prelude
 import Unison.Reference (Reference, pattern Builtin)
 import Unison.Referent (pattern Ref)
@@ -169,7 +170,7 @@ decompileForeign backref topTerms = \case
         (ref () ibarrayFromBytesRef)
         (decompileBytes . By.fromWord8s $ byteArrayToList a)
   WrapSeq s ->
-    list' () <$> traverse (decompile backref topTerms) s
+    list' () . Seq.fromList <$> traverse (decompile backref topTerms) (toList s)
   WrapMap m -> do
     let decompileEntry k v = pair <$> decompile backref topTerms k <*> decompile backref topTerms v
     kvs <- traverse (uncurry decompileEntry) (Map.toList m)

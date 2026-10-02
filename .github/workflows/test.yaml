@@ -177,6 +177,10 @@ jobs:
         if: steps.cache-ucm-binaries.outputs.cache-hit != 'true'
         run: stack build --fast --test unison-util-cache
 
+      - name: unison-util-rope tests
+        if: steps.cache-ucm-binaries.outputs.cache-hit != 'true'
+        run: stack build --fast --test unison-util-rope
+
       - name: unison-util-relation tests
         if: steps.cache-ucm-binaries.outputs.cache-hit != 'true'
         run: stack build --fast --test unison-util-relation
