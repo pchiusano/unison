@@ -973,6 +973,29 @@ void *unison_jit_list_append(UnisonJitCtx *ctx, void *x, void *y) {
 
 // --- checking the layouts ---
 
+// A sample handed over from Haskell can be a reference to a top-level value
+// (the optimizer makes constants of the samples it can), which is an
+// untagged pointer to an indirection. This follows it to the constructor
+// and tags the pointer the way a field holding it would be. Values on the
+// Unison stack don't need this: the helpers decline a pointer without its
+// tag, and the interpreter handles it.
+static void *settle(void *p) {
+  StgClosure *c = (StgClosure *)p;
+  for (;;) {
+    if (GET_CLOSURE_TAG(c) != 0) return c;
+    const StgInfoTable *it = get_itbl(c);
+    if (it->type == IND || it->type == IND_STATIC) {
+      c = ((StgInd *)c)->indirectee;
+      continue;
+    }
+    if (it->type >= CONSTR && it->type <= CONSTR_NOCAF) {
+      StgWord tag = it->srt + 1; // the constructor's number
+      return (StgClosure *)((StgWord)c | (tag > 7 ? 7 : tag));
+    }
+    return c;
+  }
+}
+
 static int con_is(StgClosure *c, StgWord tag, StgWord ptrs, StgWord nptrs) {
   if (LTAG(c) != tag) return 0;
   const StgInfoTable *it = get_itbl(LUN(c));
@@ -1036,7 +1059,7 @@ static StgInt check_digit(StgClosure *l, int depth, StgInt count, int64_t *kinds
 // set of bits saying which constructors it met: 1 for a Deep, 2 and 4 for
 // the two kinds of node, 8 for an MDeep.
 int64_t unison_jit_list_check(void **elems) {
-  StgClosure *c = deque_of(elems[0]);
+  StgClosure *c = deque_of(settle(elems[0]));
   if (c == NULL) return -1;
   if (LTAG(c) == 1) return c == LF.nil ? 0 : -1;
   int64_t kinds = 1;
@@ -1078,7 +1101,8 @@ int64_t unison_jit_list_check(void **elems) {
 // back, which has both kinds of node. info[] holds the info pointers of
 // Foreign, Val, Data1 and Data2. Returns 1 if everything is as this file
 // assumes, else a number saying which check failed.
-int64_t unison_jit_list_init(void **elems, int64_t *info) {
+int64_t unison_jit_list_init(void **raw, int64_t *info) {
+  void *elems[4] = {settle(raw[0]), settle(raw[1]), settle(raw[2]), settle(raw[3])};
   memset(&LF, 0, sizeof LF);
   LF.foreign_info = info[0];
   LF.val_info = info[1];
@@ -1146,32 +1170,33 @@ int64_t unison_jit_list_test(void **elems, int64_t op, int64_t arg, int64_t arg2
   UnisonJitCtx tmp = {0}, *ctx = &tmp;
   ctx->cap = rts_unsafeGetMyCapability();
   void *res = NULL;
+  void *e0 = settle(elems[0]), *e1 = settle(elems[1]);
   switch (op) {
     case 0:
     case 1:
-      res = unison_jit_list_view(ctx, elems[0], elems[1], arg, op == 0);
+      res = unison_jit_list_view(ctx, e0, e1, arg, op == 0);
       break;
     case 2:
     case 3:
-      res = unison_jit_list_push(ctx, elems[0], arg, elems[1], op == 2);
+      res = unison_jit_list_push(ctx, e0, arg, e1, op == 2);
       break;
     case 4:
-      res = unison_jit_list_index(ctx, elems[0], arg, elems[1], arg2);
+      res = unison_jit_list_index(ctx, e0, arg, e1, arg2);
       break;
     case 5:
     case 6:
-      res = unison_jit_list_cut(ctx, elems[0], arg, op == 5);
+      res = unison_jit_list_cut(ctx, e0, arg, op == 5);
       break;
     case 7:
     case 8:
-      res = unison_jit_list_split(ctx, elems[0], arg, elems[1], arg2, op == 7);
+      res = unison_jit_list_split(ctx, e0, arg, e1, arg2, op == 7);
       break;
     case 9:
-      res = unison_jit_list_append(ctx, elems[0], elems[1]);
+      res = unison_jit_list_append(ctx, e0, e1);
       break;
     case 10: {
       void *acc = NULL;
-      for (int64_t i = 0; i < arg; i++) acc = unison_jit_list_lit(ctx, acc, arg2 + i, elems[1]);
+      for (int64_t i = 0; i < arg; i++) acc = unison_jit_list_lit(ctx, acc, arg2 + i, e1);
       res = unison_jit_list_wrap(ctx, acc);
       break;
     }

@@ -15,6 +15,7 @@ module Unison.Runtime.JIT.Layout
   )
 where
 
+import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
 import Data.Maybe (catMaybes)
 import Data.Bits (shiftR, xor, (.&.), (.|.))
@@ -186,9 +187,12 @@ probeLists ls steps = do
           ++ [Sq.take k (range 1 n) | (n, k) <- [(100, 50), (1000, 93), (5000, 3)]]
           ++ take 10 (iterate (\d -> case d of _ Sq.:<| r -> r; r -> r) (range 1 300))
           ++ take 10 (iterate (\d -> case d of r Sq.:|> _ -> r; r -> r) (range 1 300))
-  -- the array must hold the evaluated objects, never thunks that produce them
+  -- The array must hold the evaluated objects, never thunks that produce
+  -- them. (`evaluate`, not `seq`: the optimizer makes top-level constants of
+  -- some samples, and a `seq` on one can leave the reference to the
+  -- unevaluated constant in the array.)
   let put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
-      put a i v = v `seq` writeArray a i v
+      put a i v = evaluate v >>= writeArray a i
       !first = wrap sample
   arr <- newArray 4 first :: IO (MutableArray RealWorld Any)
   put arr 1 (any' x)
@@ -363,7 +367,7 @@ probeTexts ls = do
   let wrap :: UText.Text -> Any
       wrap t = any' $! Foreign (WrapText t)
       put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
-      put a i v = v `seq` writeArray a i v
+      put a i v = evaluate v >>= writeArray a i
       !abc = UText.pack "abc"
       !first = wrap abc
       pieces = ["", "a", "abc", "h\233llo w\246rld", "\8364\128512x\128512", "0123456789abcdef", replicate 31 'x', replicate 32 'y', replicate 33 'z', concat (replicate 40 "\955x"), replicate 600 'q']
@@ -438,7 +442,7 @@ probeNames :: Layouts -> IO (Either String ())
 probeNames ls = do
   closureInit [lInfo (lPAp ls), lByteArrayBoxInfo ls, lArrayBoxInfo ls]
   let put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
-      put a i v = v `seq` writeArray a i v
+      put a i v = evaluate v >>= writeArray a i
       !ref = Ty.booleanRef
       !cix = CIx ref 21 22
       !comb = LamI 5 7 Exit noNativeCell
