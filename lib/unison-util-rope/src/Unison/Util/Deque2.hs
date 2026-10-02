@@ -50,11 +50,12 @@ import Control.DeepSeq (NFData (..))
 import Control.Monad (unless, when)
 import Data.Bits (unsafeShiftL, unsafeShiftR, (.&.), (.|.))
 import Data.Functor.Classes (Eq1 (..), Ord1 (..), Show1 (..))
-import GHC.Exts
-  ( Int (I#), Int#, RealWorld, SmallArray#, SmallMutableArray#, State#
-  , cloneSmallArray#, indexSmallArray#, newSmallArray#, runRW#
-  , sizeofSmallArray#, unsafeFreezeSmallArray#, writeSmallArray#
+import Control.Monad.ST (ST)
+import Data.Primitive.SmallArray
+  ( SmallArray, SmallMutableArray, cloneSmallArray, indexSmallArray, newSmallArray
+  , runSmallArray, sizeofSmallArray, writeSmallArray
   )
+import GHC.Exts (Int (I#), Int#)
 import qualified Data.Foldable as F
 import qualified Data.List as L
 import qualified GHC.Exts as Exts
@@ -105,67 +106,75 @@ listS (SCons x r) = x : listS r
 -- store each; the bulk copy operations are calls into the runtime that cost
 -- more than they save at these sizes.
 
-data Arr a = Arr (SmallArray# a)
+type Arr = SmallArray
 
 lenA :: Arr a -> Int
-lenA (Arr a) = I# (sizeofSmallArray# a)
+lenA = sizeofSmallArray
 {-# INLINE lenA #-}
 
 ixA :: Arr a -> Int -> a
-ixA (Arr a) (I# i) = case indexSmallArray# a i of (# x #) -> x
+ixA = indexSmallArray
 {-# INLINE ixA #-}
 
 hole :: a
 hole = error "Deque2: an array element that was never written"
 {-# NOINLINE hole #-}
 
--- an array of n elements, all x to begin with, then filled in
-newA :: Int -> a -> (SmallMutableArray# RealWorld a -> State# RealWorld -> State# RealWorld) -> Arr a
-newA (I# n) x fill = runRW# (\s -> case newSmallArray# n x s of
-  (# s1, m #) -> case unsafeFreezeSmallArray# m (fill m s1) of
-    (# _, a #) -> Arr a)
-{-# INLINE newA #-}
-
 arr8 :: a -> a -> a -> a -> a -> a -> a -> a -> Arr a
-arr8 !a !b !c !d !e !f !g !h = newA 8 a (\m s ->
-  writeSmallArray# m 7# h (writeSmallArray# m 6# g (writeSmallArray# m 5# f (writeSmallArray# m 4# e
-    (writeSmallArray# m 3# d (writeSmallArray# m 2# c (writeSmallArray# m 1# b s)))))))
+arr8 !a !b !c !d !e !f !g !h = runSmallArray do
+  m <- newSmallArray 8 a
+  writeSmallArray m 1 b
+  writeSmallArray m 2 c
+  writeSmallArray m 3 d
+  writeSmallArray m 4 e
+  writeSmallArray m 5 f
+  writeSmallArray m 6 g
+  writeSmallArray m 7 h
+  pure m
 
--- n elements starting at off; n is not 0
+-- n elements starting at off
 sliceA :: Arr a -> Int -> Int -> Arr a
-sliceA (Arr a) (I# off) (I# n) = Arr (cloneSmallArray# a off n)
+sliceA = cloneSmallArray
+{-# INLINE sliceA #-}
 
 -- items of a list go into slots i, i + 1, ...
-writeUp :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
-writeUp m (I# i#) (SCons x r) s = writeUp m (I# i# + 1) r (writeSmallArray# m i# x s)
-writeUp _ _ SNil s = s
+writeUp :: SmallMutableArray s a -> Int -> SList a -> ST s ()
+writeUp m !i (SCons x r) = writeSmallArray m i x >> writeUp m (i + 1) r
+writeUp _ _ SNil = pure ()
 
 -- items of a list go into slots i, i - 1, ...
-writeDown :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
-writeDown m (I# i#) (SCons x r) s = writeDown m (I# i# - 1) r (writeSmallArray# m i# x s)
-writeDown _ _ SNil s = s
+writeDown :: SmallMutableArray s a -> Int -> SList a -> ST s ()
+writeDown m !i (SCons x r) = writeSmallArray m i x >> writeDown m (i - 1) r
+writeDown _ _ SNil = pure ()
 
--- the first n items of a list that has at least n; n is not 0
+-- the first n items of a list that has at least n
 fromSListA :: Int -> SList a -> Arr a
-fromSListA n l = newA n hole (\m s -> go m 0 l s)
-  where
-    go :: SmallMutableArray# RealWorld a -> Int -> SList a -> State# RealWorld -> State# RealWorld
-    go m i@(I# i#) (SCons x r) s | i < n = go m (i + 1) r (writeSmallArray# m i# x s)
-    go _ _ _ s = s
+fromSListA n l = runSmallArray do
+  m <- newSmallArray n hole
+  let go !i (SCons x r) | i < n = writeSmallArray m i x >> go (i + 1) r
+      go _ _ = pure ()
+  go 0 l
+  pure m
 
 -- A list that runs back to front, then two that run front to back, as one
 -- array of c items: c is the three lengths added up, and the first list has
 -- nb items.
 gather :: Int -> Int -> SList a -> SList a -> SList a -> Arr a
-gather c nb back mid front = newA c hole (\m s -> writeUp m (nb + lenS mid) front (writeUp m nb mid (writeDown m (nb - 1) back s)))
+gather c nb back mid front = runSmallArray do
+  m <- newSmallArray c hole
+  writeDown m (nb - 1) back
+  writeUp m nb mid
+  writeUp m (nb + lenS mid) front
+  pure m
 
 mapA :: (a -> b) -> Arr a -> Arr b
-mapA f a = newA n hole (\m s -> go m 0 s)
-  where
-    !n = lenA a
-    go m i@(I# i#) s
-      | i >= n    = s
-      | otherwise = case f (ixA a i) of !x -> go m (i + 1) (writeSmallArray# m i# x s)
+mapA f a = runSmallArray do
+  m <- newSmallArray n hole
+  let go !i | i >= n    = pure ()
+            | otherwise = case f (ixA a i) of !x -> writeSmallArray m i x >> go (i + 1)
+  go 0
+  pure m
+  where !n = lenA a
 {-# INLINE mapA #-}
 
 foldrA :: (a -> r -> r) -> r -> Arr a -> r

@@ -57,6 +57,7 @@ library
   build-depends:
       base
     , deepseq
+    , primitive
   default-language: Haskell2010
 
 test-suite deque2-tests

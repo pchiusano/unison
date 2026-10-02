@@ -12,6 +12,7 @@ library:
   dependencies:
     - base
     - deepseq
+    - primitive
 
 tests:
   util-rope-tests:
