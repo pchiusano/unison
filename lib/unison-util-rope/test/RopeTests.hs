@@ -1,4 +1,4 @@
--- Unison.Util.Rope2 against a model: a rope of string chunks is its string.
+-- Unison.Util.Rope against a model: a rope of string chunks is its string.
 module RopeTests (test) where
 
 import Control.Monad
@@ -9,8 +9,8 @@ import Data.List qualified as L
 import Data.Map.Strict qualified as Map
 import EasyTest
 import GHC.Stack (HasCallStack)
-import Unison.Util.Rope2 (Rope)
-import Unison.Util.Rope2 qualified as R
+import Unison.Util.Rope (Rope)
+import Unison.Util.Rope qualified as R
 
 newtype C = C String
   deriving stock (Eq, Ord, Show)

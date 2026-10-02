@@ -32,6 +32,7 @@ import Unison.Runtime.Stack
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
 import Unison.Util.Deque qualified as Sq
+import Unison.Util.Rope qualified as Rope
 import Unison.Util.Text qualified as UText
 import Unsafe.Coerce (unsafeCoerce)
 
@@ -362,26 +363,34 @@ probeLists ls steps = do
 -- Haskell operation on texts of many shapes (one chunk, deep ropes, several
 -- bytes per character), and every text a helper builds is checked for its
 -- structure too.
-probeTexts :: Layouts -> IO (Either String ())
-probeTexts ls = do
+--
+-- @steps@ (stress mode @texts=N@) adds the longer test, as for lists: that
+-- many random operations, each done by a helper on the results of earlier
+-- ones and compared with the Haskell operation.
+probeTexts :: Layouts -> Int -> IO (Either String ())
+probeTexts ls steps = do
   let wrap :: UText.Text -> Any
       wrap t = any' $! Foreign (WrapText t)
       put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
       put a i v = evaluate v >>= writeArray a i
       !abc = UText.pack "abc"
       !first = wrap abc
-      pieces = ["", "a", "abc", "h\233llo w\246rld", "\8364\128512x\128512", "0123456789abcdef", replicate 31 'x', replicate 32 'y', replicate 33 'z', concat (replicate 40 "\955x"), replicate 600 'q']
+      -- two chunks with more characters than this between them stay two
+      th = Rope.threshold
+      pieces = ["", "a", "abc", "h\233llo w\246rld", "\8364\128512x\128512", "0123456789abcdef", replicate (th - 1) 'x', replicate th 'y', replicate (th + 1) 'z', concat (replicate 40 "\955x"), replicate 600 'q']
       base = map UText.pack pieces
       -- ropes with structure: built up piece by piece from either side, by
-      -- repetition, and cut
+      -- repetition, and cut; `chunky` is in chunks too big to be joined, so
+      -- it has the most levels for its size
       grown = [foldl (\acc i -> acc <> UText.pack (show i)) mempty [1 .. n :: Int] | n <- [5, 40, 300]]
       grownL = [foldl (\acc i -> UText.pack (show i) <> acc) mempty [1 .. n :: Int] | n <- [40, 300]]
       big = UText.replicate 2000 (UText.pack "a\233")
-      samples = base ++ grown ++ grownL ++ [big, UText.drop 7 big, UText.take 1500 big, UText.drop 100 (grown !! 2), UText.take 400 (grownL !! 1)]
+      chunky = foldl (\acc i -> acc <> UText.pack (take (th `div` 2 + 1) (drop (i `mod` 7) (cycle "0123456789\955abcdefghij")))) mempty [1 .. 260 :: Int]
+      samples = base ++ grown ++ grownL ++ [big, UText.drop 7 big, UText.take 1500 big, UText.drop 100 (grown !! 2), UText.take 400 (grownL !! 1), chunky, UText.drop 1000 chunky]
   arr <- newArray 4 first :: IO (MutableArray RealWorld Any)
-  put arr 1 (wrap (UText.appendUnbalanced abc (UText.pack "de")))
+  put arr 1 (wrap (UText.pack (replicate (th + 1) 'a') <> UText.pack (replicate (th + 1) 'b')))
   put arr 2 (wrap UText.empty)
-  ok <- textInit arr [lForeignInfo ls]
+  ok <- textInit arr [lForeignInfo ls, th]
   if ok /= 1
     then pure (Left ("the text constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
     else do
@@ -400,7 +409,7 @@ probeTexts ls = do
             put arr 0 (wrap t)
             shape <- textCheck arr
             size <- textTest arr 3 0
-            cuts <- forM ([-1 .. min n 70] ++ [n - 3 .. n + 1]) $ \k -> do
+            cuts <- forM ([-1 .. min n 70] ++ [(n * j) `div` 23 | j <- [1 .. 22], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
               put arr 0 (wrap t)
               h1 <- textTest arr 1 k
               r1 <- result
@@ -427,13 +436,82 @@ probeTexts ls = do
               [ if eq == (if a == b then 1 else 0) then Nothing else Just "Text equality differs from the interpreter's",
                 if h == 1 && r == Just (a <> b) then Nothing else Just ("Text.++ differs from the interpreter's on texts of " ++ show (UText.size a) ++ " and " ++ show (UText.size b) ++ " characters")
               ]
+          -- the longer test: random operations on eight texts
+          mix :: Int -> Int
+          mix z0 =
+            let z1 = (z0 `xor` (z0 `shiftR` 30)) * (-4658895280553007687)
+                z2 = (z1 `xor` (z1 `shiftR` 27)) * (-7723592293110705685)
+             in (z2 `xor` (z2 `shiftR` 31)) .&. maxBound
+          letters = cycle "abcd\233fghij\8364klmnop\128512qrstuvwxyz0123456789\955"
+          stress :: Int -> [UText.Text] -> IO (Either String ())
+          stress step pool
+            | step >= steps = pure (Right ())
+            | otherwise = do
+                let r k = mix (step * 16 + k)
+                    i = r 0 `mod` 8
+                    t = pool !! i
+                    e = pool !! (r 1 `mod` 8)
+                    n = UText.size t
+                    full = n <= 3000 || r 2 `mod` 16 == 0
+                    pos = case r 3 `mod` 4 of
+                      0 -> r 4 `mod` 12
+                      1 -> n - r 4 `mod` 12
+                      _ -> r 4 `mod` (n + 2) - 1
+                    op = r 5 `mod` 14
+                    piece k = UText.pack (take (r k `mod` (if even (r (k + 1)) then 7 else 90)) (drop (r (k + 2) `mod` 40) letters))
+                    -- what a helper built, if it is laid out right and is the expected text
+                    -- (the characters are compared when `whole`; the size always)
+                    verdict :: Bool -> Int -> UText.Text -> IO (Maybe UText.Text)
+                    verdict whole h expected = do
+                      got <- result
+                      pure $ case got of
+                        Just g | h == 1, UText.size g == UText.size expected, not whole || g == expected -> Just g
+                        _ -> Nothing
+                    cat whole a b = do
+                      put arr 0 (wrap a)
+                      put arr 1 (wrap b)
+                      h <- textTest arr 0 0
+                      verdict whole h (a <> b)
+                    cut whole tk k x = do
+                      put arr 0 (wrap x)
+                      h <- textTest arr (if tk then 1 else 2) k
+                      verdict whole h (if tk then (if k < 0 then x else UText.take k x) else (if k < 0 then UText.empty else UText.drop k x))
+                    same a b = do
+                      put arr 0 (wrap a)
+                      put arr 1 (wrap b)
+                      eq <- textTest arr 4 0
+                      pure (eq == (if a == b then 1 else 0))
+                    times :: Int -> (UText.Text -> IO (Maybe UText.Text)) -> UText.Text -> IO (Maybe UText.Text)
+                    times 0 _ x = pure (Just x)
+                    times k f x = f x >>= maybe (pure Nothing) (times (k - 1) f)
+                res <-
+                  if
+                    | op < 2 -> cat full t (piece 6)
+                    | op < 4 -> cat full (piece 6) t
+                    | op == 4 -> cut full True pos t
+                    | op == 5 -> cut full False pos t
+                    | op == 6 -> cut full False pos t >>= maybe (pure Nothing) (cut full True (r 6 `mod` 200))
+                    | op <= 8 -> if n + UText.size e > 60000 then cut full True (r 6 `mod` 50) t else cat full t e
+                    | op == 9 -> do
+                        -- the same text cut into chunks differently, and another text
+                        a <- same t (UText.take pos t <> UText.drop pos t)
+                        b <- same t e
+                        c <- if n > 0 then same t (UText.take (n - 1) t <> piece 9) else pure True
+                        pure (if a && b && c then Just t else Nothing)
+                    | op == 10 -> times (r 6 `mod` 100) (\x -> cat (n <= 300) x (piece 9)) t
+                    | op == 11 -> times (r 6 `mod` 100) (\x -> cat (n <= 300) (piece 9) x) t
+                    | op == 12 -> times (r 6 `mod` 100) (cut (n <= 300) False 1) t
+                    | otherwise -> times (r 6 `mod` 100) (\x -> cut (n <= 300) True (UText.size x - 1) x) t
+                case res of
+                  Nothing -> pure (Left ("the text helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a text of " ++ show n ++ " characters)"))
+                  Just t' -> stress (step + 1) (take i pool ++ [t'] ++ drop (i + 1) pool)
       e1 <- concat <$> mapM one samples
       -- equal texts cut into chunks differently must compare equal
       let recut t = UText.take 3 t <> UText.drop 3 t
       e2 <- concat <$> sequence ([two a b | a <- samples, b <- samples] ++ [two t (recut t) | t <- samples])
-      pure $ case e1 ++ e2 of
-        [] -> Right ()
-        e : _ -> Left e
+      case e1 ++ e2 of
+        e : _ -> pure (Left e)
+        [] -> if steps > 0 then stress 0 (replicate 8 UText.empty) else pure (Right ())
 
 -- | Partial applications: the helper for the @Name@ instruction against
 -- what the interpreter builds, for closures with and without arguments

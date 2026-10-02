@@ -86,6 +86,8 @@ data Config = Config
     -- | random operations to run through the list helpers at startup,
     -- each checked against the interpreter's (stress mode @lists=N@)
     stressLists :: Int,
+    -- | the same for the text helpers (stress mode @texts=N@)
+    stressTexts :: Int,
     -- | features turned off for debugging, from @UNISON_JIT_DISABLE@
     -- (comma separated): @app@ (closure calls), @apply@ (the interpreter
     -- entering native code for a closure), @ref@, @array@, @cmp@
@@ -136,6 +138,7 @@ config = unsafePerformIO $ do
         stressInstall = fromMaybe 0 (setting "install"),
         stressPool = setting "pool",
         stressLists = fromMaybe 0 (setting "lists"),
+        stressTexts = fromMaybe 0 (setting "texts"),
         statsEvery = fromMaybe 0 (every >>= readMaybe),
         disabled = disabledFeatures
       }

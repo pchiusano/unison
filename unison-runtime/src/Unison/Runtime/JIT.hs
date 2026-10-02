@@ -92,7 +92,7 @@ initJIT = do
           timed "list helper checks" (probeLists ls (stressLists config)) >>= \case
             Left e -> pure (Left e)
             Right () ->
-              timed "text helper checks" (probeTexts ls) >>= \case
+              timed "text helper checks" (probeTexts ls (stressTexts config)) >>= \case
                 Left e -> pure (Left e)
                 Right () -> fmap (const ls) <$> probeNames ls
       (offs, _) <- ctxLayout

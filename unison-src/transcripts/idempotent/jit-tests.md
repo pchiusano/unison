@@ -1296,8 +1296,22 @@ wide n =
     else go (acc + Text.size (Text.take 3 t)) (Text.drop 1 (t ++ "é€😀")) (i + 1)
   go 0 "λx" 0
 
+-- texts of many chunks appended to each other and cut in the middle
+weave : Nat -> Nat
+weave n =
+  go acc t i =
+    if i == n then acc + Text.size t
+    else
+      u = t ++ Nat.toText i ++ t
+      m = Text.size u / 3
+      mid = Text.take m (Text.drop m u)
+      same = Text.eq (Text.take m u ++ Text.drop m u) u
+      go (acc + Text.size mid + (if same then 1 else 0)) (if Text.size u > 100000 then mid else u) (i + 1)
+  go 0 (grow 100) 0
+
 > Text.size (grow 20000)
 > Text.size (growFront 3000)
+> weave 60
 > eat (grow 2000)
 > chop (growFront 500)
 > recut (grow 3000)
@@ -1313,35 +1327,40 @@ wide n =
   + grow      : Nat -> Text
   + growFront : Nat -> Text
   + recut     : Text -> Nat
+  + weave     : Nat -> Nat
   + wide      : Nat -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    45 | > Text.size (grow 20000)
+    58 | > Text.size (grow 20000)
            ⧩
            40000
 
-    46 | > Text.size (growFront 3000)
+    59 | > Text.size (growFront 3000)
            ⧩
            10890
 
-    47 | > eat (grow 2000)
+    60 | > weave 60
+           ⧩
+           2142964
+
+    61 | > eat (grow 2000)
            ⧩
            8002000
 
-    48 | > chop (growFront 500)
+    62 | > chop (growFront 500)
            ⧩
            1390
 
-    49 | > recut (grow 3000)
+    63 | > recut (grow 3000)
            ⧩
            858
 
-    50 | > wide 5000
+    64 | > wide 5000
            ⧩
            25001
 
-    51 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+    65 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
            ⧩
            (true, false, "ab", "bab", "", 0)
 ```

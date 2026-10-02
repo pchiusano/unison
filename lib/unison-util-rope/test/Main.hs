@@ -16,7 +16,7 @@ import Unison.Util.Deque (Deque)
 import Unison.Util.Deque qualified as D
 
 main :: IO ()
-main = run (tests [scope "util.deque" test, scope "util.rope2" RopeTests.test])
+main = run (tests [scope "util.deque" test, scope "util.rope" RopeTests.test])
 
 -- The deque's invariants hold and it has the same elements as the model.
 same :: (HasCallStack) => Deque Int -> Seq Int -> Test ()

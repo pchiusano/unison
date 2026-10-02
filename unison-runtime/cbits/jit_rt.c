@@ -515,7 +515,9 @@ static inline StgClosure *s_nth(StgClosure *l, StgInt k) {
 }
 
 // The node of a middle holding its leaf number i, and the leaf's offset in
-// the node (lookM). A full child of this level's nodes has 2^sh leaves.
+// the node (lookM). A full child of this level's nodes has 2^sh leaves; sh is
+// negative for a text's middle, where a node's size says nothing of its
+// children's.
 static StgClosure *mid_look(StgClosure *c, int sh, StgInt i, StgInt *off) {
   Lv v;
   lv_read(c, 0, &v);
@@ -533,9 +535,9 @@ static StgClosure *mid_look(StgClosure *c, int sh, StgInt i, StgInt *off) {
   StgInt i2 = i - v.ps;
   if (i2 < mid_size(v.m)) {
     StgInt o;
-    StgClosure *nn = mid_look(v.m, sh + 3, i2, &o);
+    StgClosure *nn = mid_look(v.m, sh < 0 ? sh : sh + 3, i2, &o);
     StgClosure **kids = node_kids(nn);
-    if (node_size(nn) == (StgInt)8 << (sh + 3) && node_arity(nn) == 8) { // all eight children full
+    if (sh >= 0 && node_size(nn) == (StgInt)8 << (sh + 3) && node_arity(nn) == 8) { // all eight children full
       *off = o & (((StgInt)1 << (sh + 3)) - 1);
       return kids[o >> (sh + 3)];
     }
@@ -1010,12 +1012,20 @@ static int con_nullary(StgClosure *c) {
   return it->type >= CONSTR && it->type <= CONSTR_NOCAF && it->layout.payload.ptrs == 0;
 }
 
+// Whether c is the same constructor without fields as ref. Not a comparison
+// of addresses: a constructor without fields has a static closure of its own,
+// but so does every top-level binding that is just that constructor (empty =
+// Nil), and which of them a piece of code refers to is up to the compiler.
+static inline int same_con0(StgClosure *c, StgClosure *ref) {
+  return LTAG(c) == LTAG(ref) && LUN(c)->header.info == LUN(ref)->header.info;
+}
+
 // the length of a digit's list, or -1 if it isn't one
 static StgInt check_slist(StgClosure *l) {
   StgInt len = 0;
   for (; LTAG(l) == 2; l = LP(l, 1), len++)
     if ((StgWord)LUN(l)->header.info != LF.scons_info || len > MAXD) return -1;
-  return l == LF.snil ? len : -1;
+  return same_con0(l, LF.snil) ? len : -1;
 }
 
 static int is_small_array(StgClosure *a) {
@@ -1061,7 +1071,7 @@ static StgInt check_digit(StgClosure *l, int depth, StgInt count, int64_t *kinds
 int64_t unison_jit_list_check(void **elems) {
   StgClosure *c = deque_of(settle(elems[0]));
   if (c == NULL) return -1;
-  if (LTAG(c) == 1) return c == LF.nil ? 0 : -1;
+  if (LTAG(c) == 1) return same_con0(c, LF.nil) ? 0 : -1;
   int64_t kinds = 1;
   StgInt sizes[64], befores[64];
   int depth = 0;
@@ -1080,7 +1090,7 @@ int64_t unison_jit_list_check(void **elems) {
     sizes[depth] = TSIZE(t), befores[depth] = a + b;
     StgClosure *m = LP(c, 1);
     if (LTAG(m) == 1) {
-      if (m != LF.mnil) return -1;
+      if (!same_con0(m, LF.mnil)) return -1;
       break;
     }
     // a level with a middle has an item in both digits
@@ -1211,29 +1221,37 @@ int64_t unison_jit_list_test(void **elems, int64_t op, int64_t arg, int64_t arg2
 // Text
 //
 // A Unison Text is a Unison.Util.Rope of chunks, held as Foreign (WrapText
-// rope). Like the list's deque it is strict throughout, so these helpers read
-// and build it directly. They are ports of the Haskell operations (the
-// Semigroup, Take and Drop instances in lib/unison-util-rope's Rope.hs and
-// the Chunk instances in Unison.Util.Text): same results, structure included.
+// rope). The rope is the list's finger tree with chunks for elements and
+// sizes counted in characters: its middle is the Deque's own Mid, so the
+// functions above that take top = 0 work on it as they are, and only the top
+// level, whose items are chunks, is written here. These helpers are ports of
+// the Haskell operations in lib/unison-util-rope's Rope.hs and the Chunk
+// instances in Unison.Util.Text, and take every case.
 //
-//   Rope: Empty (tag 1), One chunk (tag 2), Two size left right (tag 3;
-//         the pointers left and right, then the size)
+//   Rope: Empty (tag 1), One chunk (tag 2),
+//         Deep t ps pr m sf (tag 3): pointers pr, m, sf; words t, ps
 //   Chunk count (Text array offset length), unpacked: the pointer to the
 //         byte array, then the character count, byte offset and byte length
+//
+// t and ps are as in an MDeep, with characters for leaves. The rope's
+// invariants: no chunk is empty; a rope of one chunk is One; both digits of a
+// Deep have a chunk; two chunks next to each other have more than
+// ROPE_THRESHOLD characters between them.
 //
 // Checked at startup like the list layouts (unison_jit_text_init).
 
 typedef struct {
   StgWord foreign_info, wraptext_info, wraptext_tag;
-  StgWord one_info, two_info, chunk_info;
+  StgWord one_info, deep_info, chunk_info;
   StgClosure *empty; // Rope's Empty (tagged)
+  StgInt threshold;
 } TextFacts;
 static TextFacts TF;
 
 enum { CH_ARR, CH_COUNT, CH_OFF, CH_LEN };
-enum { TW_L, TW_R, TW_SZ };
-// the most characters two chunks may have between them to be merged into one (Rope.threshold)
-#define ROPE_THRESHOLD 32
+// the most characters two chunks may have between them to be made one
+// (Rope.threshold, handed to unison_jit_text_init)
+#define ROPE_THRESHOLD (TF.threshold)
 
 static inline StgClosure *rope_of(void *text) {
   if (LTAG(text) != 7 || (StgWord)LUN(text)->header.info != TF.foreign_info) return NULL;
@@ -1242,10 +1260,18 @@ static inline StgClosure *rope_of(void *text) {
   return LP(w, 0);
 }
 
+static inline StgInt chunk_size(StgClosure *c) { return LW(c, CH_COUNT); }
+
+// the fields of a Deep (which lv_read doesn't take: its tag isn't a list level's)
+static inline void rope_read(StgClosure *c, Lv *v) {
+  v->pr = LP(c, 0), v->m = LP(c, 1), v->sf = LP(c, 2);
+  v->t = LW(c, 3), v->ps = LW(c, 4);
+}
+
 static inline StgInt rope_size(StgClosure *r) {
   switch (LTAG(r)) {
-    case 2: return LW(LP(r, 0), CH_COUNT);
-    case 3: return LW(r, TW_SZ);
+    case 2: return chunk_size(LP(r, 0));
+    case 3: return TSIZE(LW(r, 3));
     default: return 0;
   }
 }
@@ -1254,31 +1280,46 @@ static inline const unsigned char *chunk_bytes(StgClosure *c) {
   return (const unsigned char *)((StgArrBytes *)LP(c, CH_ARR))->payload + LW(c, CH_OFF);
 }
 
-static inline StgClosure *new_two(UnisonJitCtx *ctx, StgClosure *l, StgClosure *r, StgInt sz) {
-  StgWord *p = list_alloc(ctx, 4);
-  p[0] = TF.two_info;
-  p[1 + TW_L] = (StgWord)l;
-  p[1 + TW_R] = (StgWord)r;
-  p[1 + TW_SZ] = sz;
-  return (StgClosure *)((StgWord)p | 3);
+// the characters under a list of chunks
+static inline StgInt s_sum_chunks(StgClosure *l) {
+  StgInt s = 0;
+  for (; IS_CONS(l); l = TAIL(l)) s += chunk_size(HEAD(l));
+  return s;
 }
 
-// One (Chunk count (Text arr off len)), or Empty for no characters
-static StgClosure *new_one(UnisonJitCtx *ctx, void *arr, StgInt count, StgInt off, StgInt len) {
-  if (count == 0) return TF.empty;
-  StgWord *p = list_alloc(ctx, 5 + 2);
+// --- building ---
+
+static inline StgClosure *new_chunk(UnisonJitCtx *ctx, void *arr, StgInt count, StgInt off, StgInt len) {
+  StgWord *p = list_alloc(ctx, 5);
   p[0] = TF.chunk_info;
   p[1 + CH_ARR] = (StgWord)arr;
   p[1 + CH_COUNT] = count;
   p[1 + CH_OFF] = off;
   p[1 + CH_LEN] = len;
-  p[5] = TF.one_info;
-  p[6] = (StgWord)p | 1;
-  return (StgClosure *)((StgWord)(p + 5) | 2);
+  return (StgClosure *)((StgWord)p | 1);
 }
 
-// One holding the two chunks' characters in a fresh byte array
-static StgClosure *merge_chunks(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) {
+static inline StgClosure *rope_one(UnisonJitCtx *ctx, StgClosure *chunk) {
+  StgWord *p = list_alloc(ctx, 2);
+  p[0] = TF.one_info;
+  p[1] = (StgWord)chunk;
+  return (StgClosure *)((StgWord)p | 2);
+}
+
+static inline StgClosure *rope_deep(UnisonJitCtx *ctx, StgInt t, StgInt ps, StgClosure *pr, StgClosure *m,
+                                    StgClosure *sf) {
+  StgWord *p = list_alloc(ctx, 6);
+  p[0] = TF.deep_info;
+  p[1] = (StgWord)pr;
+  p[2] = (StgWord)m;
+  p[3] = (StgWord)sf;
+  p[4] = (StgWord)t;
+  p[5] = (StgWord)ps;
+  return (StgClosure *)((StgWord)p | 3);
+}
+
+// the two chunks' characters as one chunk, in a fresh byte array
+static StgClosure *chunk_join(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) {
   StgInt la = LW(a, CH_LEN), lb = LW(b, CH_LEN);
   StgWord bytes = la + lb;
   StgArrBytes *arr = (StgArrBytes *)list_alloc(ctx, sizeofW(StgArrBytes) + ROUNDUP_BYTES_TO_WDS(bytes));
@@ -1286,86 +1327,7 @@ static StgClosure *merge_chunks(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b)
   arr->bytes = bytes;
   memcpy(arr->payload, chunk_bytes(a), la);
   memcpy((char *)arr->payload + la, chunk_bytes(b), lb);
-  return new_one(ctx, arr, LW(a, CH_COUNT) + LW(b, CH_COUNT), 0, bytes);
-}
-
-// size-balanced append, leaving the left tree as is (szl is its size)
-static StgClosure *rope_appendL(UnisonJitCtx *ctx, StgInt szl, StgClosure *l, StgClosure *r) {
-  if (szl == 0) return r;
-  switch (LTAG(r)) {
-    case 1: return l;
-    case 2: return new_two(ctx, l, r, szl + rope_size(r));
-    default: {
-      StgInt szr = LW(r, TW_SZ);
-      if (szl >= szr) return new_two(ctx, l, r, szl + szr);
-      StgClosure *l2 = rope_appendL(ctx, szl, l, LP(r, TW_L));
-      return new_two(ctx, l2, LP(r, TW_R), szl + szr);
-    }
-  }
-}
-
-// ... leaving the right tree as is
-static StgClosure *rope_appendR(UnisonJitCtx *ctx, StgClosure *l, StgInt szr, StgClosure *r) {
-  if (szr == 0) return l;
-  switch (LTAG(l)) {
-    case 1: return r;
-    case 2: return new_two(ctx, l, r, rope_size(l) + szr);
-    default: {
-      StgInt szl = LW(l, TW_SZ);
-      if (szr >= szl) return new_two(ctx, l, r, szl + szr);
-      StgClosure *r2 = rope_appendR(ctx, LP(l, TW_R), szr, r);
-      return new_two(ctx, LP(l, TW_L), r2, szl + szr);
-    }
-  }
-}
-
-// a one-chunk rope `one` (of sz0 characters) in front of a rope
-static StgClosure *rope_cons(UnisonJitCtx *ctx, StgInt sz0, StgClosure *one, StgClosure *as) {
-  switch (LTAG(as)) {
-    case 1: return one;
-    case 2: {
-      StgInt n = sz0 + rope_size(as);
-      return n <= ROPE_THRESHOLD ? merge_chunks(ctx, LP(one, 0), LP(as, 0)) : new_two(ctx, one, as, n);
-    }
-    default: {
-      StgInt sz = LW(as, TW_SZ);
-      if (sz0 >= sz) return new_two(ctx, one, as, sz0 + sz);
-      StgClosure *r = LP(as, TW_R);
-      return rope_appendR(ctx, rope_cons(ctx, sz0, one, LP(as, TW_L)), rope_size(r), r);
-    }
-  }
-}
-
-// ... or behind it
-static StgClosure *rope_snoc(UnisonJitCtx *ctx, StgClosure *as, StgInt szn, StgClosure *one) {
-  switch (LTAG(as)) {
-    case 1: return one;
-    case 2: {
-      StgInt n = rope_size(as) + szn;
-      return n <= ROPE_THRESHOLD ? merge_chunks(ctx, LP(as, 0), LP(one, 0)) : new_two(ctx, as, one, n);
-    }
-    default: {
-      StgInt sz = LW(as, TW_SZ);
-      if (szn >= sz) return new_two(ctx, as, one, sz + szn);
-      StgClosure *l = LP(as, TW_L);
-      return rope_appendL(ctx, rope_size(l), l, rope_snoc(ctx, LP(as, TW_R), szn, one));
-    }
-  }
-}
-
-static StgClosure *rope_append(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) {
-  if (LTAG(a) == 1) return b;
-  if (LTAG(b) == 1) return a;
-  if (LTAG(a) == 2) return rope_cons(ctx, rope_size(a), a, b);
-  if (LTAG(b) == 2) return rope_snoc(ctx, a, rope_size(b), b);
-  StgInt sz1 = LW(a, TW_SZ), sz2 = LW(b, TW_SZ);
-  if (sz1 * 2 >= sz2 && sz2 * 2 >= sz1) return new_two(ctx, a, b, sz1 + sz2);
-  if (sz1 > sz2) {
-    StgClosure *l1 = LP(a, TW_L);
-    return rope_appendL(ctx, rope_size(l1), l1, rope_append(ctx, LP(a, TW_R), b));
-  }
-  StgClosure *r2 = LP(b, TW_R);
-  return rope_appendR(ctx, rope_append(ctx, a, LP(b, TW_L)), rope_size(r2), r2);
+  return new_chunk(ctx, arr, chunk_size(a) + chunk_size(b), 0, bytes);
 }
 
 // the number of bytes the first k characters of UTF-8 text take
@@ -1375,44 +1337,337 @@ static inline StgInt utf8_prefix(const unsigned char *p, StgInt k) {
   return q - p;
 }
 
-static StgClosure *rope_drop(UnisonJitCtx *ctx, StgInt n, StgClosure *as) {
-  if (n <= 0) return as;
-  switch (LTAG(as)) {
-    case 1: return as;
+// the first k characters of a chunk, 0 < k < its size; and the rest
+static inline StgClosure *chunk_take(UnisonJitCtx *ctx, StgClosure *c, StgInt k) {
+  return new_chunk(ctx, LP(c, CH_ARR), k, LW(c, CH_OFF), utf8_prefix(chunk_bytes(c), k));
+}
+
+static inline StgClosure *chunk_drop(UnisonJitCtx *ctx, StgClosure *c, StgInt k) {
+  StgInt nb = utf8_prefix(chunk_bytes(c), k);
+  return new_chunk(ctx, LP(c, CH_ARR), chunk_size(c) - k, LW(c, CH_OFF) + nb, LW(c, CH_LEN) - nb);
+}
+
+// cnt chunks in order, at most a digit's worth, holding n characters (fromFwd)
+static StgClosure *rope_from_fwd(UnisonJitCtx *ctx, StgInt n, StgInt cnt, StgClosure *l) {
+  if (cnt == 0) return TF.empty;
+  if (cnt == 1) return rope_one(ctx, HEAD(l));
+  StgInt p = (cnt + 1) / 2;
+  StgClosure *pr = s_take(ctx, p, l);
+  return rope_deep(ctx, MK(n, p, cnt - p), s_sum_chunks(pr), pr, LF.mnil, s_rev_onto(ctx, s_drop(p, l), LF.snil));
+}
+
+// ... back to front (fromBwd)
+static StgClosure *rope_from_bwd(UnisonJitCtx *ctx, StgInt n, StgInt cnt, StgClosure *l) {
+  if (cnt == 0) return TF.empty;
+  if (cnt == 1) return rope_one(ctx, HEAD(l));
+  StgInt q = cnt / 2;
+  StgClosure *pr = s_rev_onto(ctx, s_drop(q, l), LF.snil);
+  return rope_deep(ctx, MK(n, cnt - q, q), s_sum_chunks(pr), pr, LF.mnil, s_take(ctx, q, l));
+}
+
+// A rope of n characters from the parts of a Deep, either of whose digits may
+// be empty (build): an empty digit takes a node from the middle, or half of
+// the other digit when there is no middle.
+static StgClosure *rope_build(UnisonJitCtx *ctx, StgInt n, StgInt pc, StgInt ps, StgClosure *pr, StgClosure *m,
+                              StgInt sc, StgClosure *sf) {
+  if (pc == 0) {
+    if (LTAG(m) != 2) return rope_from_bwd(ctx, n, sc, sf);
+    StgClosure *nd;
+    m = lv_uncons(ctx, 0, m, &nd);
+    pc = node_arity(nd), ps = node_size(nd), pr = kids_fwd(ctx, nd, 0);
+  }
+  if (sc == 0) {
+    if (LTAG(m) != 2) return rope_from_fwd(ctx, n, pc, pr);
+    StgClosure *nd;
+    m = lv_unsnoc(ctx, 0, m, &nd);
+    sc = node_arity(nd), sf = kids_rev(ctx, nd, sc);
+  }
+  return rope_deep(ctx, MK(n, pc, sc), ps, pr, m, sf);
+}
+
+// --- adding a chunk at an end (cons', snoc') ---
+
+// a chunk c of s characters in front of a rope
+static StgClosure *rope_cons(UnisonJitCtx *ctx, StgInt s, StgClosure *c, StgClosure *r) {
+  switch (LTAG(r)) {
+    case 1: return rope_one(ctx, c);
     case 2: {
-      StgClosure *c = LP(as, 0);
-      StgInt count = LW(c, CH_COUNT);
-      if (n >= count) return TF.empty;
-      StgInt nb = utf8_prefix(chunk_bytes(c), n);
-      return new_one(ctx, LP(c, CH_ARR), count - n, LW(c, CH_OFF) + nb, LW(c, CH_LEN) - nb);
+      StgClosure *a = LP(r, 0);
+      StgInt sa = chunk_size(a);
+      if (s + sa <= ROPE_THRESHOLD) return rope_one(ctx, chunk_join(ctx, c, a));
+      return rope_deep(ctx, MK(s + sa, 1, 1), s, scons(ctx, c, LF.snil), LF.mnil, scons(ctx, a, LF.snil));
     }
-    default: {
-      StgClosure *l = LP(as, TW_L), *r = LP(as, TW_R);
-      StgInt szl = rope_size(l);
-      if (n >= szl) return rope_drop(ctx, n - szl, r);
-      StgClosure *l2 = rope_drop(ctx, n, l); // the tree isn't rebalanced
-      return new_two(ctx, l2, r, rope_size(l2) + rope_size(r));
+  }
+  Lv v;
+  rope_read(r, &v);
+  StgClosure *f = HEAD(v.pr);
+  if (s + chunk_size(f) <= ROPE_THRESHOLD)
+    return rope_deep(ctx, v.t + (s << 8), v.ps + s, scons(ctx, chunk_join(ctx, c, f), TAIL(v.pr)), v.m, v.sf);
+  if (TPC(v.t) < MAXD) return rope_deep(ctx, v.t + (s << 8) + 1, v.ps + s, scons(ctx, c, v.pr), v.m, v.sf);
+  // a full prefix keeps its two outermost chunks and sheds the other eight
+  StgClosure *k[MAXD];
+  s_items(v.pr, k);
+  StgInt keep = chunk_size(k[0]) + chunk_size(k[1]);
+  StgClosure *m = lv_cons(ctx, 0, mk_na(ctx, v.ps - keep, k + 2, 8), v.m);
+  return rope_deep(ctx, v.t + (s << 8) - 7, s + keep, scons(ctx, c, s_from(ctx, k, 2, LF.snil)), m, v.sf);
+}
+
+// ... or behind it
+static StgClosure *rope_snoc(UnisonJitCtx *ctx, StgClosure *r, StgInt s, StgClosure *c) {
+  switch (LTAG(r)) {
+    case 1: return rope_one(ctx, c);
+    case 2: {
+      StgClosure *a = LP(r, 0);
+      StgInt sa = chunk_size(a);
+      if (sa + s <= ROPE_THRESHOLD) return rope_one(ctx, chunk_join(ctx, a, c));
+      return rope_deep(ctx, MK(sa + s, 1, 1), sa, scons(ctx, a, LF.snil), LF.mnil, scons(ctx, c, LF.snil));
     }
+  }
+  Lv v;
+  rope_read(r, &v);
+  StgClosure *l = HEAD(v.sf);
+  if (chunk_size(l) + s <= ROPE_THRESHOLD)
+    return rope_deep(ctx, v.t + (s << 8), v.ps, v.pr, v.m, scons(ctx, chunk_join(ctx, l, c), TAIL(v.sf)));
+  if (TSC(v.t) < MAXD) return rope_deep(ctx, v.t + (s << 8) + 0x10, v.ps, v.pr, v.m, scons(ctx, c, v.sf));
+  // the suffix runs back to front: s1, s2, then the eight to shed, last first
+  StgClosure *k[MAXD], *shed[8];
+  s_items(v.sf, k);
+  for (int i = 0; i < 8; i++) shed[i] = k[9 - i];
+  StgInt sz = TSIZE(v.t) - v.ps - mid_size(v.m) - chunk_size(k[0]) - chunk_size(k[1]);
+  StgClosure *m = lv_snoc(ctx, 0, v.m, mk_na(ctx, sz, shed, 8));
+  return rope_deep(ctx, v.t + (s << 8) - 0x70, v.ps, v.pr, m, scons(ctx, c, s_from(ctx, k, 2, LF.snil)));
+}
+
+// a Deep without its first chunk (uncons)
+static StgClosure *rope_tail(UnisonJitCtx *ctx, StgClosure *r) {
+  Lv v;
+  rope_read(r, &v);
+  StgInt s = chunk_size(HEAD(v.pr));
+  StgClosure *rest = TAIL(v.pr);
+  if (IS_CONS(rest)) return rope_deep(ctx, v.t - (s << 8) - 1, v.ps - s, rest, v.m, v.sf);
+  return rope_build(ctx, TSIZE(v.t) - s, 0, 0, LF.snil, v.m, TSC(v.t), v.sf);
+}
+
+// --- take and drop (takeR, dropR) ---
+//
+// The rope is cut between two chunks, by the list's code when the cut is in
+// the middle, and then the part of the chunk the cut falls in is added back
+// with snoc or cons, which joins it to its neighbour if the two are small.
+
+static StgClosure *rope_take(UnisonJitCtx *ctx, StgInt i, StgClosure *r) {
+  switch (LTAG(r)) {
+    case 1: return r;
+    case 2: {
+      StgClosure *c = LP(r, 0);
+      if (i <= 0) return TF.empty;
+      if (i >= chunk_size(c)) return r;
+      return rope_one(ctx, chunk_take(ctx, c, i));
+    }
+  }
+  Lv v;
+  rope_read(r, &v);
+  StgInt n = TSIZE(v.t), pc = TPC(v.t), sc = TSC(v.t), ms = mid_size(v.m);
+  if (i <= 0) return TF.empty;
+  if (i >= n) return r;
+  if (i <= v.ps) {
+    StgInt q = 0, sb = 0; // q whole chunks of the prefix, with sb characters, come before the cut
+    for (StgClosure *l = v.pr;; l = TAIL(l), q++) {
+      StgClosure *c = HEAD(l);
+      StgInt s = chunk_size(c);
+      if (sb + s < i) {
+        sb += s;
+        continue;
+      }
+      if (sb + s == i) return rope_from_fwd(ctx, i, q + 1, s_take(ctx, q + 1, v.pr));
+      StgClosure *whole = rope_from_fwd(ctx, sb, q, s_take(ctx, q, v.pr));
+      return rope_snoc(ctx, whole, i - sb, chunk_take(ctx, c, i - sb));
+    }
+  }
+  if (i <= v.ps + ms) {
+    StgClosure *nd;
+    StgInt k;
+    StgClosure *m2 = mid_take(ctx, v.m, i - v.ps, &nd, &k);
+    // the first k characters of the node are kept
+    StgClosure **kids = node_kids(nd);
+    StgInt q = 0, sb = 0;
+    for (;; q++) {
+      StgClosure *c = kids[q];
+      StgInt s = chunk_size(c);
+      if (sb + s < k) {
+        sb += s;
+        continue;
+      }
+      if (sb + s == k) return rope_build(ctx, i, pc, v.ps, v.pr, m2, q + 1, kids_rev(ctx, nd, q + 1));
+      StgClosure *whole = rope_build(ctx, i - (k - sb), pc, v.ps, v.pr, m2, q, kids_rev(ctx, nd, q));
+      return rope_snoc(ctx, whole, k - sb, chunk_take(ctx, c, k - sb));
+    }
+  }
+  StgInt d = n - i, cnt = sc; // d characters are to go from the back; cnt chunks of the suffix are left
+  for (StgClosure *l = v.sf;; l = TAIL(l), cnt--) {
+    StgClosure *c = HEAD(l);
+    StgInt s = chunk_size(c);
+    if (d >= s) {
+      d -= s;
+      continue;
+    }
+    if (d == 0) return rope_build(ctx, i, pc, v.ps, v.pr, v.m, cnt, l);
+    StgClosure *whole = rope_build(ctx, i - (s - d), pc, v.ps, v.pr, v.m, cnt - 1, TAIL(l));
+    return rope_snoc(ctx, whole, s - d, chunk_take(ctx, c, s - d));
   }
 }
 
-static StgClosure *rope_take(UnisonJitCtx *ctx, StgInt n, StgClosure *as) {
-  switch (LTAG(as)) {
-    case 1: return as;
+static StgClosure *rope_drop(UnisonJitCtx *ctx, StgInt i, StgClosure *r) {
+  switch (LTAG(r)) {
+    case 1: return r;
     case 2: {
-      StgClosure *c = LP(as, 0);
-      if (n <= 0) return TF.empty;
-      if (n >= LW(c, CH_COUNT)) return as;
-      return new_one(ctx, LP(c, CH_ARR), n, LW(c, CH_OFF), utf8_prefix(chunk_bytes(c), n));
+      StgClosure *c = LP(r, 0);
+      if (i <= 0) return r;
+      if (i >= chunk_size(c)) return TF.empty;
+      return rope_one(ctx, chunk_drop(ctx, c, i));
     }
-    default: {
-      StgClosure *l = LP(as, TW_L);
-      StgInt szl = rope_size(l);
-      if (n < szl) return rope_take(ctx, n, l);
-      if (n >= LW(as, TW_SZ)) return as;
-      StgClosure *r2 = rope_take(ctx, n - szl, LP(as, TW_R));
-      return new_two(ctx, l, r2, szl + rope_size(r2));
+  }
+  Lv v;
+  rope_read(r, &v);
+  StgInt n = TSIZE(v.t), pc = TPC(v.t), sc = TSC(v.t), ms = mid_size(v.m);
+  if (i <= 0) return r;
+  if (i >= n) return TF.empty;
+  StgInt left = n - i;
+  if (i >= v.ps + ms) {
+    StgInt q = 0, sa = 0; // q whole chunks of the suffix, with sa characters, come after the cut
+    for (StgClosure *l = v.sf;; l = TAIL(l), q++) {
+      StgClosure *c = HEAD(l);
+      StgInt s = chunk_size(c);
+      if (sa + s < left) {
+        sa += s;
+        continue;
+      }
+      if (sa + s == left) return rope_from_bwd(ctx, left, q + 1, s_take(ctx, q + 1, v.sf));
+      StgClosure *whole = rope_from_bwd(ctx, sa, q, s_take(ctx, q, v.sf));
+      return rope_cons(ctx, left - sa, chunk_drop(ctx, c, s - (left - sa)), whole);
     }
+  }
+  if (i >= v.ps) {
+    StgClosure *nd;
+    StgInt k;
+    StgClosure *m2 = mid_drop(ctx, v.m, i - v.ps, &nd, &k);
+    // the first k characters of the node go
+    StgClosure **kids = node_kids(nd);
+    StgInt arity = node_arity(nd), q = 0, sb = 0;
+    for (;; q++) {
+      StgClosure *c = kids[q];
+      StgInt s = chunk_size(c);
+      if (k >= sb + s) {
+        sb += s;
+        continue;
+      }
+      if (k == sb) return rope_build(ctx, left, arity - q, node_size(nd) - sb, kids_fwd(ctx, nd, q), m2, sc, v.sf);
+      StgClosure *whole = rope_build(ctx, left - (sb + s - k), arity - q - 1, node_size(nd) - sb - s,
+                                     kids_fwd(ctx, nd, q + 1), m2, sc, v.sf);
+      return rope_cons(ctx, sb + s - k, chunk_drop(ctx, c, k - sb), whole);
+    }
+  }
+  // k characters still to drop; the prefix has cnt chunks and psz characters left
+  StgInt k = i, cnt = pc, psz = v.ps;
+  for (StgClosure *l = v.pr;; l = TAIL(l)) {
+    StgClosure *c = HEAD(l);
+    StgInt s = chunk_size(c);
+    if (k >= s) {
+      k -= s, cnt--, psz -= s;
+      continue;
+    }
+    if (k == 0) return rope_build(ctx, left, cnt, psz, l, v.m, sc, v.sf);
+    StgClosure *whole = rope_build(ctx, left - (s - k), cnt - 1, psz - s, TAIL(l), v.m, sc, v.sf);
+    return rope_cons(ctx, s - k, chunk_drop(ctx, c, k), whole);
+  }
+}
+
+// --- append ---
+
+// If the two chunks that meet are small they are joined; then the digits that
+// end up inside are packed into nodes and handed to the list's append of two
+// middles.
+static StgClosure *rope_append(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) {
+  for (;;) {
+    if (LTAG(a) == 1) return b;
+    if (LTAG(b) == 1) return a;
+    if (LTAG(a) == 2) return rope_cons(ctx, rope_size(a), LP(a, 0), b);
+    if (LTAG(b) == 2) return rope_snoc(ctx, a, rope_size(b), LP(b, 0));
+    Lv x, y;
+    rope_read(a, &x);
+    rope_read(b, &y);
+    StgClosure *l = HEAD(x.sf), *f = HEAD(y.pr);
+    StgInt s = chunk_size(f);
+    if (chunk_size(l) + s <= ROPE_THRESHOLD) {
+      a = rope_deep(ctx, x.t + (s << 8), x.ps, x.pr, x.m, scons(ctx, chunk_join(ctx, l, f), TAIL(x.sf)));
+      b = rope_tail(ctx, b);
+      continue;
+    }
+    StgInt pc1 = TPC(x.t), sc1 = TSC(x.t), pc2 = TPC(y.t), sc2 = TSC(y.t);
+    StgInt n = TSIZE(x.t) + TSIZE(y.t), c = sc1 + pc2;
+    if (LTAG(x.m) != 2 && pc1 + c <= MAXD)
+      return rope_deep(ctx, MK(n, pc1 + c, sc2), TSIZE(x.t) + y.ps, s_append(ctx, x.pr, s_rev_onto(ctx, x.sf, y.pr)),
+                       y.m, y.sf);
+    if (LTAG(y.m) != 2 && c + sc2 <= MAXD)
+      return rope_deep(ctx, MK(n, pc1, c + sc2), x.ps, x.pr, x.m, s_append(ctx, y.sf, s_rev_onto(ctx, y.pr, x.sf)));
+    // the left suffix (back to front) and the right prefix, as nodes of eight
+    // while that leaves none or at least two for the next (packChunks)
+    StgClosure *items[2 * MAXD], *out[3];
+    StgInt at = sc1, no = 0;
+    for (StgClosure *p = x.sf; IS_CONS(p); p = TAIL(p)) items[--at] = HEAD(p);
+    s_items(y.pr, items + sc1);
+    for (StgInt done = 0; done < c;) {
+      StgInt left = c - done, k = left <= 8 ? left : left == 9 ? 5 : 8, sz = 0;
+      for (StgInt j = 0; j < k; j++) sz += chunk_size(items[done + j]);
+      out[no++] = mk_na(ctx, sz, items + done, k);
+      done += k;
+    }
+    StgInt sns = (TSIZE(x.t) - x.ps - mid_size(x.m)) + y.ps;
+    StgClosure *m = lv_append(ctx, 0, x.m, sns, out, no, y.m);
+    return rope_deep(ctx, MK(n, pc1, sc2), x.ps, x.pr, m, y.sf);
+  }
+}
+
+// --- finding the chunk that holds a character (chunkAt) ---
+
+// The chunk holding character i, 0 <= i < size, and i's offset in it.
+static StgClosure *rope_chunk_at(StgClosure *r, StgInt i, StgInt *off) {
+  if (LTAG(r) == 2) {
+    *off = i;
+    return LP(r, 0);
+  }
+  Lv v;
+  rope_read(r, &v);
+  if (i < v.ps) {
+    for (StgClosure *l = v.pr;; l = TAIL(l)) {
+      StgInt s = chunk_size(HEAD(l));
+      if (i < s) {
+        *off = i;
+        return HEAD(l);
+      }
+      i -= s;
+    }
+  }
+  StgInt i2 = i - v.ps;
+  if (i2 < mid_size(v.m)) {
+    StgInt o;
+    StgClosure *nd = mid_look(v.m, -1, i2, &o);
+    for (StgClosure **kids = node_kids(nd);; kids++) {
+      StgInt s = chunk_size(*kids);
+      if (o < s) {
+        *off = o;
+        return *kids;
+      }
+      o -= s;
+    }
+  }
+  StgInt back = TSIZE(v.t) - 1 - i; // characters after the one looked for
+  for (StgClosure *l = v.sf;; l = TAIL(l)) {
+    StgInt s = chunk_size(HEAD(l));
+    if (back < s) {
+      *off = s - 1 - back;
+      return HEAD(l);
+    }
+    back -= s;
   }
 }
 
@@ -1426,6 +1681,8 @@ static void *wrap_text(UnisonJitCtx *ctx, StgClosure *rope, void *same) {
   p[3] = (StgWord)p | TF.wraptext_tag;
   return (void *)((StgWord)(p + 2) | 7);
 }
+
+// --- the helpers generated code calls ---
 
 // Text.size, or -1 if the closure isn't a text.
 int64_t unison_jit_text_size(void *text) {
@@ -1452,61 +1709,31 @@ void *unison_jit_text_cut(UnisonJitCtx *ctx, void *text, int64_t n, int64_t take
   return wrap_text(ctx, n < 0 ? TF.empty : rope_drop(ctx, n, r), text);
 }
 
-// Walks the chunks of a rope in order, with an explicit stack.
-typedef struct {
-  StgClosure *stack[96];
-  int top;
-} RopeIter;
-
-static int rope_iter_start(RopeIter *it, StgClosure *r) {
-  it->top = 0;
-  it->stack[it->top++] = r;
-  return 1;
-}
-
-// the next chunk, NULL at the end; *deep is set if the stack overflowed
-static StgClosure *rope_iter_next(RopeIter *it, int *deep) {
-  while (it->top > 0) {
-    StgClosure *r = it->stack[--it->top];
-    switch (LTAG(r)) {
-      case 1: break;
-      case 2: return LP(r, 0);
-      default:
-        if (it->top + 2 > 96) {
-          *deep = 1;
-          return NULL;
-        }
-        it->stack[it->top++] = LP(r, TW_R);
-        it->stack[it->top++] = LP(r, TW_L);
-    }
-  }
-  return NULL;
-}
-
-// Text equality: 1 or 0, or -1 if a closure isn't a text (or a rope is too
-// deep for the walk here). Texts are equal when they have the same
-// characters, however they are cut into chunks; UTF-8 makes that the same bytes.
+// Text equality: 1 or 0, or -1 if a closure isn't a text. Texts are equal
+// when they have the same characters, however they are cut into chunks; UTF-8
+// makes that the same bytes. Each side is walked a chunk at a time, finding
+// the next chunk by its position.
 int64_t unison_jit_text_eq(void *x, void *y) {
   StgClosure *a = rope_of(x), *b = rope_of(y);
   if (a == NULL || b == NULL) return -1;
   if (a == b) return 1;
-  if (rope_size(a) != rope_size(b)) return 0;
-  RopeIter ia, ib;
-  int deep = 0;
-  rope_iter_start(&ia, a);
-  rope_iter_start(&ib, b);
+  StgInt n = rope_size(a);
+  if (n != rope_size(b)) return 0;
+  if (LTAG(a) == 2 && LTAG(b) == 2) {
+    StgClosure *ca = LP(a, 0), *cb = LP(b, 0);
+    return LW(ca, CH_LEN) == LW(cb, CH_LEN) && memcmp(chunk_bytes(ca), chunk_bytes(cb), LW(ca, CH_LEN)) == 0;
+  }
   const unsigned char *pa = NULL, *pb = NULL;
-  StgInt na = 0, nb = 0;
+  StgInt na = 0, nb = 0, ia = 0, ib = 0, off; // bytes left in each side's chunk; characters before the next one
   for (;;) {
-    if (na == 0) {
-      StgClosure *c = rope_iter_next(&ia, &deep);
-      if (c != NULL) pa = chunk_bytes(c), na = LW(c, CH_LEN);
+    if (na == 0 && ia < n) {
+      StgClosure *c = rope_chunk_at(a, ia, &off);
+      pa = chunk_bytes(c), na = LW(c, CH_LEN), ia += chunk_size(c);
     }
-    if (nb == 0) {
-      StgClosure *c = rope_iter_next(&ib, &deep);
-      if (c != NULL) pb = chunk_bytes(c), nb = LW(c, CH_LEN);
+    if (nb == 0 && ib < n) {
+      StgClosure *c = rope_chunk_at(b, ib, &off);
+      pb = chunk_bytes(c), nb = LW(c, CH_LEN), ib += chunk_size(c);
     }
-    if (deep) return -1;
     if (na == 0 || nb == 0) return na == nb;
     StgInt k = na < nb ? na : nb;
     if (memcmp(pa, pb, k) != 0) return 0;
@@ -1514,44 +1741,101 @@ int64_t unison_jit_text_eq(void *x, void *y) {
   }
 }
 
-// Checks a text's structure: every constructor's shape, the cached sizes, and
-// each chunk's character count against its bytes. 1 if all is as assumed.
-static StgInt check_rope(StgClosure *r, int depth) {
-  if (depth > 200) return -1;
-  switch (LTAG(r)) {
-    case 1: return r == TF.empty ? 0 : -1;
-    case 2: {
-      if ((StgWord)LUN(r)->header.info != TF.one_info) return -1;
-      StgClosure *c = LP(r, 0);
-      if (LTAG(c) != 1 || (StgWord)LUN(c)->header.info != TF.chunk_info) return -1;
-      StgArrBytes *arr = (StgArrBytes *)LP(c, CH_ARR);
-      StgInt off = LW(c, CH_OFF), len = LW(c, CH_LEN), count = LW(c, CH_COUNT);
-      if (arr->header.info != &stg_ARR_WORDS_info || off < 0 || len <= 0 || (StgWord)(off + len) > arr->bytes)
-        return -1;
-      if (utf8_prefix(chunk_bytes(c), count) != len) return -1;
-      return count;
-    }
-    case 3: {
-      if ((StgWord)LUN(r)->header.info != TF.two_info) return -1;
-      StgInt a = check_rope(LP(r, TW_L), depth + 1), b = check_rope(LP(r, TW_R), depth + 1);
-      return a < 0 || b < 0 || a + b != LW(r, TW_SZ) ? -1 : a + b;
-    }
-    default: return -1;
+// --- the startup checks ---
+
+// a chunk's character count, or -1 if it isn't laid out as assumed
+static StgInt check_chunk(StgClosure *c) {
+  if (LTAG(c) != 1 || (StgWord)LUN(c)->header.info != TF.chunk_info) return -1;
+  StgArrBytes *arr = (StgArrBytes *)LP(c, CH_ARR);
+  StgInt off = LW(c, CH_OFF), len = LW(c, CH_LEN), count = LW(c, CH_COUNT);
+  if (arr->header.info != &stg_ARR_WORDS_info || off < 0 || len <= 0 || (StgWord)(off + len) > arr->bytes) return -1;
+  return utf8_prefix(chunk_bytes(c), count) == len ? count : -1;
+}
+
+// the characters under a node `depth` levels down (1: its children are chunks), or -1
+static StgInt check_text_node(StgClosure *nd, int depth) {
+  if (LTAG(nd) != 2 || (StgWord)LUN(nd)->header.info != LF.na_info || !is_small_array(LP(nd, 0))) return -1;
+  StgInt arity = node_arity(nd), total = 0;
+  if (arity < 2 || arity > 8) return -1;
+  for (StgInt c = 0; c < arity; c++) {
+    StgClosure *kid = node_kids(nd)[c];
+    StgInt z = depth == 1 ? check_chunk(kid) : check_text_node(kid, depth - 1);
+    if (z < 0) return -1;
+    total += z;
   }
+  return total == LW(nd, 1) ? total : -1;
 }
 
+// a digit of a level `depth` down with the given count; its characters, or -1
+static StgInt check_text_digit(StgClosure *l, int depth, StgInt count) {
+  if (check_slist(l) != count) return -1;
+  StgInt total = 0;
+  for (; LTAG(l) == 2; l = LP(l, 1)) {
+    StgInt z = depth == 0 ? check_chunk(HEAD(l)) : check_text_node(HEAD(l), depth);
+    if (z < 0) return -1;
+    total += z;
+  }
+  return total;
+}
+
+// Checks a text's structure: every constructor's shape, the counts and sizes
+// at every level, each chunk's character count against its bytes, and the
+// rope's invariants. 1 if all is as assumed.
 int64_t unison_jit_text_check(void **elems) {
-  StgClosure *r = rope_of(elems[0]);
-  return r != NULL && check_rope(r, 0) >= 0;
+  StgClosure *r = rope_of(settle(elems[0]));
+  if (r == NULL) return 0;
+  if (LTAG(r) == 1) return same_con0(r, TF.empty);
+  if (LTAG(r) == 2) return (StgWord)LUN(r)->header.info == TF.one_info && check_chunk(LP(r, 0)) > 0;
+  StgClosure *c = r;
+  StgInt sizes[64], befores[64], inner = 0;
+  int depth = 0;
+  for (;; depth++) {
+    if (depth >= 64) return 0;
+    if (depth == 0 ? (StgWord)LUN(c)->header.info != TF.deep_info || !con_is(c, 3, 3, 2)
+                   : (StgWord)LUN(c)->header.info != LF.mdeep_info || !con_is(c, 2, 3, 2))
+      return 0;
+    StgInt t = LW(c, 3);
+    StgInt a = check_text_digit(LP(c, 0), depth, TPC(t)), b = check_text_digit(LP(c, 2), depth, TSC(t));
+    if (a < 0 || b < 0 || TSIZE(t) <= 0 || LW(c, 4) != a) return 0;
+    sizes[depth] = TSIZE(t), befores[depth] = a + b;
+    StgClosure *m = LP(c, 1);
+    // the top level always has a chunk in both digits; a level below, when it has a middle
+    if ((depth == 0 || LTAG(m) != 1) && (TPC(t) == 0 || TSC(t) == 0)) return 0;
+    if (LTAG(m) == 1) {
+      if (!same_con0(m, LF.mnil)) return 0;
+      break;
+    }
+    c = m;
+  }
+  for (; depth >= 0; depth--) {
+    if (sizes[depth] != befores[depth] + inner) return 0;
+    inner = sizes[depth];
+  }
+  // no two chunks next to each other are small enough to be one
+  StgInt n = rope_size(r), prev = ROPE_THRESHOLD + 1, off;
+  for (StgInt i = 0; i < n;) {
+    StgClosure *ch = rope_chunk_at(r, i, &off);
+    StgInt s = chunk_size(ch);
+    if (off != 0 || prev + s <= ROPE_THRESHOLD) return 0;
+    prev = s, i += s;
+  }
+  return 1;
 }
 
-// Learns the constructors from samples: elems[0] is the text "abc" in one
-// chunk, elems[1] the same appended (unbalanced) to "de", elems[2] the empty
-// text. info[0] is Foreign's info pointer. Returns 1, or the number of the
-// check that failed.
-int64_t unison_jit_text_init(void **elems, int64_t *info) {
+// Learns the constructors from samples: elems[0] is the text "abc", elems[1]
+// two pieces of one character more than the threshold appended, which is a
+// Deep with one chunk in each digit, elems[2] the empty text. info[0] is
+// Foreign's info pointer and info[1] Rope.threshold. The
+// constructors of the digits and of the levels below are the list's
+// (unison_jit_list_init has run). Returns 1, or the number of the check that
+// failed.
+int64_t unison_jit_text_init(void **raw, int64_t *info) {
+  void *elems[3] = {settle(raw[0]), settle(raw[1]), settle(raw[2])};
   memset(&TF, 0, sizeof TF);
   TF.foreign_info = info[0];
+  TF.threshold = info[1];
+  if (TF.threshold < 1) return 14;
+  StgInt piece = TF.threshold + 1;
   StgClosure *f = elems[0];
   if (LTAG(f) != 7 || (StgWord)LUN(f)->header.info != TF.foreign_info) return 2;
   StgClosure *w = LP(f, 0);
@@ -1572,11 +1856,14 @@ int64_t unison_jit_text_init(void **elems, int64_t *info) {
   if (LW(c, CH_COUNT) != 3 || LW(c, CH_LEN) != 3 || LW(c, CH_OFF) < 0 || (StgWord)(LW(c, CH_OFF) + 3) > arr->bytes)
     return 7;
   if (memcmp(chunk_bytes(c), "abc", 3) != 0) return 8;
-  StgClosure *two = rope_of(elems[1]);
-  if (two == NULL || !con_is(two, 3, 2, 1)) return 9;
-  TF.two_info = (StgWord)LUN(two)->header.info;
-  if (LW(two, TW_SZ) != 5 || !con_is(LP(two, TW_L), 2, 1, 0) || !con_is(LP(two, TW_R), 2, 1, 0)) return 10;
-  if (LW(LP(LP(two, TW_L), 0), CH_COUNT) != 3 || LW(LP(LP(two, TW_R), 0), CH_COUNT) != 2) return 11;
+  StgClosure *deep = rope_of(elems[1]);
+  if (deep == NULL || !con_is(deep, 3, 3, 2)) return 9;
+  TF.deep_info = (StgWord)LUN(deep)->header.info;
+  if (LW(deep, 3) != MK(2 * piece, 1, 1) || LW(deep, 4) != piece) return 10;
+  StgClosure *pr = LP(deep, 0), *sf = LP(deep, 2);
+  if (!same_con0(LP(deep, 1), LF.mnil) || check_slist(pr) != 1 || check_slist(sf) != 1) return 11;
+  if (!con_is(HEAD(pr), 1, 1, 3) || LW(HEAD(pr), CH_COUNT) != piece || LW(HEAD(sf), CH_COUNT) != piece)
+    return 13;
   StgClosure *e = rope_of(elems[2]);
   if (e == NULL || !con_nullary(e)) return 12;
   TF.empty = e;
@@ -1590,12 +1877,13 @@ int64_t unison_jit_text_test(void **elems, int64_t op, int64_t arg) {
   UnisonJitCtx tmp = {0}, *ctx = &tmp;
   ctx->cap = rts_unsafeGetMyCapability();
   void *res = NULL;
+  void *e0 = settle(elems[0]), *e1 = settle(elems[1]);
   switch (op) {
-    case 0: res = unison_jit_text_append(ctx, elems[0], elems[1]); break;
-    case 1: res = unison_jit_text_cut(ctx, elems[0], arg, 1); break;
-    case 2: res = unison_jit_text_cut(ctx, elems[0], arg, 0); break;
-    case 3: return unison_jit_text_size(elems[0]);
-    case 4: return unison_jit_text_eq(elems[0], elems[1]);
+    case 0: res = unison_jit_text_append(ctx, e0, e1); break;
+    case 1: res = unison_jit_text_cut(ctx, e0, arg, 1); break;
+    case 2: res = unison_jit_text_cut(ctx, e0, arg, 0); break;
+    case 3: return unison_jit_text_size(e0);
+    case 4: return unison_jit_text_eq(e0, e1);
   }
   if (res == NULL) return 0;
   elems[3] = res;
