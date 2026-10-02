@@ -55,41 +55,85 @@ import qualified GHC.Exts as Exts
 data SList a = SNil | SCons !a !(SList a)
 
 -- A node's first field is the number of leaves under it.  Digits that fill
--- up make nodes of eight; 'append' also makes nodes of three and two.
+-- up make nodes of eight; 'append' makes the smaller ones.
 data Node a
   = N8 !Int !a !a !a !a !a !a !a !a
+  | N7 !Int !a !a !a !a !a !a !a
+  | N6 !Int !a !a !a !a !a !a
+  | N5 !Int !a !a !a !a !a
+  | N4 !Int !a !a !a !a
   | N3 !Int !a !a !a
   | N2 !Int !a !a
 
 nodeSize :: Node a -> Int
 nodeSize (N8 n _ _ _ _ _ _ _ _) = n
-nodeSize (N3 n _ _ _)           = n
-nodeSize (N2 n _ _)             = n
+nodeSize (N7 n _ _ _ _ _ _ _) = n
+nodeSize (N6 n _ _ _ _ _ _) = n
+nodeSize (N5 n _ _ _ _ _) = n
+nodeSize (N4 n _ _ _ _) = n
+nodeSize (N3 n _ _ _) = n
+nodeSize (N2 n _ _) = n
 {-# INLINE nodeSize #-}
 
 nodeArity :: Node a -> Int
 nodeArity (N8 {}) = 8
+nodeArity (N7 {}) = 7
+nodeArity (N6 {}) = 6
+nodeArity (N5 {}) = 5
+nodeArity (N4 {}) = 4
 nodeArity (N3 {}) = 3
 nodeArity (N2 {}) = 2
 {-# INLINE nodeArity #-}
 
 -- a node's children in sequence order, and in reverse
 nodeToFwd, nodeToBwd :: Node a -> SList a
-nodeToFwd (N8 _ a b c d e f g h) =
-  SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h SNil)))))))
+nodeToFwd (N8 _ a b c d e f g h) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h SNil)))))))
+nodeToFwd (N7 _ a b c d e f g) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g SNil))))))
+nodeToFwd (N6 _ a b c d e f) = SCons a (SCons b (SCons c (SCons d (SCons e (SCons f SNil)))))
+nodeToFwd (N5 _ a b c d e) = SCons a (SCons b (SCons c (SCons d (SCons e SNil))))
+nodeToFwd (N4 _ a b c d) = SCons a (SCons b (SCons c (SCons d SNil)))
 nodeToFwd (N3 _ a b c) = SCons a (SCons b (SCons c SNil))
-nodeToFwd (N2 _ a b)   = SCons a (SCons b SNil)
-nodeToBwd (N8 _ a b c d e f g h) =
-  SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil)))))))
+nodeToFwd (N2 _ a b) = SCons a (SCons b SNil)
+nodeToBwd (N8 _ a b c d e f g h) = SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil)))))))
+nodeToBwd (N7 _ a b c d e f g) = SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil))))))
+nodeToBwd (N6 _ a b c d e f) = SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil)))))
+nodeToBwd (N5 _ a b c d e) = SCons e (SCons d (SCons c (SCons b (SCons a SNil))))
+nodeToBwd (N4 _ a b c d) = SCons d (SCons c (SCons b (SCons a SNil)))
 nodeToBwd (N3 _ a b c) = SCons c (SCons b (SCons a SNil))
-nodeToBwd (N2 _ a b)   = SCons b (SCons a SNil)
+nodeToBwd (N2 _ a b) = SCons b (SCons a SNil)
 
 -- the k-th child (0-based)
 nodeAt :: Int -> Node a -> a
-nodeAt k (N8 _ a b c d e f g h) = case k of
-  0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; 6 -> g; _ -> h
+nodeAt k (N8 _ a b c d e f g h) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; 6 -> g; _ -> h }
+nodeAt k (N7 _ a b c d e f g) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; 5 -> f; _ -> g }
+nodeAt k (N6 _ a b c d e f) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; 4 -> e; _ -> f }
+nodeAt k (N5 _ a b c d e) = case k of { 0 -> a; 1 -> b; 2 -> c; 3 -> d; _ -> e }
+nodeAt k (N4 _ a b c d) = case k of { 0 -> a; 1 -> b; 2 -> c; _ -> d }
 nodeAt k (N3 _ a b c) = case k of { 0 -> a; 1 -> b; _ -> c }
-nodeAt k (N2 _ a b)   = case k of { 0 -> a; _ -> b }
+nodeAt k (N2 _ a b) = case k of { 0 -> a; _ -> b }
+
+-- a node of the first k items of a list, and the rest of the list; the
+-- items are leaves
+leafNode :: Int -> SList a -> (# Node a, SList a #)
+leafNode 8 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) = (# N8 8 a b c d e f g h, r #)
+leafNode 7 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g r))))))) = (# N7 7 a b c d e f g, r #)
+leafNode 6 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f r)))))) = (# N6 6 a b c d e f, r #)
+leafNode 5 (SCons a (SCons b (SCons c (SCons d (SCons e r))))) = (# N5 5 a b c d e, r #)
+leafNode 4 (SCons a (SCons b (SCons c (SCons d r)))) = (# N4 4 a b c d, r #)
+leafNode 3 (SCons a (SCons b (SCons c r))) = (# N3 3 a b c, r #)
+leafNode 2 (SCons a (SCons b r)) = (# N2 2 a b, r #)
+leafNode _ _ = error "Deque2: short list"
+
+-- the same where the items are nodes
+innerNode :: Int -> SList (Node a) -> (# Node (Node a), SList (Node a) #)
+innerNode 8 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) = (# N8 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h) a b c d e f g h, r #)
+innerNode 7 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g r))))))) = (# N7 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g) a b c d e f g, r #)
+innerNode 6 (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f r)))))) = (# N6 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f) a b c d e f, r #)
+innerNode 5 (SCons a (SCons b (SCons c (SCons d (SCons e r))))) = (# N5 (nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e) a b c d e, r #)
+innerNode 4 (SCons a (SCons b (SCons c (SCons d r)))) = (# N4 (nodeSize a + nodeSize b + nodeSize c + nodeSize d) a b c d, r #)
+innerNode 3 (SCons a (SCons b (SCons c r))) = (# N3 (nodeSize a + nodeSize b + nodeSize c) a b c, r #)
+innerNode 2 (SCons a (SCons b r)) = (# N2 (nodeSize a + nodeSize b) a b, r #)
+innerNode _ _ = error "Deque2: short list"
 
 -- the first k children, back to front
 nodeTakeRev :: Int -> Node a -> SList a
@@ -287,8 +331,7 @@ unconsSlow t m sf = case unconsM m of
   (# nd, m' #) -> case nd of
     N8 _ a b c d e f g h ->
       Just (a, Deep (t - 0x100 + 7) (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h SNil))))))) m' sf)
-    N3 _ a b c -> Just (a, Deep (t - 0x100 + 2) (SCons b (SCons c SNil)) m' sf)
-    N2 _ a b   -> Just (a, Deep (t - 0x100 + 1) (SCons b SNil) m' sf)
+    _ -> Just (nodeAt 0 nd, Deep (t - 0x100 + (nodeArity nd - 1)) (nodeDropFwd 1 nd) m' sf)
 {-# NOINLINE unconsSlow #-}
 
 unsnocSlow :: Int -> SList a -> Mid a -> Maybe (Deque a, a)
@@ -307,8 +350,8 @@ unsnocSlow t pr m = case unsnocM m of
   (# m', nd #) -> case nd of
     N8 _ a b c d e f g h ->
       Just (Deep (t - 0x100 + 0x70) pr m' (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a SNil))))))), h)
-    N3 _ a b c -> Just (Deep (t - 0x100 + 0x20) pr m' (SCons b (SCons a SNil)), c)
-    N2 _ a b   -> Just (Deep (t - 0x100 + 0x10) pr m' (SCons a SNil), b)
+    _ -> let !k = nodeArity nd - 1
+         in Just (Deep (t - 0x100 + (k `unsafeShiftL` 4)) pr m' (nodeTakeRev k nd), nodeAt k nd)
 {-# NOINLINE unsnocSlow #-}
 
 -- the first node and the rest; the argument is not empty
@@ -408,7 +451,10 @@ childAt !sh !off nn
   | nodeSize nn == 8 `unsafeShiftL` sh =
       case off .&. ((1 `unsafeShiftL` sh) - 1) of
         I# o# -> (# nodeAt (off `unsafeShiftR` sh) nn, o# #)
-  | otherwise = scanFwd off (nodeToFwd nn)
+  | otherwise = go 0 off
+  where go !i !o = let !c = nodeAt i nn
+                       !s = nodeSize c
+                   in if o < s then (case o of I# o# -> (# c, o# #)) else go (i + 1) (o - s)
 
 ------------------------------------------------------------------------
 -- take and drop.  The cut falls in a prefix, in a suffix, or in the middle;
@@ -549,6 +595,8 @@ append :: Deque a -> Deque a -> Deque a
 append Nil b = b
 append a Nil = a
 append a@(Deep t1 pr1 m1 sf1) b@(Deep t2 pr2 m2 sf2) = case m1 of
+  MNil | MNil <- m2, tsc t1 + tsize t2 <= maxD ->
+    Deep (mk n (tpc t1) (tsc t1 + tsize t2)) pr1 MNil (appendS sf2 (revOnto pr2 sf1))
   MNil ->
     let !c = tsize t1 + tpc t2
         !f = appendS pr1 (revOnto sf1 pr2)
@@ -659,36 +707,21 @@ appM a@(MDeep t1 ps1 pr1 m1 sf1) ns b@(MDeep t2 ps2 pr2 m2 sf2) = case m1 of
         !n = tsize t1 + sns + tsize t2
 
 -- c items, front to back, as nodes: eights while that leaves none or at
--- least two, then threes and twos.  c is not 1.
+-- least two, then one node of what is left (nine make a five and a four).
+-- c is not 1.
 packLeaves :: Int -> SList a -> SList (Node a)
 packLeaves c l
-  | c == 8 || c >= 10 = case l of
-      SCons a (SCons b (SCons c' (SCons d (SCons e (SCons f (SCons g (SCons h r))))))) ->
-        SCons (N8 8 a b c' d e f g h) (packLeaves (c - 8) r)
-      _ -> error "Deque2.append: short list"
   | c == 0 = SNil
-  | c == 2 || c == 4 = case l of
-      SCons a (SCons b r) -> SCons (N2 2 a b) (packLeaves (c - 2) r)
-      _ -> error "Deque2.append: short list"
-  | otherwise = case l of
-      SCons a (SCons b (SCons c' r)) -> SCons (N3 3 a b c') (packLeaves (c - 3) r)
-      _ -> error "Deque2.append: short list"
+  | c == 9 = case leafNode 5 l of (# x, r #) -> case leafNode 4 r of (# y, _ #) -> SCons x (SCons y SNil)
+  | c <= 8 = case leafNode c l of (# x, _ #) -> SCons x SNil
+  | otherwise = case leafNode 8 l of (# x, r #) -> SCons x (packLeaves (c - 8) r)
 
 packNodes :: Int -> SList (Node a) -> SList (Node (Node a))
 packNodes c l
-  | c == 8 || c >= 10 = case l of
-      SCons a (SCons b (SCons c' (SCons d (SCons e (SCons f (SCons g (SCons h r))))))) ->
-        let !s = nodeSize a + nodeSize b + nodeSize c' + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-        in SCons (N8 s a b c' d e f g h) (packNodes (c - 8) r)
-      _ -> error "Deque2.append: short list"
   | c == 0 = SNil
-  | c == 2 || c == 4 = case l of
-      SCons a (SCons b r) -> SCons (N2 (nodeSize a + nodeSize b) a b) (packNodes (c - 2) r)
-      _ -> error "Deque2.append: short list"
-  | otherwise = case l of
-      SCons a (SCons b (SCons c' r)) ->
-        SCons (N3 (nodeSize a + nodeSize b + nodeSize c') a b c') (packNodes (c - 3) r)
-      _ -> error "Deque2.append: short list"
+  | c == 9 = case innerNode 5 l of (# x, r #) -> case innerNode 4 r of (# y, _ #) -> SCons x (SCons y SNil)
+  | c <= 8 = case innerNode c l of (# x, _ #) -> SCons x SNil
+  | otherwise = case innerNode 8 l of (# x, r #) -> SCons x (packNodes (c - 8) r)
 
 ------------------------------------------------------------------------
 -- Lists
@@ -698,7 +731,18 @@ toList :: Deque a -> [a]
 toList = foldrI (:) []
 
 fromList :: [a] -> Deque a
-fromList xs = fromListN (L.length xs) xs
+fromList xs = case shortL 0 xs of
+  (# n#, pl #) | n <= maxD -> if n == 0 then Nil else Deep (mk n n 0) pl MNil SNil
+               | otherwise -> fromListN (L.length xs) xs
+    where n = I# n#
+
+-- the length of a list and its items, if there are at most maxD; a larger
+-- number otherwise
+shortL :: Int -> [a] -> (# Int#, SList a #)
+shortL (I# k#) [] = (# k#, SNil #)
+shortL k (y : ys)
+  | k >= maxD = case k + 1 of I# k# -> (# k#, SNil #)
+  | otherwise = case shortL (k + 1) ys of (# n#, l #) -> (# n#, SCons y l #)
 
 -- | 'fromList' for a list whose length is known.  O(n).  Builds the levels
 -- directly: each gets a prefix of two to nine items and a suffix of five, and
@@ -776,9 +820,13 @@ foldrI f z (Deep _ pr m sf) = foldrS f (foldrM (\nd acc -> foldrNodeI f nd acc) 
 {-# INLINE foldrI #-}
 
 foldrNodeI :: (a -> r -> r) -> Node a -> r -> r
-foldrNodeI f (N8 _ a b c d e g h i) z = f a (f b (f c (f d (f e (f g (f h (f i z)))))))
-foldrNodeI f (N3 _ a b c) z = f a (f b (f c z))
-foldrNodeI f (N2 _ a b) z = f a (f b z)
+foldrNodeI fn (N8 _ a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
+foldrNodeI fn (N7 _ a b c d e f g) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g z))))))
+foldrNodeI fn (N6 _ a b c d e f) z = fn a (fn b (fn c (fn d (fn e (fn f z)))))
+foldrNodeI fn (N5 _ a b c d e) z = fn a (fn b (fn c (fn d (fn e z))))
+foldrNodeI fn (N4 _ a b c d) z = fn a (fn b (fn c (fn d z)))
+foldrNodeI fn (N3 _ a b c) z = fn a (fn b (fn c z))
+foldrNodeI fn (N2 _ a b) z = fn a (fn b z)
 {-# INLINE foldrNodeI #-}
 
 foldrM :: (Node a -> r -> r) -> r -> Mid a -> r
@@ -795,9 +843,13 @@ foldrRev f = go where go acc SNil = acc
                       go acc (SCons x r) = go (f x acc) r
 
 foldrNode :: (a -> r -> r) -> Node a -> r -> r
-foldrNode f (N8 _ a b c d e g h i) z = f a (f b (f c (f d (f e (f g (f h (f i z)))))))
-foldrNode f (N3 _ a b c) z = f a (f b (f c z))
-foldrNode f (N2 _ a b) z = f a (f b z)
+foldrNode fn (N8 _ a b c d e f g h) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g (fn h z)))))))
+foldrNode fn (N7 _ a b c d e f g) z = fn a (fn b (fn c (fn d (fn e (fn f (fn g z))))))
+foldrNode fn (N6 _ a b c d e f) z = fn a (fn b (fn c (fn d (fn e (fn f z)))))
+foldrNode fn (N5 _ a b c d e) z = fn a (fn b (fn c (fn d (fn e z))))
+foldrNode fn (N4 _ a b c d) z = fn a (fn b (fn c (fn d z)))
+foldrNode fn (N3 _ a b c) z = fn a (fn b (fn c z))
+foldrNode fn (N2 _ a b) z = fn a (fn b z)
 
 foldlD' :: (r -> a -> r) -> r -> Deque a -> r
 foldlD' _ !z Nil = z
@@ -817,11 +869,13 @@ foldlRev f !z = go where go SNil = z
                          go (SCons x r) = let !a = go r in f a x
 
 foldlNode :: (r -> a -> r) -> r -> Node a -> r
-foldlNode f !z (N8 _ a b c d e g h i) =
-  let !z1 = f z a; !z2 = f z1 b; !z3 = f z2 c; !z4 = f z3 d; !z5 = f z4 e; !z6 = f z5 g; !z7 = f z6 h
-  in f z7 i
-foldlNode f !z (N3 _ a b c) = let !z1 = f z a; !z2 = f z1 b in f z2 c
-foldlNode f !z (N2 _ a b) = let !z1 = f z a in f z1 b
+foldlNode fn !z (N8 _ a b c d e f g h) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e; !z6 = fn z5 f; !z7 = fn z6 g in fn z7 h
+foldlNode fn !z (N7 _ a b c d e f g) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e; !z6 = fn z5 f in fn z6 g
+foldlNode fn !z (N6 _ a b c d e f) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d; !z5 = fn z4 e in fn z5 f
+foldlNode fn !z (N5 _ a b c d e) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c; !z4 = fn z3 d in fn z4 e
+foldlNode fn !z (N4 _ a b c d) = let !z1 = fn z a; !z2 = fn z1 b; !z3 = fn z2 c in fn z3 d
+foldlNode fn !z (N3 _ a b c) = let !z1 = fn z a; !z2 = fn z1 b in fn z2 c
+foldlNode fn !z (N2 _ a b) = let !z1 = fn z a in fn z1 b
 
 ------------------------------------------------------------------------
 -- Mapping keeps the shape
@@ -840,9 +894,13 @@ mapS f = go where go SNil = SNil
 {-# INLINE mapS #-}
 
 mapNode :: (a -> b) -> Node a -> Node b
-mapNode f (N8 n a b c d e g h i) = N8 n (f a) (f b) (f c) (f d) (f e) (f g) (f h) (f i)
-mapNode f (N3 n a b c) = N3 n (f a) (f b) (f c)
-mapNode f (N2 n a b) = N2 n (f a) (f b)
+mapNode fn (N8 n a b c d e f g h) = N8 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f) (fn g) (fn h)
+mapNode fn (N7 n a b c d e f g) = N7 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f) (fn g)
+mapNode fn (N6 n a b c d e f) = N6 n (fn a) (fn b) (fn c) (fn d) (fn e) (fn f)
+mapNode fn (N5 n a b c d e) = N5 n (fn a) (fn b) (fn c) (fn d) (fn e)
+mapNode fn (N4 n a b c d) = N4 n (fn a) (fn b) (fn c) (fn d)
+mapNode fn (N3 n a b c) = N3 n (fn a) (fn b) (fn c)
+mapNode fn (N2 n a b) = N2 n (fn a) (fn b)
 {-# INLINE mapNode #-}
 
 ------------------------------------------------------------------------
