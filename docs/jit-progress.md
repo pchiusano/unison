@@ -858,7 +858,7 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   list, and `seq` before storing it left a reference to the unevaluated constant in the
   array. Samples are now evaluated with `evaluate`. The fast build never showed this, so
   **run the test matrix's first few configurations on the optimized build too** before
-  believing a benchmark, and check the log for "the JIT is off". (3) The log's time for the list check (56 ms on the optimized build, 85 ms on the fast
-  one) overstates it: on the fast build the check's own parts add up to about 40 ms, and
-  the rest is spent before its first step, probably on the first use of the builtin type
-  references. Worth a look if startup time ever matters.
+  believing a benchmark, and check the log for "the JIT is off". (3) The list check takes about 8 ms on the optimized build (`UNISON_JIT_LOG=1` prints
+  it). A reading several times that means a major GC or a first use of something else
+  landed inside it: on the fast build the check's own parts added up to 40 ms of a
+  reported 85 ms.
