@@ -18,7 +18,9 @@ source-repository head
 library
   exposed-modules:
       Unison.Util.Deque
+      Unison.Util.Deque.Internal
       Unison.Util.Rope
+      Unison.Util.Rope2
       Unison.Util.Skews
   hs-source-dirs:
       src
@@ -62,6 +64,8 @@ library
 test-suite util-rope-tests
   type: exitcode-stdio-1.0
   main-is: Main.hs
+  other-modules:
+      RopeTests
   hs-source-dirs:
       test
   default-extensions:

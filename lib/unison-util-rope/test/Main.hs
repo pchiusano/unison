@@ -11,11 +11,12 @@ import Data.Sequence qualified as Seq
 import EasyTest
 import GHC.Exts qualified as Exts
 import GHC.Stack (HasCallStack)
+import RopeTests qualified
 import Unison.Util.Deque (Deque)
 import Unison.Util.Deque qualified as D
 
 main :: IO ()
-main = run (scope "util.deque" test)
+main = run (tests [scope "util.deque" test, scope "util.rope2" RopeTests.test])
 
 -- The deque's invariants hold and it has the same elements as the model.
 same :: (HasCallStack) => Deque Int -> Seq Int -> Test ()
