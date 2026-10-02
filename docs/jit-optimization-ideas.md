@@ -201,6 +201,28 @@ than deleting it.
     times, `take`/`drop` about 1.5 times (2 to 2.7 times around 100 elements), pushes at
     around 100 elements about 1.4 times, and a queue on a list of ten about 1.8 times.
 
+  - *`Unison.Util.Deque2`, a simpler structure that may replace it* (prototype, 2026-10-02;
+    nothing uses it yet). A Hinze–Paterson finger tree with a strict middle: digits are
+    strict lists of up to ten items, a node is eight leaves inline or an array of two to
+    eight children, and the only invariant is that both digits of a tree with a middle have
+    an item. Pushes and pops are amortized O(1) when a list is used once and O(log n) in
+    the worst case, which only repeated use of the same old version can hit. It is about
+    half the code, every level has the same shape (which is what the JIT's C helpers
+    want), and it passes the Deque's tests. Against `Data.Sequence` on the same benchmark:
+    pushes 0.65 to 0.9 times, pops about 0.5, a queue 0.45 to 0.8, lookup 0.3 to 0.45 on
+    lists of 100 and up, `sum` 0.4, `take` about even, `drop` 1.1 to 1.3, `append` of two
+    large pieces 1.5 to 1.8, `fromList` of a long list 3 times (it is a fold of `snoc`;
+    `Data.Sequence` builds in bulk). What was tried and measured on the way:
+    - Array digits below the top level: pushes and pops about 1 ns slower, append only 15%
+      faster. Half of append's time was then inside `copySmallArray#`, `memmove` and
+      `newSmallArray#`, which are calls into the runtime even for three elements.
+    - One node constructor (always an array) instead of the inline node of eight leaves:
+      pushes 7% slower, pops 20 to 45%, `sum` and `toList` 60 to 70%.
+    - What append still spends its time on is reading digit lists cell by cell, on data
+      that is not in the cache. Digits that are one object, without the array calls, are
+      the thing to try: an array with an offset so pops don't copy, filled by single
+      writes.
+
   `Unison.Util.Skews` (two skew binary lists back to back, also Paul's) is in the same
   package as a possible alternative: it compiles, nothing uses it, and it hasn't been
   measured against either structure.
