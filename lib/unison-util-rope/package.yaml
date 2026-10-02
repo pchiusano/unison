@@ -26,6 +26,19 @@ tests:
       - unison-util-rope
     main: Main.hs
     source-dirs: test
+  deque2-tests:
+    when:
+      - condition: false
+        other-modules: Paths_unison_util_rope
+    dependencies:
+      - base
+      - containers
+      - deepseq
+      - easytest
+      - unison-util-rope
+    main: Main.hs
+    source-dirs: test
+    cpp-options: -DDEQUE2
 
 benchmarks:
   deque:

@@ -1,3 +1,6 @@
+{-# LANGUAGE CPP #-}
+-- The same tests run against Unison.Util.Deque and, with -DDEQUE2, against
+-- Unison.Util.Deque2.
 module Main (main) where
 
 import Control.Exception (ErrorCall, evaluate, try)
@@ -11,8 +14,13 @@ import Data.Sequence qualified as Seq
 import EasyTest
 import GHC.Exts qualified as Exts
 import GHC.Stack (HasCallStack)
+#ifdef DEQUE2
+import Unison.Util.Deque2 (Deque)
+import Unison.Util.Deque2 qualified as D
+#else
 import Unison.Util.Deque (Deque)
 import Unison.Util.Deque qualified as D
+#endif
 
 main :: IO ()
 main = run (scope "util.deque" test)
