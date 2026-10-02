@@ -116,6 +116,8 @@ poolKeysOf s =
       Prim1 VWLS _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       Prim1 VWRS _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       Prim2 IDXS _ _ -> [KeyEnum Ty.optionalRef TT.noneTag]
+      Prim2 SPLL _ _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
+      Prim2 SPLR _ _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       -- a partial application of a known function starts from its closure
       Name (Env cix comb) _ | Comb info <- unRComb comb -> [KeyComb cix info]
       ForeignCall _ MutableArray_write _ -> [KeyEnum Ty.unitRef TT.unitTag]

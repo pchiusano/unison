@@ -29,7 +29,7 @@ module Unison.Runtime.JIT.Codegen
   )
 where
 
-import Control.Monad (forM, forM_, unless, void, when)
+import Control.Monad (foldM, forM, forM_, unless, void, when)
 import Control.Monad.State.Strict
 import Data.Char (ord)
 import Data.List (intercalate)
@@ -168,6 +168,11 @@ modulePrelude =
       "declare ptr @unison_jit_list_view(ptr, ptr, ptr, i64, i64)",
       "declare ptr @unison_jit_list_push(ptr, ptr, i64, ptr, i64)",
       "declare ptr @unison_jit_list_index(ptr, ptr, i64, ptr, i64)",
+      "declare ptr @unison_jit_list_lit(ptr, ptr, i64, ptr)",
+      "declare ptr @unison_jit_list_wrap(ptr, ptr)",
+      "declare ptr @unison_jit_list_cut(ptr, ptr, i64, i64)",
+      "declare ptr @unison_jit_list_split(ptr, ptr, i64, ptr, i64, i64)",
+      "declare ptr @unison_jit_list_append(ptr, ptr, ptr)",
       "declare i64 @unison_jit_text_size(ptr)",
       "declare ptr @unison_jit_text_append(ptr, ptr, ptr)",
       "declare ptr @unison_jit_text_cut(ptr, ptr, i64, i64)",
@@ -691,7 +696,8 @@ allocates = anyInstr $ \case
   ForeignCall _ MutableArray_write _ -> True
   -- the list helpers allocate, and charge the budget themselves
   Prim1 op _ -> op `elem` [VWLS, VWRS]
-  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATT, TAKT, DRPT]
+  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT]
+  Seq _ -> True
   Name {} -> True
   _ -> False
 
@@ -2183,7 +2189,8 @@ instrNative = \case
   Lit _ -> True
   Pack {} -> True
   Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT]
-  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATT, TAKT, DRPT, EQLT]
+  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, EQLT]
+  Seq _ -> True
   ForeignCall _ f _ -> f `elem` [MutableArray_size, MutableArray_read, MutableArray_write]
   -- (up to four arguments; more is rare, and then it is a call-out)
   Name r _ -> case r of Dyn _ -> False; _ -> True
@@ -2256,8 +2263,9 @@ genInstr fe d instr sect k = case instr of
             Just ix <- Map.lookup (KeyComb cix info) (envPool (feEnv fe)) ->
               Just (poolValue ix)
         _ -> Nothing
-  -- Lists: C helpers do the common cases (see "Lists" in jit_rt.c) and
-  -- answer "not handled" for the rest, which the interpreter then runs.
+  -- Lists: C helpers that are ports of the Haskell operations (see "Lists"
+  -- in jit_rt.c). They handle every list; the slow path is only for a
+  -- closure that isn't one.
   Prim1 SIZS i | enabled fe "list" -> do
     slow <- callOutExit True fe d instr sect
     l <- loadB (d - i)
@@ -2286,6 +2294,43 @@ genInstr fe d instr sect k = case instr of
     u <- loadU kx
     b <- loadB kx
     listHelper d slow ("@unison_jit_list_push(ptr %ctx, ptr " ++ l ++ ", i64 " ++ u ++ ", ptr " ++ b ++ ", i64 " ++ (if op == CONS then "1" else "0") ++ ")")
+    k (d + 1)
+  Prim2 op i j | enabled fe "list", op == TAKS || op == DRPS -> do
+    slow <- callOutExit True fe d instr sect
+    n <- loadU (d - i)
+    l <- loadB (d - j)
+    listHelper d slow ("@unison_jit_list_cut(ptr %ctx, ptr " ++ l ++ ", i64 " ++ n ++ ", i64 " ++ (if op == TAKS then "1" else "0") ++ ")")
+    k (d + 1)
+  Prim2 op i j
+    | enabled fe "list",
+      op == SPLL || op == SPLR,
+      Just emptyIx <- Map.lookup (KeyEnum Ty.seqViewRef TT.seqViewEmptyTag) (envPool (feEnv fe)) -> do
+        let PackedTag elemTag = TT.seqViewElemTag
+        slow <- callOutExit True fe d instr sect
+        n <- loadU (d - i)
+        l <- loadB (d - j)
+        e <- poolValue emptyIx
+        listHelper d slow ("@unison_jit_list_split(ptr %ctx, ptr " ++ l ++ ", i64 " ++ n ++ ", ptr " ++ e ++ ", i64 " ++ show elemTag ++ ", i64 " ++ (if op == SPLL then "1" else "0") ++ ")")
+        k (d + 1)
+  Prim2 CATS i j | enabled fe "list" -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadB (d - i)
+    y <- loadB (d - j)
+    listHelper d slow ("@unison_jit_list_append(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ")")
+    k (d + 1)
+  -- A list literal: the elements are added one at a time to a deque that
+  -- is wrapped at the end. Nothing can go wrong, so there is no slow path.
+  Seq args | enabled fe "list" -> do
+    vals <- loadSources (argSources fe d args)
+    let add acc (u, b) = do
+          r <- fresh "lit"
+          emit (r ++ " = call ptr @unison_jit_list_lit(ptr %ctx, ptr " ++ acc ++ ", i64 " ++ u ++ ", ptr " ++ b ++ ")")
+          pure r
+    acc <- foldM add "null" vals
+    r <- fresh "list"
+    emit (r ++ " = call ptr @unison_jit_list_wrap(ptr %ctx, ptr " ++ acc ++ ")")
+    storeU (d + 1) "-1"
+    storeB (d + 1) r
     k (d + 1)
   -- Text: the same arrangement (see "Text" in jit_rt.c). The helpers handle
   -- every text; the slow path is only for a closure that isn't one.

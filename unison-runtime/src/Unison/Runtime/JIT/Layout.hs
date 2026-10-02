@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE MultiWayIf #-}
 
 -- | Closure layouts, found by probing sample closures at startup
 -- (decision D7 in docs/jit-implementation-plan.md). Generated code
@@ -16,8 +17,7 @@ where
 
 import Control.Monad (foldM, forM)
 import Data.Maybe (catMaybes)
-import Data.Bits ((.|.))
-import Data.Foldable (toList)
+import Data.Bits (shiftR, xor, (.&.), (.|.))
 import Data.Primitive.Array (MutableArray, arrayFromList, newArray, readArray, writeArray)
 import Data.IORef (newIORef)
 import Data.Primitive.ByteArray (byteArrayFromList)
@@ -30,7 +30,7 @@ import Unison.Runtime.MCode (CombIx (..), GCombInfo (..), GSection (..), noNativ
 import Unison.Runtime.Stack
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
-import Unison.Util.Deque qualified as Sq
+import Unison.Util.Deque2 qualified as Sq
 import Unison.Util.Text qualified as UText
 import Unsafe.Coerce (unsafeCoerce)
 
@@ -156,12 +156,16 @@ probeLayouts = do
     summary l = show (lPtrTag l, lPtrs l, lNptrs l)
 
 -- | Lists: teaches the C helpers (jit_rt.c) the constructors of
--- Unison.Util.Deque from samples, checks the structure of a range of lists
+-- Unison.Util.Deque2 from samples, checks the structure of a range of lists
 -- against what the helpers assume, and then runs every helper against the
--- Haskell operation it stands in for. Returns an explanation if anything
--- differs.
-probeLists :: Layouts -> IO (Either String ())
-probeLists ls = do
+-- Haskell operation it stands in for; each list a helper builds is checked
+-- for its structure too. Returns an explanation if anything differs.
+--
+-- @steps@ (stress mode @lists=N@) adds a longer test: that many random
+-- operations, each done by a helper on the results of earlier ones and
+-- compared with the Haskell operation.
+probeLists :: Layouts -> Int -> IO (Either String ())
+probeLists ls steps = do
   let nat i = NatVal (fromIntegral (i :: Int))
       wrap :: Sq.Deque Val -> Any
       wrap d = any' $! Foreign (WrapSeq d)
@@ -172,16 +176,16 @@ probeLists ls = do
       !emptyView = Enum Ty.seqViewRef TT.seqViewEmptyTag
       !none = Enum Ty.optionalRef TT.noneTag
       range a b = Sq.fromList (map nat [a .. b])
-      -- lists of many shapes: built from either end, appended (nodes of two
-      -- and three), cut, and drained
-      built n = [range 1 n, foldr (Sq.<|) Sq.empty (map nat [1 .. n]), foldl (Sq.|>) Sq.empty (map nat [1 .. n])]
+      -- lists of many shapes: built from either end, appended, cut, and drained
+      built n = [range 1 n, foldr (Sq.<|) Sq.empty (map nat [1 .. n])]
       samples =
-        concatMap built ([0 .. 40] ++ [63, 64, 65, 100, 200, 513, 1000, 3000, 40000])
-          ++ [range 1 a Sq.>< range 1 b | a <- [9, 33, 150, 1200], b <- [10, 47, 300, 2500]]
-          ++ [Sq.drop k (range 1 n) | n <- [100, 1000, 5000], k <- [1, 7, 60, 97]]
-          ++ [Sq.take k (range 1 n) | n <- [100, 1000, 5000], k <- [3, 50, 93]]
-          ++ take 40 (iterate (\d -> case d of _ Sq.:<| r -> r; r -> r) (range 1 300))
-          ++ take 40 (iterate (\d -> case d of r Sq.:|> _ -> r; r -> r) (range 1 300))
+        concatMap built ([0 .. 12] ++ [63, 64, 65, 100, 200, 513, 1000, 3000])
+          ++ [range 1 12000]
+          ++ [range 1 a Sq.>< range 1 b | (a, b) <- [(9, 10), (33, 300), (150, 47), (1200, 2500)]]
+          ++ [Sq.drop k (range 1 n) | (n, k) <- [(100, 7), (1000, 60), (5000, 1), (5000, 97)]]
+          ++ [Sq.take k (range 1 n) | (n, k) <- [(100, 50), (1000, 93), (5000, 3)]]
+          ++ take 10 (iterate (\d -> case d of _ Sq.:<| r -> r; r -> r) (range 1 300))
+          ++ take 10 (iterate (\d -> case d of r Sq.:|> _ -> r; r -> r) (range 1 300))
   -- the array must hold the evaluated objects, never thunks that produce them
   let put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
       put a i v = v `seq` writeArray a i v
@@ -189,71 +193,165 @@ probeLists ls = do
   arr <- newArray 4 first :: IO (MutableArray RealWorld Any)
   put arr 1 (any' x)
   put arr 2 (wrap Sq.empty)
+  put arr 3 (wrap (range 1 1000))
   ok <- listInit arr [lForeignInfo ls, lInfo (lVal ls), lInfo (lData1 ls), lInfo (lData2 ls)]
   if ok /= 1
     then pure (Left ("the list constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
     else do
-      let result :: IO Closure
-          result = unsafeCoerce <$> readArray arr 3
-          same a b = BoxedVal a == BoxedVal b
+      let same a b = BoxedVal a == BoxedVal b
           listOf c = case c of
             Foreign (WrapSeq d) -> Just d
             _ -> Nothing
-          good d = either (const False) (const True) (Sq.valid d)
+          -- a helper on the list d, with its other arguments; its result
+          run :: Sq.Deque Val -> Int -> Any -> Int -> Int -> IO (Maybe Closure)
+          run d op other a b = do
+            put arr 0 (wrap d)
+            put arr 1 other
+            h <- listTest arr op a b
+            if h then Just . unsafeCoerce <$> readArray arr 3 else pure Nothing
+          -- a few positions of a list of n elements: all, if it is short
+          spread n
+            | n <= 40 = [0 .. n - 1]
+            | otherwise = [0 .. 11] ++ [(n * k) `div` 23 | k <- [1 .. 22]] ++ [n - 12 .. n - 1]
+          agree full d e
+            | Sq.length d /= Sq.length e = False
+            -- (the C walk has checked the structure; the Haskell check of it is for the longer test)
+            | full = (steps == 0 || either (const False) (const True) (Sq.valid d)) && d == e
+            | otherwise = all (\i -> Sq.lookup i d == Sq.lookup i e) (spread (Sq.length e))
+          -- What a helper built against the list it should be: Nothing if
+          -- they differ, else the helper's list. Checking every element is
+          -- for lists that aren't long (full).
+          checked :: Bool -> Sq.Deque Val -> Maybe Closure -> IO (Maybe (Sq.Deque Val))
+          checked full expected = \case
+            Just c | Just d <- listOf c -> do
+              put arr 0 (any' c)
+              k <- listCheck arr
+              pure (if k >= 0 && agree full d expected then Just d else Nothing)
+            _ -> pure Nothing
+          push full front v d =
+            run d (if front then 2 else 3) (any' natTypeTag) v 0
+              >>= checked full (if front then nat v Sq.<| d else d Sq.|> nat v)
+          view full left d = do
+            r <- run d (if left then 0 else 1) (any' emptyView) (fromIntegral elemTag) 0
+            case (r, left, d) of
+              (Just c, _, Sq.Empty) -> pure (if same c emptyView then Just d else Nothing)
+              (Just (Data2 rf t a (BoxedVal c)), True, e Sq.:<| rest)
+                | rf == Ty.seqViewRef, t == TT.seqViewElemTag, a == e -> checked full rest (Just c)
+              (Just (Data2 rf t (BoxedVal c) b), False, rest Sq.:|> e)
+                | rf == Ty.seqViewRef, t == TT.seqViewElemTag, b == e -> checked full rest (Just c)
+              _ -> pure Nothing
+          -- a negative count is a Nat too large to be a size
+          cut full tk k d =
+            run d (if tk then 5 else 6) (any' none) k 0
+              >>= checked full (if tk then (if k < 0 then d else Sq.take k d) else (if k < 0 then Sq.empty else Sq.drop k d))
+          split full left k d = do
+            r <- run d (if left then 7 else 8) (any' emptyView) k (fromIntegral elemTag)
+            let n = Sq.length d
+                (ea, eb) = Sq.splitAt (if left then k else n - k) d
+            case r of
+              Just c | n < k -> pure (if same c emptyView then Just (d, d) else Nothing)
+              Just (Data2 rf t (BoxedVal a) (BoxedVal b)) | rf == Ty.seqViewRef, t == TT.seqViewElemTag -> do
+                ra <- checked full ea (Just a)
+                rb <- checked full eb (Just b)
+                pure ((,) <$> ra <*> rb)
+              _ -> pure Nothing
+          cat full a b = run a 9 (wrap b) 0 0 >>= checked full (a Sq.>< b)
+          lit k v = run Sq.empty 10 (any' natTypeTag) k v >>= checked True (Sq.fromList (map nat [v .. v + k - 1]))
+          at d i = do
+            r <- run d 4 (any' none) i (fromIntegral someTag)
+            pure (maybe False (\c -> same c (maybe none (Data1 Ty.optionalRef TT.someTag) (Sq.lookup i d))) r)
+          yes = maybe False (const True)
           -- one sample: its structure, then each helper against Haskell
-          check :: Sq.Deque Val -> IO (Either String (Int, Int))
+          check :: Sq.Deque Val -> IO (Either String Int)
           check d = do
             let n = Sq.length d
+                full = n <= 64
+                cuts = [-1, 1, 10, n `div` 2, n - 10, n + 1]
             put arr 0 (wrap d)
             kinds <- listCheck arr
             if kinds < 0
               then pure (Left ("a list of " ++ show n ++ " elements isn't laid out as expected"))
               else do
-                let ixs = if n <= 3000 then [-1 .. n] else [-1, 0, 1, 7, 8, 9, 10, 11] ++ [12, 139 .. n - 12] ++ [n - 11 .. n]
-                ixOk <- forM ixs $ \i -> do
-                  put arr 1 (any' none)
-                  h <- listTest arr 4 i (fromIntegral someTag)
-                  r <- result
-                  pure (h && same r (maybe none (Data1 Ty.optionalRef TT.someTag) (Sq.lookup i d)))
-                views <- forM [(0 :: Int, True), (1, False)] $ \(op, left) -> do
-                  put arr 1 (any' emptyView)
-                  h <- listTest arr op (fromIntegral elemTag) 0
-                  r <- result
-                  let expected = case (left, d) of
-                        (_, Sq.Empty) -> emptyView
-                        (True, e Sq.:<| rest) -> Data2 Ty.seqViewRef TT.seqViewElemTag e (BoxedVal (Foreign (WrapSeq rest)))
-                        (False, rest Sq.:|> e) -> Data2 Ty.seqViewRef TT.seqViewElemTag (BoxedVal (Foreign (WrapSeq rest))) e
-                      restOk = case r of
-                        Data2 _ _ a b | BoxedVal c <- if left then b else a -> maybe False good (listOf c)
-                        _ -> n == 0
-                  pure (if h then (if same r expected && restOk then 1 else -1) else 0 :: Int)
-                pushes <- forM [(2 :: Int, True), (3, False)] $ \(op, front) -> do
-                  put arr 1 (any' natTypeTag)
-                  h <- listTest arr op 77 0
-                  r <- result
-                  let expected = if front then nat 77 Sq.<| d else d Sq.|> nat 77
-                  pure (if h then (if maybe False (\d' -> good d' && toList d' == toList expected) (listOf r) then 1 else -1) else 0 :: Int)
-                pure $
-                  if not (and ixOk)
-                    then Left ("List.at on a list of " ++ show n ++ " elements differs from the interpreter's")
-                    else
-                      if any (< 0) (views ++ pushes)
-                        then Left ("a list helper on a list of " ++ show n ++ " elements differs from the interpreter")
-                        else Right (kinds, sum views + sum pushes)
-      r <-
-        foldM
-          ( \acc d -> case acc of
-              Left e -> pure (Left e)
-              Right (k, h) -> fmap (\(k', h') -> (k .|. k', h + h')) <$> check d
-          )
-          (Right (0, 0))
-          samples
-      pure $ case r of
-        Left e -> Left e
-        Right (kinds, handled)
-          | kinds /= 62 -> Left ("the list samples don't cover every constructor (" ++ show kinds ++ ")")
-          -- the helpers must take the common cases, or they are pointless
-          | 2 * handled < 4 * length samples -> Left ("the list helpers handled only " ++ show handled ++ " of " ++ show (4 * length samples) ++ " cases")
+                ixOk <- and <$> mapM (at d) ([-1, n] ++ spread n)
+                viewOk <- and <$> mapM (\left -> yes <$> view full left d) [True, False]
+                pushOk <- and <$> mapM (\front -> yes <$> push full front 77 d) [True, False]
+                cutOk <- and <$> sequence [yes <$> cut full tk k d | tk <- [True, False], k <- cuts]
+                splitOk <- and <$> sequence [yes <$> split full left k d | left <- [True, False], k <- [3, n `div` 2, n + 1]]
+                pure $ case () of
+                  _
+                    | not ixOk -> Left ("List.at on a list of " ++ show n ++ " elements differs from the interpreter's")
+                    | not viewOk -> Left ("a list pattern on a list of " ++ show n ++ " elements differs from the interpreter's")
+                    | not pushOk -> Left ("adding to a list of " ++ show n ++ " elements differs from the interpreter")
+                    | not cutOk -> Left ("List.take or List.drop on a list of " ++ show n ++ " elements differs from the interpreter's")
+                    | not splitOk -> Left ("splitting a list of " ++ show n ++ " elements differs from the interpreter")
+                    | otherwise -> Right kinds
+          firstLeft :: [IO (Either String a)] -> IO (Either String [a])
+          firstLeft = foldM (\acc io -> case acc of Left e -> pure (Left e); Right rs -> fmap (: rs) <$> io) (Right [])
+          -- lists that helpers built, used again: a full digit at each
+          -- level, then drained from the other end
+          grow front = go (200 :: Int) Sq.empty
+            where
+              go 0 d = shrink (200 :: Int) d
+              go k d = push (k > 160) front k d >>= maybe (pure (Left "a list built by the helpers differs from the interpreter's")) (go (k - 1))
+              shrink 0 _ = pure (Right ())
+              shrink k d = view (k < 40) (not front) d >>= maybe (pure (Left "a list drained by the helpers differs from the interpreter's")) (shrink (k - 1))
+          pairs = [d | (i, d) <- zip [0 :: Int ..] samples, i `mod` 6 == 0]
+          appends = [(\r -> if yes r then Right () else Left ("List.++ on lists of " ++ show (Sq.length a) ++ " and " ++ show (Sq.length b) ++ " elements differs from the interpreter's")) <$> cat (Sq.length a + Sq.length b <= 64) a b | a <- pairs, b <- pairs]
+          lits = [(\r -> if yes r then Right () else Left ("a list literal of " ++ show k ++ " elements differs from the interpreter's")) <$> lit k 5 | k <- [0 .. 24]]
+          -- (The checks above are sized to cost little at every startup: they
+          -- confirm the layouts and that each helper works here. The thorough
+          -- test of the helpers is the longer one, run when they change.)
+          -- the longer test: random operations on eight lists
+          mix :: Int -> Int
+          mix z0 =
+            let z1 = (z0 `xor` (z0 `shiftR` 30)) * (-4658895280553007687)
+                z2 = (z1 `xor` (z1 `shiftR` 27)) * (-7723592293110705685)
+             in (z2 `xor` (z2 `shiftR` 31)) .&. maxBound
+          stress :: Int -> [Sq.Deque Val] -> IO (Either String ())
+          stress step pool
+            | step >= steps = pure (Right ())
+            | otherwise = do
+                let r k = mix (step * 16 + k)
+                    i = r 0 `mod` 8
+                    d = pool !! i
+                    e = pool !! (r 1 `mod` 8)
+                    n = Sq.length d
+                    full = n <= 3000 || r 2 `mod` 16 == 0
+                    pos = case r 3 `mod` 4 of
+                      0 -> r 4 `mod` 12
+                      1 -> n - r 4 `mod` 12
+                      _ -> r 4 `mod` (n + 2) - 1
+                    op = r 5 `mod` 16
+                    front = even (r 7)
+                    times :: Int -> (Sq.Deque Val -> IO (Maybe (Sq.Deque Val))) -> Sq.Deque Val -> IO (Maybe (Sq.Deque Val))
+                    times 0 _ l = pure (Just l)
+                    times k f l = f l >>= maybe (pure Nothing) (times (k - 1) f)
+                res <-
+                  if
+                    | op < 2 -> push full True step d
+                    | op < 4 -> push full False step d
+                    | op == 4 -> view full True d
+                    | op == 5 -> view full False d
+                    | op == 6 -> cut full True pos d
+                    | op == 7 -> cut full False pos d
+                    | op == 8 -> fmap fst <$> split full True pos d
+                    | op == 9 -> fmap snd <$> split full False pos d
+                    | op <= 11 -> if n + Sq.length e > 400000 then cut full True (r 6 `mod` 50) d else cat full d e
+                    | op == 12 -> (\good -> if good then Just d else Nothing) <$> at d pos
+                    | op == 13 -> times (r 6 `mod` 300) (view (n <= 300) front) d
+                    | otherwise -> times (r 6 `mod` 300) (push (n <= 300) front step) d
+                case res of
+                  Nothing -> pure (Left ("the list helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a list of " ++ show n ++ " elements)"))
+                  Just d' -> stress (step + 1) (take i pool ++ [d'] ++ drop (i + 1) pool)
+      r <- firstLeft (map check samples)
+      r2 <- firstLeft ([grow True, grow False] ++ appends ++ lits)
+      r3 <- if steps > 0 then stress 0 (replicate 8 Sq.empty) else pure (Right ())
+      pure $ case (r, r2, r3) of
+        (Left e, _, _) -> Left e
+        (_, Left e, _) -> Left e
+        (_, _, Left e) -> Left e
+        (Right kinds, _, _)
+          | foldr (.|.) 0 kinds /= 15 -> Left ("the list samples don't cover every constructor (" ++ show (foldr (.|.) 0 kinds) ++ ")")
           | otherwise -> Right ()
 
 -- | Text: the same for the text helpers. Each helper is run against the

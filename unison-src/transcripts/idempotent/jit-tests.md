@@ -1038,9 +1038,9 @@ overApply n =
 
 ## Lists
 
-List primitives have native fast paths (C helpers that read and build the list's
-structure directly): size, the views at both ends that pattern matching uses, cons, snoc
-and `List.at`. Cases they don't handle (a digit that needs a repair) go to the interpreter.
+List primitives are native (C helpers that read and build the list's structure directly):
+size, the views at both ends that pattern matching uses, cons, snoc, `List.at`, append,
+take, drop, the patterns that split off a fixed number of elements, and list literals.
 
 ``` unison
 use Nat + - * / == < > <= >=
@@ -1123,6 +1123,43 @@ pairs n =
     (t, k) +: rest -> walk (acc + Text.size t + k) rest
   walk 0 (go [] 0)
 
+-- take, drop and append in a loop, each on the result of the last
+chop : Nat -> Nat
+chop n =
+  go l acc i =
+    if i == n then acc + List.size l
+    else
+      k = Nat.mod (i * 7) (List.size l + 1)
+      a = List.take k l
+      b = List.drop k l
+      l' = (b :+ i) List.++ a
+      next = if List.size l' > 600 then List.drop 100 l' List.++ List.take 3 l' else l'
+      go next (acc + List.size a * 3 + sumFront (List.take 2 b)) (i + 1)
+  go (build 50) 0 0
+
+-- doubling by append, then cuts in the middle
+doubled : Nat -> Nat
+doubled n =
+  go l i = if i == n then l else go (l List.++ (i +: l)) (i + 1)
+  l = go [1, 2, 3] 0
+  m = List.take (List.size l / 2 + 17) (List.drop (List.size l / 3) l)
+  List.size l + sumFront m + sumBack m + sumAt (List.take 5000 m)
+
+-- patterns that split off a fixed number of elements, and literals
+splits : Nat -> Nat
+splits n =
+  step = cases
+    [a, b, c] ++ rest -> (a + b * 2 + c * 3, rest)
+    rest -> (List.size rest, [])
+  back = cases
+    rest ++ [y, z] -> y * 5 + z + List.size rest
+    _ -> 0
+  go l acc =
+    match step l with
+      (v, []) -> acc + v
+      (v, rest) -> go rest (acc + v + back rest)
+  go (build n List.++ [n, n + 1, n + 2, n + 3]) 0
+
 > sumFront (build 100000)
 > sumBack (buildFront 100000)
 > sumAt (build 30000)
@@ -1132,6 +1169,10 @@ pairs n =
 > mixed 5000
 > pairs 20000
 > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+> chop 20000
+> doubled 14
+> splits 30000
+> (List.take 2 [1, 2, 3], List.drop 2 [1, 2, 3], [1, 2] List.++ [3], List.take 0 [1], List.drop 5 [1], [] List.++ [7])
 ```
 
 ``` ucm :added-by-ucm
@@ -1139,51 +1180,70 @@ pairs n =
 
   + build      : Nat -> [Nat]
   + buildFront : Nat -> [Nat]
+  + chop       : Nat -> Nat
+  + doubled    : Nat -> Nat
   + edges      : Nat -> Nat
   + mixed      : Nat -> Nat
   + pairs      : Nat -> Nat
   + queue      : Nat -> Nat -> Nat
+  + splits     : Nat -> Nat
   + sumAt      : [Nat] -> Nat
   + sumBack    : [Nat] -> Nat
   + sumFront   : [Nat] -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    81 | > sumFront (build 100000)
-           ⧩
-           4999950000
+    118 | > sumFront (build 100000)
+            ⧩
+            4999950000
 
-    82 | > sumBack (buildFront 100000)
-           ⧩
-           4999950000
+    119 | > sumBack (buildFront 100000)
+            ⧩
+            4999950000
 
-    83 | > sumAt (build 30000)
-           ⧩
-           450005000
+    120 | > sumAt (build 30000)
+            ⧩
+            450005000
 
-    84 | > queue 10 100000
-           ⧩
-           4998950110
+    121 | > queue 10 100000
+            ⧩
+            4998950110
 
-    85 | > queue 3000 100000
-           ⧩
-           4708953000
+    122 | > queue 3000 100000
+            ⧩
+            4708953000
 
-    86 | > edges 2000
-           ⧩
-           20594
+    123 | > edges 2000
+            ⧩
+            20594
 
-    87 | > mixed 5000
-           ⧩
-           38978757
+    124 | > mixed 5000
+            ⧩
+            38978757
 
-    88 | > pairs 20000
-           ⧩
-           200030000
+    125 | > pairs 20000
+            ⧩
+            200030000
 
-    89 | > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
-           ⧩
-           (0, 0, 0, Some 1, None)
+    126 | > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+            ⧩
+            (0, 0, 0, Some 1, None)
+
+    127 | > chop 20000
+            ⧩
+            394214577
+
+    128 | > doubled 14
+            ⧩
+            189028
+
+    129 | > splits 30000
+            ⧩
+            2850305009
+
+    130 | > (List.take 2 [1, 2, 3], List.drop 2 [1, 2, 3], [1, 2] List.++ [3], List.take 0 [1], List.drop 5 [1], [] List.++ [7])
+            ⧩
+            ([1, 2], [3], [1, 2, 3], [], [], [7])
 ```
 
 ## Text

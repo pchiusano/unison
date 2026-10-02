@@ -16,6 +16,7 @@ import Control.Monad (foldM, forM_, forever, unless, void, when)
 import Data.IORef
 import Data.Set qualified as Set
 import Foreign.Ptr (Ptr)
+import GHC.Clock (getMonotonicTimeNSec)
 import Data.Map.Strict qualified as Map
 import Data.List (sortOn)
 import Data.Word (Word64)
@@ -75,6 +76,11 @@ startCompiler = case mode config of
 -- anything is wrong the JIT stays off, with a message.
 initJIT :: IO ()
 initJIT = do
+  let timed what io = do
+        t0 <- getMonotonicTimeNSec
+        x <- io
+        t1 <- getMonotonicTimeNSec
+        x <$ jitLog (what ++ ": " ++ show (fromIntegral (t1 - t0) / 1e6 :: Double) ++ " ms")
   r <- initLLVM
   case r of
     Left e -> jitLog (e ++ "; the JIT is off")
@@ -83,10 +89,10 @@ initJIT = do
         Left e -> pure (Left e)
         -- the list helpers are part of the generated code's contract too
         Right ls ->
-          probeLists ls >>= \case
+          timed "list helper checks" (probeLists ls (stressLists config)) >>= \case
             Left e -> pure (Left e)
             Right () ->
-              probeTexts ls >>= \case
+              timed "text helper checks" (probeTexts ls) >>= \case
                 Left e -> pure (Left e)
                 Right () -> fmap (const ls) <$> probeNames ls
       (offs, _) <- ctxLayout

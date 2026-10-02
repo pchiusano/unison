@@ -234,7 +234,7 @@ import Unison.Runtime.MCode
 import Unison.Runtime.Referenced (Referenced, dereference)
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
-import Unison.Util.Deque (Deque)
+import Unison.Util.Deque2 (Deque)
 import Unison.Util.Bytes (Bytes)
 import Unison.Util.EnumContainers as EC
 import Unison.Util.Monoid qualified as Monoid

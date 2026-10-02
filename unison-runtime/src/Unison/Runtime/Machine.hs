@@ -39,7 +39,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Map.Strict qualified as M
 import Data.Map.Strict.Internal qualified as M
 import Data.Sequence qualified as Seq
-import Unison.Util.Deque qualified as Sq
+import Unison.Util.Deque2 qualified as Sq
 import Data.Set qualified as S
 import Data.Set qualified as Set
 import Data.Text qualified as DTx
