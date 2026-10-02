@@ -690,83 +690,36 @@ dropM j (MDeep t ps pr m sf)
     goS _ _ _ SNil = error "Deque2.drop: past the end of a suffix"
 
 ------------------------------------------------------------------------
--- Append.  When both sides have a middle, the digits that end up inside (the
--- left side's suffix and the right side's prefix) are packed into nodes and
--- handed down between the two middles.  When one side has no middle it has
--- at most two digits' worth of items, which join the other side's near digit;
--- what does not fit goes into the other side's middle in nodes of eight.
--- When neither has a middle the result is built from all the items.
+-- Append.  The digits that end up inside (the left side's suffix and the
+-- right side's prefix) either join the outer digit of a side that has no
+-- middle, when they fit there, or are packed into nodes and handed down
+-- between the two middles.
 
 append :: Deque a -> Deque a -> Deque a
 append Nil b = b
 append a Nil = a
-append (Deep t1 pr1 m1 sf1) (Deep t2 pr2 m2 sf2) = case m1 of
-  MNil -> case m2 of
-    MNil
-      | tsc t1 + tsize t2 <= maxD ->
-          Deep (mk n (tpc t1) (tsc t1 + tsize t2)) pr1 MNil (appendS sf2 (revOnto pr2 sf1))
-      | otherwise -> buildSmall n (appendS pr1 (revOnto sf1 (appendS pr2 (revS sf2))))
-    _ ->
-      let !c = tsize t1 + tpc t2
-          !f = appendS pr1 (revOnto sf1 pr2)
-      in if c <= maxD
-           then Deep (mk n c (tsc t2)) f m2 sf2
-           else let !k = (c - maxD + 7) `unsafeShiftR` 3
-                    !p = c - 8 * k
-                in Deep (mk n p (tsc t2)) (takeS p f) (consLeaves8 k (dropS p f) m2) sf2
-  _ -> case m2 of
-    MNil ->
-      let !c = tsc t1 + tsize t2
-          !r = appendS sf2 (revOnto pr2 sf1)
-      in if c <= maxD
-           then Deep (mk n (tpc t1) c) pr1 m1 r
-           else let !k = (c - maxD + 7) `unsafeShiftR` 3
-                    !q = c - 8 * k
-                in Deep (mk n (tpc t1) q) pr1 (snocLeaves8 k (dropS q r) m1) (takeS q r)
-    _ -> let !c = tsc t1 + tpc t2
-         in Deep (mk n (tpc t1) (tsc t2)) pr1 (appM m1 c (packLeaves c (tsc t1) sf1 pr2) m2) sf2
+append a@(Deep t1 pr1 m1 sf1) b@(Deep t2 pr2 m2 sf2)
+  | MNil <- m1, tpc t1 + c <= maxD =
+      Deep (mk n (tpc t1 + c) (tsc t2)) (appendS pr1 (revOnto sf1 pr2)) m2 sf2
+  | MNil <- m2, c + tsc t2 <= maxD =
+      Deep (mk n (tpc t1) (c + tsc t2)) pr1 m1 (appendS sf2 (revOnto pr2 sf1))
+  | c >= 2, t1 .&. 15 /= 0, t2 .&. 0xF0 /= 0 =
+      Deep (mk n (tpc t1) (tsc t2)) pr1 (appM m1 c (packLeaves c (tsc t1) sf1 pr2) m2) sf2
+  -- what is left: a side with no middle whose outer digit is empty, or a
+  -- single item inside
+  | MNil <- m1 = consEach (revS pr1) (consEach sf1 b)
+  | otherwise  = snocEach (snocEach a pr2) (revS sf2)
   where !n = tsize t1 + tsize t2
+        !c = tsc t1 + tpc t2
 
--- n items, front to back, more than fit in one digit and fewer than five
--- digits' worth, as a tree
-buildSmall :: Int -> SList a -> Deque a
-buildSmall n f
-  | n <= 2 * maxD =
-      let !p = (n + 1) `div` 2
-      in Deep (mk n p (n - p)) (takeS p f) MNil (revS (dropS p f))
-  | otherwise =
-      let !k = (n - 2 * maxD + 7) `unsafeShiftR` 3
-          !rest = n - 8 * k
-          !p = (rest + 1) `div` 2
-      in Deep (mk n p (rest - p)) (takeS p f) (consLeaves8 k (dropS p f) MNil) (revS (dropS (p + 8 * k) f))
+-- cons each item, in list order (so the list runs back to front)
+consEach :: SList a -> Deque a -> Deque a
+consEach SNil d = d
+consEach (SCons x r) d = consEach r (cons x d)
 
--- the same for c nodes with sz leaves under them
-buildSmallM :: Int -> Int -> SList (Node a) -> Mid a
-buildSmallM c sz f
-  | c <= 2 * maxD =
-      let !p = (c + 1) `div` 2
-          !pr = takeS p f
-      in MDeep (mk sz p (c - p)) (sumS pr) pr MNil (revS (dropS p f))
-  | otherwise =
-      let !k = (c - 2 * maxD + 7) `unsafeShiftR` 3
-          !rest = c - 8 * k
-          !p = (rest + 1) `div` 2
-          !pr = takeS p f
-      in MDeep (mk sz p (rest - p)) (sumS pr) pr (consNodes8 k (dropS p f) MNil) (revS (dropS (p + 8 * k) f))
-
--- 8k items, front to back, go on the front of a middle as k nodes
-consLeaves8 :: Int -> SList a -> Mid a -> Mid a
-consLeaves8 0 _ m = m
-consLeaves8 k (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) m =
-  consM (N8 a b c d e f g h) (consLeaves8 (k - 1) r m)
-consLeaves8 _ _ _ = error "Deque2.append: short list"
-
--- 8k items, back to front, go on the back of a middle as k nodes
-snocLeaves8 :: Int -> SList a -> Mid a -> Mid a
-snocLeaves8 0 _ m = m
-snocLeaves8 k (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a r)))))))) m =
-  snocM (snocLeaves8 (k - 1) r m) (N8 a b c d e f g h)
-snocLeaves8 _ _ _ = error "Deque2.append: short list"
+snocEach :: Deque a -> SList a -> Deque a
+snocEach d SNil = d
+snocEach d (SCons x r) = snocEach (snoc d x) r
 
 -- A node of the first k items of a list, which are leaves.
 leafNode :: Int -> SList a -> Node a
@@ -807,22 +760,6 @@ packNodes c sz nb back mid front
               in SCons (NA sx x) (SCons (NA sy y) (SCons (NA (sz - sx - sy) (sliceA items (k1 + k2) (c - k1 - k2))) SNil))
   where !items = gather c nb back mid front
 
--- 8k nodes, front to back, go on the front of a middle as k nodes
-consNodes8 :: Int -> SList (Node a) -> Mid (Node a) -> Mid (Node a)
-consNodes8 0 _ m = m
-consNodes8 k (SCons a (SCons b (SCons c (SCons d (SCons e (SCons f (SCons g (SCons h r)))))))) m =
-  let !s = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-  in consM (NA s (arr8 a b c d e f g h)) (consNodes8 (k - 1) r m)
-consNodes8 _ _ _ = error "Deque2.append: short list"
-
--- 8k nodes, back to front, go on the back of a middle as k nodes
-snocNodes8 :: Int -> SList (Node a) -> Mid (Node a) -> Mid (Node a)
-snocNodes8 0 _ m = m
-snocNodes8 k (SCons h (SCons g (SCons f (SCons e (SCons d (SCons c (SCons b (SCons a r)))))))) m =
-  let !s = nodeSize a + nodeSize b + nodeSize c + nodeSize d + nodeSize e + nodeSize f + nodeSize g + nodeSize h
-  in snocM (snocNodes8 (k - 1) r m) (NA s (arr8 a b c d e f g h))
-snocNodes8 _ _ _ = error "Deque2.append: short list"
-
 consEachM :: SList (Node a) -> Mid a -> Mid a
 consEachM SNil d = d
 consEachM (SCons x r) d = consEachM r (consM x d)
@@ -835,36 +772,18 @@ snocEachM d (SCons x r) = snocEachM (snocM d x) r
 appM :: Mid a -> Int -> SList (Node a) -> Mid a -> Mid a
 appM MNil _ ns b = consEachM (revS ns) b
 appM a _ ns MNil = snocEachM a ns
-appM (MDeep t1 ps1 pr1 m1 sf1) sns ns (MDeep t2 ps2 pr2 m2 sf2) = case m1 of
-  MNil -> case m2 of
-    MNil ->
-      let !c = tpc t1 + tsc t1 + k + tpc t2 + tsc t2
-          !f = appendS pr1 (revOnto sf1 (appendS ns (appendS pr2 (revS sf2))))
-      in if c <= maxD then MDeep (mk n c 0) n f MNil SNil else buildSmallM c n f
-    _ ->
-      let !c = tpc t1 + tsc t1 + k + tpc t2
-          !f = appendS pr1 (revOnto sf1 (appendS ns pr2))
-      in if c <= maxD
-           then MDeep (mk n c (tsc t2)) (tsize t1 + sns + ps2) f m2 sf2
-           else let !kk = (c - maxD + 7) `unsafeShiftR` 3
-                    !p = c - 8 * kk
-                    !pr' = takeS p f
-                in MDeep (mk n p (tsc t2)) (sumS pr') pr' (consNodes8 kk (dropS p f) m2) sf2
-  _ -> case m2 of
-    MNil ->
-      let !c = tsc t1 + k + tpc t2 + tsc t2
-          !r = appendS sf2 (revOnto pr2 (revOnto ns sf1))
-      in if c <= maxD
-           then MDeep (mk n (tpc t1) c) ps1 pr1 m1 r
-           else let !kk = (c - maxD + 7) `unsafeShiftR` 3
-                    !q = c - 8 * kk
-                in MDeep (mk n (tpc t1) q) ps1 pr1 (snocNodes8 kk (dropS q r) m1) (takeS q r)
-    _ ->
-      let !c = tsc t1 + k + tpc t2
-          !sz = (tsize t1 - ps1 - sizeM m1) + sns + ps2
+appM a@(MDeep t1 ps1 pr1 m1 sf1) sns ns b@(MDeep t2 ps2 pr2 m2 sf2)
+  | MNil <- m1, tpc t1 + c <= maxD =
+      MDeep (mk n (tpc t1 + c) (tsc t2)) (tsize t1 + sns + ps2) (appendS pr1 (revOnto sf1 (appendS ns pr2))) m2 sf2
+  | MNil <- m2, c + tsc t2 <= maxD =
+      MDeep (mk n (tpc t1) (c + tsc t2)) ps1 pr1 m1 (appendS sf2 (revOnto pr2 (revOnto ns sf1)))
+  | c >= 2, t1 .&. 15 /= 0, t2 .&. 0xF0 /= 0 =
+      let !sz = (tsize t1 - ps1 - sizeM m1) + sns + ps2
       in MDeep (mk n (tpc t1) (tsc t2)) ps1 pr1 (appM m1 sz (packNodes c sz (tsc t1) sf1 ns pr2) m2) sf2
-  where !k = lenS ns
-        !n = tsize t1 + sns + tsize t2
+  | MNil <- m1 = consEachM (revS pr1) (consEachM sf1 (consEachM (revS ns) b))
+  | otherwise  = snocEachM (snocEachM (snocEachM a ns) pr2) (revS sf2)
+  where !n = tsize t1 + sns + tsize t2
+        !c = tsc t1 + lenS ns + tpc t2
 
 ------------------------------------------------------------------------
 -- Lists
