@@ -231,6 +231,12 @@ without statistics. Fixed in step 0.
   `Multimap.fromList` 64 µs to 83 µs and `Json.toText` 7.1 µs to 8.4 µs are slower. Why
   JSON parsing is slower isn't known yet (the parser only snocs); it is the first thing to
   look at when the deque is tuned further.
+  *After M6* (2026-10-02): the list became `Unison.Util.Deque2`, a strict finger tree that
+  is simpler and faster than the Deque above, and the helpers became complete ports of its
+  operations, so nothing in this step's "still call-outs" list is left: `CATS`, `TAKS`,
+  `DRPS`, `SPLL`, `SPLR`, the cases of the views and pushes that reach below the top
+  level, and list literals (`Seq`) are all native. Details and numbers are in the progress
+  log ("The list representation" and the M6 measurements).
 - [x] **5b. Text.** The same pattern for `Text` (a `Unison.Util.Rope` of chunks, strict
   throughout; see "Native `Text` operations" in the [ideas](jit-optimization-ideas.md)):
   C helpers for `Text.size`, the simple cases of `Text.++`, and `Text.drop`/`Text.take`

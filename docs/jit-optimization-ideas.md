@@ -172,13 +172,20 @@ than deleting it.
   array), `uncons`/`unsnoc`, comparison (`<=`, `<`), `indexOf`, and everything that is a
   foreign function rather than a primitive. The exit counts of a text-heavy program say
   which to do next.
-- **The list cases still left to the interpreter.** The C helpers of M6 step 5 take the
-  cases that need no repair. Left: a view or push whose digit changes color (about one in
-  eight on a long list: the node moves between levels, which in C means porting `place`
-  and `repair` from `Deque.hs`), and `++`, `take`, `drop` and the two splits (`SPLL`,
-  `SPLR`, which list patterns like `[a, b] ++ rest` compile to). All are possible in C,
-  since nothing in a deque is a thunk; the question each time is whether the port is worth
-  keeping in step with the Haskell.
+- **What is left of lists.** Every list primitive is native since 2026-10-02 (the C
+  helpers are ports of `Unison.Util.Deque2`). What still leaves native code or costs more
+  than it should:
+  - The list operations that are foreign functions rather than primitives (`List.sort`,
+    conversions from `Text` and `Bytes`): call-outs like any other foreign function.
+  - Every operation is a call into C, including the common push and pop, which are a
+    dozen instructions. Generating those two cases inline (the digit has room; the digit
+    keeps an item) and calling C for the rest would remove the call and let LLVM see the
+    allocation.
+  - A list literal is one call per element plus one to wrap the result. A helper that
+    takes the elements from the stack and builds the tree in one pass (what `fromListN`
+    does) would be better for long literals.
+  - `SPLL`/`SPLR` do a take and a drop, two walks to the same place; a single split would
+    share the walk.
 - **Partial applications of function values.** M6 step 7 builds a partial application
   natively when the function is known at code generation. A function value applied to too
   few arguments (`g = f x` where `f` is itself a closure) still resumes in the interpreter:
@@ -186,43 +193,33 @@ than deleting it.
   needs a second continuation that joins the body with the new closure instead of a call's
   result. The helper already handles closures with arguments captured. Also: more than
   four arguments at once.
-- **The deque itself.** Two things, in this order:
-  - *What the swap cost the interpreter.* With the JIT off, against the interpreter on
-    `Data.Sequence`: JSON parsing 7.2 µs to 10.2 µs and complex JSON parsing 10.7 µs to
-    18.1 µs per document, `Multimap.fromList` 64 µs to 83 µs, `Json.toText` 7.1 µs to
-    8.4 µs, `List.range` per element 42 ns to 102 ns (`List.range 0 1000` itself got
-    faster). The JSON parser only snocs onto small lists, so the cause isn't obvious; a
-    profile of that one benchmark is the place to start. `List.range` per element is a
-    very large list built in one go, so it may be the garbage collector's view of the
-    structure rather than the building.
-  - *The operations that trail `Data.Sequence`* (table in the progress log): `append` is 3
-    to 5 times slower (each level builds its seam as a list and then packs it; packing
-    straight from the digits would cut that), appending one to four elements about 3
-    times, `take`/`drop` about 1.5 times (2 to 2.7 times around 100 elements), pushes at
-    around 100 elements about 1.4 times, and a queue on a list of ten about 1.8 times.
+- **The list structure itself** (`Unison.Util.Deque2`, the runtime's list since
+  2026-10-02; numbers in the progress log):
+  - *JSON parsing is slower than it was on `Data.Sequence`, and the list is not why.* With
+    the JIT off: 7.2 µs per document on `Data.Sequence`, 10.2 µs on the old Deque, 10.1 µs
+    on Deque2, whose pushes are faster than both; complex parsing 10.7, 18.1, 18.1 µs. So
+    something else changed with the first swap. Candidates: the conversion at the
+    `ANF.Value`/`Term.List` boundary, `fromList`, or the parser's use of `Sq.empty` and
+    `|>` no longer fusing with something. A profile of that one benchmark is the place to
+    start. `List.range` per element (42 ns to 102 ns, a very large list built in one go)
+    is in the same position.
+  - *Where it trails `Data.Sequence`:* `append` of two large pieces (1.5 to 1.8 times),
+    `drop` (1.1 to 1.3), `fromList` of a long list (3 times; it is a fold of `snoc`, and
+    the bulk `fromListN` measured no faster for a reason not yet found). Append and drop
+    spend their time reading digit lists cell by cell on data that is not in the cache.
+    Digits that are one object, without the array calls, are the thing to try: an array
+    with an offset so pops don't copy, filled by single writes.
+  - *What was tried and lost while it was built:* array digits below the top level (pushes
+    and pops about 1 ns slower, append only 15% faster; half of append's time was then
+    inside `copySmallArray#`, `memmove` and `newSmallArray#`, which are calls into the
+    runtime even for three elements), and a single array-only node constructor in place
+    of the inline node of eight leaves (pushes 7% slower, pops 20 to 45%, `sum` and
+    `toList` 60 to 70%).
+  - Any change here has to be made in the C helpers too (see the progress log).
 
-  - *`Unison.Util.Deque2`, a simpler structure that may replace it* (prototype, 2026-10-02;
-    nothing uses it yet). A Hinze–Paterson finger tree with a strict middle: digits are
-    strict lists of up to ten items, a node is eight leaves inline or an array of two to
-    eight children, and the only invariant is that both digits of a tree with a middle have
-    an item. Pushes and pops are amortized O(1) when a list is used once and O(log n) in
-    the worst case, which only repeated use of the same old version can hit. It is about
-    half the code, every level has the same shape (which is what the JIT's C helpers
-    want), and it passes the Deque's tests. Against `Data.Sequence` on the same benchmark:
-    pushes 0.65 to 0.9 times, pops about 0.5, a queue 0.45 to 0.8, lookup 0.3 to 0.45 on
-    lists of 100 and up, `sum` 0.4, `take` about even, `drop` 1.1 to 1.3, `append` of two
-    large pieces 1.5 to 1.8, `fromList` of a long list 3 times (it is a fold of `snoc`;
-    `Data.Sequence` builds in bulk). What was tried and measured on the way:
-    - Array digits below the top level: pushes and pops about 1 ns slower, append only 15%
-      faster. Half of append's time was then inside `copySmallArray#`, `memmove` and
-      `newSmallArray#`, which are calls into the runtime even for three elements.
-    - One node constructor (always an array) instead of the inline node of eight leaves:
-      pushes 7% slower, pops 20 to 45%, `sum` and `toList` 60 to 70%.
-    - What append still spends its time on is reading digit lists cell by cell, on data
-      that is not in the cache. Digits that are one object, without the array calls, are
-      the thing to try: an array with an offset so pops don't copy, filled by single
-      writes.
-
+  `Unison.Util.Deque`, the structure Deque2 replaced (worst-case O(1) pushes and pops,
+  about twice the code, slower on every operation measured), is still in the package and
+  in the benchmark; nothing else uses it.
   `Unison.Util.Skews` (two skew binary lists back to back, also Paul's) is in the same
   package as a possible alternative: it compiles, nothing uses it, and it hasn't been
   measured against either structure.

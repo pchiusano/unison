@@ -16,7 +16,8 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M2: calls and frames | done 2026-09-30. Test matrix (7 configurations) passes; "fib 20" 16× faster; "depth 1000000" runs natively with the C stack guard. Data and list code is slower until M3/M4. See [jit-m2.md](jit-m2.md) |
 | M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
 | M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
-| M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are `Unison.Util.Deque` now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes`, the list repair cases, tuning the deque |
+| M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are a strict structure now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes` |
+| After M6: lists on `Unison.Util.Deque2` | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -559,6 +560,52 @@ are listed per step; the full table comes at step 8.
   `unison.sqlite3-wal` or `credentials.json.lock` (the codebase copy racing another run's);
   run that one again.
 
+- 2026-10-02, lists on `Unison.Util.Deque2` with every list primitive native. `suite`,
+  optimized build, one run each. The first two columns are the interpreter (JIT off) on the
+  old Deque and on Deque2; the last two are the JIT on, before and after.
+
+  | Benchmark | `off` Deque | `off` Deque2 | `on` Deque | `on` Deque2 | `on` / `off` |
+  | --- | --- | --- | --- | --- | --- |
+  | List.map increment | 151 µs | 130 µs | 65.1 µs | 29.7 µs | 0.23 |
+  | List.map murmurHash | 402 µs | 382 µs | 414 µs | 364 µs | 0.95 |
+  | List.foldLeft | 1.16 ms | 1.06 ms | 345 µs | 204 µs | 0.19 |
+  | List.at | 130 ns | 123 ns | 25 ns | 23 ns | 0.19 |
+  | List.range 0 1000 | 45.1 µs | 45.8 µs | 45.1 µs | 46.8 µs | 1.02 |
+  | List.range (per element) | 102 ns | 103 ns | 102 ns | 104 ns | 1.01 |
+  | Multimap.fromList | 82.9 µs | 76.9 µs | 84.9 µs | 80.6 µs | 1.05 |
+  | Set.fromList, Map.fromList | 27.4, 25.8 µs | 31.9, 29.4 µs | 28.6, 27.6 µs | 33.9, 33.1 µs | 1.06, 1.13 |
+  | Json.toText | 8.43 µs | 6.11 µs | 8.45 µs | 6.20 µs | 1.01 |
+  | Json parsing, complex parsing | 10.2, 18.1 µs | 10.1, 18.1 µs | 10.2, 18.2 µs | 10.4, 18.5 µs | 1.03, 1.02 |
+  | Json complex decoding | 64.3 µs | 63.0 µs | 58.2 µs | 57.9 µs | 0.92 |
+  | Generate 100 random numbers | 84.5 µs | 83.4 µs | 40.0 µs | 36.1 µs | 0.43 |
+  | Shuffle a 1000 element array | 1.27 ms | 1.20 ms | 643 µs | 540 µs | 0.45 |
+  | Mutably mergesort a 1000 element array | 3.56 ms | 3.52 ms | 335 µs | 293 µs | 0.08 |
+  | Mutate a local Remote.Ref (one run of 20 ms) | 19.7 ms | 19.6 ms | 27.4 ms | 34.3 ms | 1.75 |
+
+  Everything not listed is within 2% of the step 5 run. What the numbers say: (1) JSON
+  parsing, which got slower when `Data.Sequence` was replaced (7.2 µs to 10.2 µs), did not
+  move at all with a list whose pushes are twice as fast, so the list structure is not the
+  cause; it is still open (ideas). (2) `Set.fromList` and `Map.fromList` are 14 to 16%
+  slower than on the old Deque and the same as they were on `Data.Sequence` (31.4, 29.0 µs).
+  (3) With the JIT on, `Map.fromList` reads 1.13× the interpreter (1.09× in a second run;
+  it was 1.07×). It is interpreted in both modes, and its only exits are the benchmark
+  harness calling it (`repeat`'s call to its argument), the shape step 8 found to differ by
+  7 to 15% between runs for no reason found. (4) **`Remote.Ref` with the JIT on got worse
+  and erratic: 34.3 ms, then 61.9 ms in a second run, against 26 to 27 ms before** and
+  19.6 ms interpreted. It is a single run of 20 ms early in the suite that takes 20 exits,
+  so the time is going to something concurrent with it (the compile thread, or a major GC
+  it provokes), not to exits. Not investigated yet; first thing to look at next.
+
+  `jitSuite` (`off`, then `on`): 66.9 ms / 320 µs, 1.39 ms / 41.2 µs, 86.7 µs / 17.2 µs,
+  87.3 µs / 4.87 µs, 1.70 ms / 224 µs, 786 µs / 62.4 µs, 1.17 ms / 48.6 µs, 849 µs / 51.2 µs,
+  7.84 ms / 68.9 µs, text append 1.51 ms / 556 µs, text drop 11.9 ms / 3.56 ms. None of
+  these use list primitives in their loops, and none moved.
+
+  Exits: the list section of the test transcript takes no exit except preemption polls.
+- Since this change the test transcript's list section also covers `++`, `take`, `drop`,
+  the split patterns and literals, and the matrix has a run with
+  `UNISON_JIT_STRESS=lists=20000`.
+
 - Debug-runtime (`-DS`) runs after steps 5, 5b and 7 (commit 88136dc40), 2026-10-02, all
   with no assertion failures: the tests with `on` and `THRESHOLD=1` (7 min), with `eager`
   (9 min), with `on`, `THRESHOLD=2`, both costs 0 and `install=5,pool=8,alloc=64,poll=7`
@@ -567,48 +614,63 @@ are listed per step; the full table comes at step 8.
 - A last `suite` and `jitSuite` with `on` after step 7: no entry moved (`fib 20` read
   45.7 µs in that run, 41.2 µs in the one before).
 
-## The list representation: `Unison.Util.Deque` (2026-10-01)
+## The list representation: `Unison.Util.Deque2` (2026-10-02)
 
-A Unison `List` is now a `Unison.Util.Deque Val` instead of a `Data.Sequence` (Paul's
-structure, in `lib/unison-util-rope`; every field strict, so native code can read and build
-lists without meeting a thunk). `USeq`, `WrapSeq` and the five runtime modules that touch
-lists use it; `ANF.Value`'s lists and `Term.List` are still `Data.Sequence` and convert at
-the boundary.
+A Unison `List` is a `Unison.Util.Deque2 Val`: a strict finger tree (in
+`lib/unison-util-rope`; every field strict, so native code can read and build lists without
+meeting a thunk). It replaced `Unison.Util.Deque`, which had replaced `Data.Sequence` the day
+before; the old module is still in the package, used only by the benchmark. `USeq`,
+`WrapSeq` and the runtime modules that touch lists import it; `ANF.Value`'s lists and
+`Term.List` are still `Data.Sequence` and convert at the boundary.
 
+- The structure: a prefix digit, a strict middle of nodes, a suffix digit. Digits are strict
+  lists of up to ten items; a node is eight leaves inline or an array of two to eight
+  children; both digits of a tree with a middle have an item. Pushes and pops are amortized
+  O(1) when a list is used once and O(log n) in the worst case, which a program can only hit
+  repeatedly by going back to the same old version.
 - Tests: `stack build --fast --flag unison-runtime:jit --test unison-util-rope` (about a
-  minute). They compare with `Data.Sequence` as a model and check the structure's
-  invariants (`valid`) after every step.
-- Benchmark against `Data.Sequence`:
+  minute) runs the same tests on both structures (`util-rope-tests` and `deque2-tests`).
+  They compare with `Data.Sequence` as a model and check the structure's invariants
+  (`valid`) after every step.
+- Benchmark against `Data.Sequence` and the old Deque:
   `stack build --work-dir .stack-work-opt --flag unison-runtime:jit --bench unison-util-rope`
-  (about 6 minutes; `--ba "--csv FILE"` for the numbers).
-- `Deque.hs` is compiled with `-O2 -funbox-strict-fields` in every build: the JIT's C
+  (about 10 minutes; `--ba "--csv FILE"` for the numbers).
+- `Deque2.hs` is compiled with `-O2 -funbox-strict-fields` in every build: the JIT's C
   helpers depend on its constructor layouts.
 - Because every package depends on `unison-util-rope`, a change to it rebuilds all the local
   packages in whichever work dir is built next (about 5 minutes for `--fast`).
+- **The C helpers in `cbits/jit_rt.c` are ports of this module's operations** (cons, snoc,
+  uncons, unsnoc, lookup, take, drop, append). A change to the Haskell has to be made in
+  the C too. What keeps them together: the startup check runs every helper against the
+  Haskell operation on a set of sample lists and turns the JIT off if they differ, and
+  `UNISON_JIT_STRESS=lists=N` runs N random operations through the helpers at startup,
+  each on the results of earlier ones, checking every result's structure (in C and with
+  `valid`) and elements against Haskell. Run that with a few hundred thousand steps after
+  touching either side (300,000 steps take about 35 s on the optimized build), on the debug
+  runtime too. `UNISON_JIT_LOG=1` prints how long the startup checks took.
 
-Time per operation, Deque with its ratio to `Data.Sequence` (below 1: the Deque is faster),
-optimized build, after the tuning done on 2026-10-01:
+Time per operation as a ratio to `Data.Sequence` (below 1: Deque2 is faster), optimized
+build, 2026-10-02:
 
 | Operation | n = 10 | n = 100 | n = 10,000 | n = 1,000,000 |
 | --- | --- | --- | --- | --- |
-| snoc (cons is the same) | 5.7 ns (1.07×) | 14.0 (1.85×) | 14.6 (1.42×) | 26.6 (0.92×) |
-| uncons | 8.9 (1.07×) | 11.2 (1.05×) | 10.3 (0.90×) | 10.4 (0.88×) |
-| unsnoc | 3.6 (0.44×) | 12.4 (1.18×) | 10.4 (0.91×) | 10.4 (0.90×) |
-| snoc n, then uncons n | 14.5 (1.04×) | 25.8 (1.37×) | 25.3 (1.06×) | 35.7 (0.86×) |
-| queue at a steady size | 26.4 (1.77×) | 21.6 (1.10×) | 24.0 (0.93×) | 46.8 (0.85×) |
-| lookup | 9.8 (1.01×) | 18.7 (0.78×) | 47.9 (0.49×) | 82.3 (0.45×) |
-| take | 12.8 (0.99×) | 66.4 (1.89×) | 207 (1.48×) | 367 (1.47×) |
-| drop | 14.9 (1.14×) | 94.8 (2.68×) | 220 (1.57×) | 378 (1.56×) |
-| take/drop within 4 of an end | 15.9 (1.28×) | 27.8 (2.13×) | 13.1 (1.01×) | 13.1 (0.98×) |
-| append of two halves | 20.9 (1.89×) | 175 (5.4×) | 376 (4.0×) | 468 (2.8×) |
-| append of 1 to 4 elements | 100 (3.5×) | 100 (3.5×) | 74 (2.6×) | 74 (2.6×) |
-| `foldl'`, per element | 4.9 (0.43×) | 4.0 (0.39×) | 3.7 (0.36×) | 4.0 (0.38×) |
-| toList, per element | 5.0 (0.79×) | 4.4 (0.55×) | 4.1 (0.50×) | 15.8 (1.01×) |
-| `==`, per element | 14.4 (1.32×) | 8.3 (0.77×) | 8.2 (0.72×) | 32.8 (0.82×) |
+| snoc (cons is the same) | 0.80 | 0.92 | 0.73 | 0.65 |
+| uncons | 0.97 | 0.51 | 0.46 | 0.47 |
+| unsnoc | 0.40 | 0.51 | 0.46 | 0.45 |
+| queue at a steady size | 0.78 | 0.47 | 0.43 | 0.62 |
+| lookup | 1.03 | 0.46 | 0.33 | 0.30 |
+| take | 0.78 | 0.70 | 0.97 | 1.05 |
+| drop | 1.04 | 1.13 | 1.23 | 1.33 |
+| append of two pieces | 1.50 | 1.56 | 1.84 | 1.74 |
+| append of 1 to 4 elements | 1.16 | 1.03 | 0.95 | 0.94 |
+| `foldl'` | 0.45 | 0.38 | 0.43 | 0.44 |
+| toList | 0.81 | 0.84 | 0.87 | 1.29 |
+| `==` | 1.27 | 0.79 | 0.77 | 0.84 |
+| fromList | 2.6 | 3.4 | 3.2 | 0.90 |
 
-The snoc row flatters `Data.Sequence`, which defers work into thunks; "snoc then uncons" is
-the fair comparison. Left for later: `append` (builds each level's seam as a list, then packs
-it), `take`/`drop` around 100 elements, the queue pattern on very small lists.
+At 10,000 elements: snoc 7.5 ns, uncons 5.3 ns, lookup 32 ns, append 172 ns
+(`Data.Sequence`: 10.3, 11.5, 96, 95; the old Deque: 14.8, 10.2, 50, 384). Left for later:
+`append` of two large pieces, `drop`, and `fromList` of a long list (see the ideas).
 
 ## Baseline: interpreter only
 
@@ -779,3 +841,20 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   created before the stress settings were read (a livelock under `poll` stress on one
   thread only). `Unison.Util.Skews`, another candidate structure of Paul's, sits in the same
   package untested.
+- 2026-10-02: lists moved to `Unison.Util.Deque2` (Paul: "swap Deque2 into the runtime ...
+  all the builtin operations on lists fully ported to native code, so no call-outs or
+  exits"). The runtime change was the import in five modules. The C list helpers were
+  rewritten as ports of Deque2's operations: one set of functions handles the top level
+  and the levels of nodes below it, the common pushes and pops keep a single-allocation
+  path, and take, drop, append, the two splits and list literals are native for the first
+  time. Things worth remembering: (1) the port passed on its first run, and what gives
+  confidence in it is the random test (`lists=N`), not the transcript; a planted bug in a
+  rare append case was caught by the ordinary startup check. (2) On the optimized build
+  the startup check first failed closed: GHC had made a top-level constant of a sample
+  list, and `seq` before storing it left a reference to the unevaluated constant in the
+  array. Samples are now evaluated with `evaluate`. The fast build never showed this, so
+  **run the test matrix's first few configurations on the optimized build too** before
+  believing a benchmark, and check the log for "the JIT is off". (3) The log's time for the list check (56 ms on the optimized build, 85 ms on the fast
+  one) overstates it: on the fast build the check's own parts add up to about 40 ms, and
+  the rest is spent before its first step, probably on the first use of the builtin type
+  references. Worth a look if startup time ever matters.
