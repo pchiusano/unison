@@ -1,4 +1,8 @@
 {-# LANGUAGE BangPatterns, GADTs, UnboxedTuples, MagicHash, PatternSynonyms, ViewPatterns, TypeFamilies #-}
+-- The JIT's C helpers read and build these constructors (unison-runtime's
+-- cbits/jit_rt.c), so their layout must be the same in every build: fields are
+-- unpacked only when optimizing.
+{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
 -- | A strict, finger-tree style deque.
 --
 -- * worst-case O(1) 'cons', 'snoc', 'uncons', 'unsnoc', 'size'
@@ -15,7 +19,7 @@ module Unison.Util.Deque
   , empty, singleton
   , cons, snoc, append
   , (<|), (|>), (><)
-  , fromList, fromFunction
+  , fromList, fromListN, fromFunction
     -- * Queries
   , size, length, null
   , lookup
@@ -925,16 +929,66 @@ take i d@(Deque sz np pl ns sl tl subs)
 toList :: Deque a -> [a]
 toList = foldrI (:) []
 
+-- | O(n).  Builds the levels directly rather than element by element: each
+-- level gets a prefix of two to nine elements and a suffix of two, and what
+-- is between them goes, in nodes of eight, to the level below.
 fromList :: [a] -> Deque a
-fromList = L.foldl' snoc empty
+fromList xs = fromListN (L.length xs) xs
+
+-- | 'fromList' for a list whose length is known.
+fromListN :: Int -> [a] -> Deque a
+fromListN n xs
+  | n <= 0 = Nil
+  | n <= 2 * bGreen =                               -- a single level
+      let !k = if n <= 3 then n else n `div` 2
+      in case takeL k xs of
+           (# pl, rest #) -> Deque n k pl (n - k) (revL rest) YN SN
+  | otherwise =
+      let !k = (n - 4) `div` 8                      -- nodes for the level below
+          !p = n - 2 - 8 * k                        -- 2..9
+      in case takeL p xs of
+           (# pl, rest #) -> case leafNodes k rest of
+             (# nodes, rest' #) -> mkTop n (Dig p 0 pl) (Dig 2 0 (revL rest')) (buildRest k nodes)
+
+-- the first k elements, in order, and the rest (k is small)
+takeL :: Int -> [a] -> (# SList a, [a] #)
+takeL 0 ys       = (# SEmpty, ys #)
+takeL k (y : ys) = case takeL (k - 1) ys of (# l, r #) -> (# SCons y l, r #)
+takeL _ []       = (# SEmpty, [] #)
+
+revL :: [a] -> SList a
+revL = go SEmpty where go acc []       = acc
+                       go acc (y : ys) = go (SCons y acc) ys
+
+-- k nodes of eight elements each from the front of a list, in order
+leafNodes :: Int -> [a] -> (# SList (Node a), [a] #)
+leafNodes = go SEmpty
+  where
+    go acc 0 ys = (# revS acc, ys #)
+    go acc k (a : b : c : d : e : f : g : h : ys) = go (SCons (N8 8 a b c d e f g h) acc) (k - 1) ys
+    go _ _ _ = error "fromList: the list is shorter than its length"
+
+-- the levels holding c nodes, given in order
+buildRest :: Int -> SList (Node x) -> Rest (Node x)
+buildRest c ns
+  | c == 0 = noRest
+  | c <= 2 * bGreen = mkRest (splitLvl nodeSize (if c <= 3 then c else c `div` 2) c ns) noRest
+  | otherwise =
+      let !k = (c - 4) `div` 8
+          !p = c - 2 - 8 * k
+      in case innerNodes SEmpty k (dropS p ns) of
+           (# nodes, rest #) ->
+             mkRest (Lvl (mkDig nodeSize p (takeS p ns)) (mkDig nodeSize 2 (revS rest))) (buildRest k nodes)
+
+innerNodes :: SList (Node (Node x)) -> Int -> SList (Node x) -> (# SList (Node (Node x)), SList (Node x) #)
+innerNodes acc 0 ys = (# revS acc, ys #)
+innerNodes acc k ys = let !nd = nodeFromFwdN ys in innerNodes (SCons nd acc) (k - 1) (dropS 8 ys)
 
 -- | @fromFunction n f@ is @f 0, f 1, ..., f (n - 1)@.
 fromFunction :: Int -> (Int -> a) -> Deque a
 fromFunction n f
   | n < 0     = error "Deque.fromFunction called with negative len"
-  | otherwise = go 0 empty
-  where go !i !acc | i == n    = acc
-                   | otherwise = go (i + 1) (snoc acc (f i))
+  | otherwise = fromListN n (L.map f [0 .. n - 1])
 
 singleton :: a -> Deque a
 singleton x = Deque 1 1 (SCons x SEmpty) 0 SEmpty YN SN
@@ -1252,11 +1306,11 @@ instance Foldable Deque where
 
 -- | Rebuilds the sequence.  O(n).
 instance Functor Deque where
-  fmap f = foldlD' (\acc x -> snoc acc (f x)) empty
+  fmap f d = fromListN (size d) (L.map f (toList d))
 
 -- | Rebuilds the sequence.  O(n).
 instance Traversable Deque where
-  traverse f d = fromList <$> traverse f (toList d)
+  traverse f d = fromListN (size d) <$> traverse f (toList d)
 
 instance (Eq a) => Eq (Deque a) where
   a == b = size a == size b && toList a == toList b

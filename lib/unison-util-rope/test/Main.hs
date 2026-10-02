@@ -27,7 +27,8 @@ same d s = do
 -- The same sequence built in different ways, so with different shapes inside.
 shapes :: [Int] -> [(String, Deque Int)]
 shapes xs =
-  [ ("snoc", D.fromList xs),
+  [ ("snoc", L.foldl' D.snoc D.empty xs),
+    ("fromList", D.fromList xs),
     ("cons", foldr D.cons D.empty xs),
     ("outward", outward),
     ("append left", L.foldl' D.append D.empty (map D.fromList (chunks [1, 2, 5, 9, 14, 23, 40, 77] xs))),

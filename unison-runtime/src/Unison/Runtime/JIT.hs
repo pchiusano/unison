@@ -26,7 +26,7 @@ import Unison.Runtime.JIT.Compile
 import Unison.Runtime.JIT.Config
 import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.LLVM
-import Unison.Runtime.JIT.Layout (probeLayouts)
+import Unison.Runtime.JIT.Layout (probeLayouts, probeLists, probeNames, probeTexts)
 import Unison.Runtime.JIT.Native (configureNative, ctxLayout, rtsFacts)
 import Unison.Runtime.MCode (CombIx (..), GComb (..), GCombInfo (..), NativeCell, claimNativeCell, combDeps, nativeCellRequested, noNativeCell, prettyIns, prettySection, readNativeCount, releaseNativeCell, takeNativeCell, writeNativeCount)
 import Unison.Runtime.Machine.Types (CCache (combRefs, combs), MCombs)
@@ -56,7 +56,12 @@ jitState = unsafePerformIO (newIORef Nothing)
 -- compile thread, which starts LLVM when the first request arrives, so
 -- that a program that never gets hot pays nothing.
 startJIT :: IO ()
-startJIT = case mode config of
+startJIT = do
+  when (statsEach config) (writeIORef outputHook printExitsSinceOutput)
+  startCompiler
+
+startCompiler :: IO ()
+startCompiler = case mode config of
   Off -> pure ()
   Eager ->
     readIORef jitState >>= \case
@@ -74,7 +79,16 @@ initJIT = do
   case r of
     Left e -> jitLog (e ++ "; the JIT is off")
     Right () -> do
-      layouts <- probeLayouts
+      layouts <- probeLayouts >>= \case
+        Left e -> pure (Left e)
+        -- the list helpers are part of the generated code's contract too
+        Right ls ->
+          probeLists ls >>= \case
+            Left e -> pure (Left e)
+            Right () ->
+              probeTexts ls >>= \case
+                Left e -> pure (Left e)
+                Right () -> fmap (const ls) <$> probeNames ls
       (offs, _) <- ctxLayout
       case (layouts, offs) of
         (Left e, _) -> jitLog (e ++ "; the JIT is off")
@@ -100,7 +114,7 @@ jitCompileGroup ref grp cmbs = case mode config of
       Nothing -> pure ()
       Just st -> do
         types <- readIORef dataTypes
-        let (now, _) = groupUnits False ref grp cmbs
+        (now, _) <- groupUnits False ref grp cmbs
         compileUnits st types ("unison_" ++ show grp) False now
   _ -> pure ()
 
@@ -222,13 +236,14 @@ compileThread = do
                 modifyIORef' callersRef (indexCallers cache)
                 Callers _ callers <- readIORef callersRef
                 members <- formBatch cache callers grp
-                let (now, later) =
-                     unzip
-                       [ groupUnits True ref g cmbs
-                         | g <- members,
-                           Just cmbs <- [EC.lookup g cache],
-                           Just ref <- [EC.lookup g refs]
-                       ]
+                (now, later) <-
+                  unzip
+                    <$> sequence
+                      [ groupUnits True ref g cmbs
+                        | g <- members,
+                          Just cmbs <- [EC.lookup g cache],
+                          Just ref <- [EC.lookup g refs]
+                      ]
                 -- pending before the groups' code can exit to them
                 forM_ (concat later) addPending
                 guarded ("unison_" ++ show grp) (compileUnits st types ("unison_" ++ show grp) True (concat now))
@@ -272,7 +287,7 @@ compileThread = do
         Right () -> pure ()
 
 -- | Prints how often each exit was taken, when UNISON_JIT_STATS is set.
--- Meant to be called when the runtime shuts down.
+-- Called after each evaluation.
 printJITStats :: IO ()
 printJITStats = when (stats config) $ do
   t <- compileTotals
@@ -280,12 +295,33 @@ printJITStats = when (stats config) $ do
     ( "[jit] compiled " ++ show (ctModules t) ++ " modules: " ++ show (ctFunctions t) ++ " functions, "
         ++ show (ctAuxiliary t) ++ " auxiliary functions with them, " ++ show (ctOnDemand t)
         ++ " re-entry functions on demand (" ++ show (ctPending t) ++ " never asked for); "
+        ++ show (ctNotWorthIt t) ++ " left interpreted by the exit rule; "
         ++ show (ctIRBytes t `div` 1024) ++ " KB of IR, " ++ show (fromIntegral (ctNanoseconds t) / 1e6 :: Double) ++ " ms"
     )
+  printExits maxBound
+  when (statsEach config) resetExitCounts
+
+-- | With @UNISON_JIT_STATS=each@: the exits taken since the program last
+-- wrote output (the busiest sites only), after which counting starts again.
+printExitsSinceOutput :: IO ()
+printExitsSinceOutput = do
+  printExits 12
+  resetExitCounts
+
+printExits :: Int -> IO ()
+printExits most = do
+  entered <- entryCounts
+  let enteredTotal = sum (map snd entered)
+  when (enteredTotal > 0) $ do
+    jitDump ("[jit] " ++ show enteredTotal ++ " entries into native code from the trampoline (" ++ show (length entered) ++ " functions):")
+    forM_ (take most (sortOn (negate . snd) entered)) $ \(name, n) ->
+      jitDump ("  " ++ show n ++ "\t" ++ name)
   counts <- exitCounts
-  jitDump ("[jit] exits taken (" ++ show (length counts) ++ " sites):")
-  forM_ (sortOn (\(_, _, n) -> negate n) counts) $ \(i, e, n) ->
-    jitDump ("  " ++ show n ++ "\t#" ++ show i ++ "\t" ++ describe e)
+  let total = sum [n | (_, _, n) <- counts]
+  when (total > 0) $ do
+    jitDump ("[jit] " ++ show total ++ " exits taken (" ++ show (length counts) ++ " sites):")
+    forM_ (take most (sortOn (\(_, _, n) -> negate n) counts)) $ \(i, e, n) ->
+      jitDump ("  " ++ show n ++ "\t#" ++ show i ++ "\t" ++ describe e)
   where
     describe = \case
       Resume cix sect -> "resume " ++ show cix ++ " at " ++ takeWhile (/= '\n') (dropWhile (== ' ') (prettySection 0 sect ""))

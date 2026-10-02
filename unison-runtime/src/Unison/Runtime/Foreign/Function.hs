@@ -189,6 +189,7 @@ import Unison.Runtime.Crypto.Rsa qualified as Rsa
 import Unison.Runtime.Exception (die, exn)
 import Unison.Runtime.FFI.DLL
 import Unison.Runtime.Foreign.Dynamic as Dyn
+import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.Foreign.Function.Type
   ( ForeignFunc (..),
     foreignFuncBuiltinName,
@@ -287,7 +288,10 @@ foreignCallHelper = \case
     \(h, n) -> Bytes.fromArray <$> hGet h n
   IO_getSomeBytes_impl_v1 -> mkForeignIOF $
     \(h, n) -> Bytes.fromArray <$> hGetSome h n
-  IO_putBytes_impl_v3 -> mkForeignIOF $ \(h, bs) -> hPut h (Bytes.toArray bs)
+  IO_putBytes_impl_v3 -> mkForeignIOF $ \(h, bs) -> do
+    hPut h (Bytes.toArray bs)
+    -- for the JIT's per-output statistics; nothing unless they are on
+    when (JIT.statsEach JIT.config) (UnliftIO.hFlush h >> JIT.noteOutput)
   -- TODO: Use `PA.withMutableByteArrayContents` here once we have Data.Primitive v9.
   IO_fillBuf_impl_v1 -> mkForeignIOF $ \(h, arr, n) -> do
     sizeof <- PA.getSizeofMutableByteArray arr
@@ -1115,7 +1119,7 @@ foreignCallHelper = \case
           | m < n = fromIntegral $ n - m
           | otherwise = 0
         mk i = NatVal $ m + fromIntegral i
-     in evaluate . forceListSpine $ Sq.fromFunction sz mk
+     in evaluate (Sq.fromFunction sz mk)
   List_sort -> mkForeign $ \(l :: USeq) -> pure $ Sq.unstableSort l
   Multimap_fromList -> mkForeign $ \(l :: [(Val, Val)]) -> do
     let listVals = l <&> \(k, v) -> (k, Sq.singleton v)

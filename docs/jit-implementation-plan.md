@@ -278,6 +278,13 @@ Everything needed to run one compiled function end to end, with the smallest use
 
 ### M6: performance and release (L)
 
+**Re-scoped 2026-10-01**, see [jit-m6.md](jit-m6.md): running the full `suite` with the JIT on
+showed most library code slower than the interpreter, because of exits. M6 is now about
+removing that (fewer and cheaper exits, and not compiling what would mostly exit) and about
+workers. Its exit criterion: no `suite` entry more than 15% slower with the JIT on. The
+release items below (static linking, other platforms, documentation, on by default) moved to
+the ideas document for a later milestone. The original list, for the record:
+
 Driven by measurements from M5, so the list is provisional.
 
 - Worker functions with register arguments for calls within a batch. A self-recursive function is its own batch, so `fib` can have its worker call itself directly before batching exists. A worker's exit status has to come back through the register chain (a two-word return, or the result in `Ctx` and the status returned), and each worker frame still writes its slots and frame record on the way out. (Noted 2026-09-30 after reading the O2 output for `fib`.)

@@ -72,6 +72,9 @@ data PoolKey
     -- same closure the interpreter builds for @App (Env cix) ZArgs@.
     -- Interned by the CombIx alone (the combinator has no Ord).
     KeyComb !CombIx !(GCombInfo MComb)
+  | -- | the boxed part of a top-level value that was evaluated when its
+    -- definition was loaded (a @CachedVal@), by its CombIx
+    KeyCached !CombIx !Closure
 
 instance Eq PoolKey where
   a == b = compare a b == EQ
@@ -85,12 +88,16 @@ instance Ord PoolKey where
     (KeyLit {}) _ -> LT
     _ (KeyLit {}) -> GT
     (KeyComb c _) (KeyComb c' _) -> compare c c'
+    (KeyComb {}) _ -> LT
+    _ (KeyComb {}) -> GT
+    (KeyCached c _) (KeyCached c' _) -> compare c c'
 
 instance Show PoolKey where
   show = \case
     KeyEnum r t -> "KeyEnum " ++ show r ++ " " ++ show t
     KeyLit l -> "KeyLit " ++ show l
     KeyComb c _ -> "KeyComb " ++ show c
+    KeyCached c _ -> "KeyCached " ++ show c
 
 data Pool = Pool
   { poolArray :: !(MutableArray RealWorld Closure),
@@ -153,6 +160,7 @@ closureFor = \case
   -- the segment's boxes must be evaluated (native code reads through
   -- them); nullSeg's components are CAFs, so force them
   KeyComb cix comb -> let (u, b) = nullSeg in u `seq` b `seq` PAp cix comb (u, b)
+  KeyCached _ c -> c
   KeyLit l -> case l of
     MT t -> Foreign (Stack.WrapText t)
     MM r -> Foreign (Stack.WrapReferent r)

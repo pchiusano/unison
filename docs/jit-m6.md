@@ -1,0 +1,488 @@
+# M6: real programs
+
+Working plan for milestone M6 of the [implementation plan](jit-implementation-plan.md). Written
+2026-10-01, before starting; the checkboxes are ticked as steps land. Each step is a commit.
+
+**This plan changes what M6 is** (agreed with Paul, 2026-10-01). The implementation plan had
+M6 as "performance and release": workers with register arguments first, then builtins, then
+release work. Before writing this I ran the older, broader benchmark suite (`suite`: lists,
+maps, text, JSON, abilities) with the JIT on, which nobody had done since M0. Most of it is
+*slower* than the interpreter. So M6 is about two things only: removing the negative impact of
+turning the JIT on, by reducing exits, and the worker/wrapper separation. Release work (static
+linking of LLVM, Linux, documentation, the on-by-default decision) is out, and listed in the
+[ideas](jit-optimization-ideas.md) for a later milestone.
+
+**Goal.** With `UNISON_JIT=on`, a program made of ordinary library code is not slower than
+with the JIT off, and the code the JIT already handles well gets faster again.
+
+Exit criteria:
+
+- No entry in `suite` is more than 15% slower with `on` than with `off`.
+- The entries that are faster today stay faster, and `jitSuite` has no regression.
+- `fib 20` at least 2× faster than at M5 (45 µs or less), from workers.
+- The cross-definition benchmark at least 2× faster batched than unbatched.
+- A target, not a criterion: `List.map` and `List.foldLeft` in `suite` faster than the
+  interpreter. Whether that is reachable depends on the list step's spike.
+
+Workers are in part 2, but they change the benchmark numbers too (less stack traffic per
+call means a function needs fewer instructions to pay for an exit). If part 1 has trouble
+reaching 15%, workers move forward.
+
+## What the measurements say
+
+`suite`, optimized build, 2026-10-01, `off` against `on` (one run each; the full table is in
+the [progress log](jit-progress.md)). Of 38 entries, 9 are faster (counting loops 17 to 135×,
+the match benchmarks 15 to 80×, `Ref` 8.5×), 5 are the same, and 24 are slower: most by 1.1 to
+1.5×, `List.foldLeft` 1.8×, JSON decoding 1.9×, the three ability-based `fib`s 2 to 2.5×,
+`Stream` 2.4×, `CAS` 2.5×, `Remote.Ref` 5.3×.
+
+The cause is always the same: the code leaves native code and comes back, often. A round trip
+through the trampoline costs on the order of 50 ns (`Map.lookup`, whose benchmark body is one
+foreign call, goes from 202 to 252 ns), and an interpreted instruction costs 5 to 10. So a
+function that does one call-out per call and little else is slower compiled. Worse, an exit
+inside a callee unwinds every native caller above it, and each of those comes back in through
+a re-entry point.
+
+The suite took 107 million exits. By kind:
+
+| Exits | What | Example | Fix |
+| --- | --- | --- | --- |
+| 28 M | `Let` whose binding can't be called natively | `fib1`: its body starts with `NMatch`, which the generator refuses at the start of a function though it compiles it elsewhere, so every recursive call exits. Also calls to builtin functions passed as values (`List.map increment`): builtins have no cell | step 1, step 2 |
+| 37 M | list primitives: `VWLS` (pattern match on a list) 19 M, `SNOC` 12 M, `IDXS` 6 M | every list loop in base | step 5 |
+| 17 M | foreign calls (`Map_lookup`, `Map_insert`, JSON, patterns) | functions that are a wrapper around one foreign call get compiled, and exit | step 1, step 3 |
+| 10 M | `App (Dyn i)`: a call to an ability handler | the ability `fib`s, `Stream`, `Remote.Ref` | step 6 |
+| 6 M | `Name` (build a partial application), `SetAff`, `Reset` | effectful loops | step 7 |
+| 5 M | primitives with no native version: `NOTB`, `REFN`, `RRFC`, `TIKR`, `RefCAS`, `EQLT`, `LZRO`, `Seq` | | step 1 |
+
+One measurement trap, found on the way: `UNISON_JIT_STATS=1` made every exit sum all the
+per-site counters, so the first run showed slowdowns of 20 to 50×. The numbers above are
+without statistics. Fixed in step 0.
+
+## Order of work
+
+**Part 1: stop losing to the interpreter.**
+
+- [x] **0. Make `suite` part of the routine.** A transcript `transcripts-manual/jit-suite.md`
+  that runs `suite`; counting an exit becomes O(1); `UNISON_JIT_STATS` can attribute exits to
+  the benchmark that took them (print and reset after each `printTime`, or per `run`). Record
+  the baseline table. Check: the statistics run and the plain run give the same timings
+  within noise. *Done:* `UNISON_JIT_STATS=each` prints the exits taken since the program
+  last wrote output and starts counting again, so each benchmark's line is followed by its
+  own exits. Exit counters are a flat array (one atomic add per exit). The statistics run
+  is 0 to 7% slower than the plain one on the exit-heavy entries.
+- [x] **1. Don't compile what would mostly exit** (Paul's idea, 2026-10-01). A static rule,
+  applied to each function before it is compiled. What compiling a node saves is the
+  interpreter's overhead for it (dispatch and stack traffic, 5 to 10 ns for a simple
+  instruction), not the instruction's own work, which costs the same either way and can be
+  much more. What an exit costs is a round trip out of native code and back, about 50 ns. So
+  native code loses when it exits more than about once per seven nodes it runs natively.
+  - *The estimate.* Walk the function's MCode tree and compute, for an average path from
+    entry to return, the number of nodes and the number of *certain* exits. A combinator
+    body has no loops, so a path is just a walk down the tree. At a branch, the arms are
+    averaged with equal weight, leaving out arms that can't return (`Die`).
+  - *What counts as a certain exit:* an instruction with no native version (a call-out, or a
+    resume); a call to a function that is known not to be native (see below). What doesn't:
+    exits on a slow path (a fast path's miss, stack growth, the poll, a callee that happens
+    to exit), since those are rare by construction. A call to a function value counts as no
+    exit: nothing is known about it.
+  - *The rule.* If `exits × E > saving` the function is left interpreted. The saving is the
+    sum over the nodes that run natively of the interpreter overhead each avoids, in units of
+    one simple instruction: 1 for an instruction or a branch, more for a call or a `let` (the
+    interpreter pushes a frame and moves arguments; `fib` suggests about 3), and 0 for a
+    node that is itself a call-out, since its work is done by the interpreter anyway. E is
+    the cost of a round trip in the same units (`UNISON_JIT_EXIT_COST`, default 7; Paul's
+    first suggestion was the equivalent of about 3). The weights and E are set from step 3's
+    measurements. Its cell's state
+    becomes "taken" and it also records "not native", so nobody asks again.
+  - *It propagates.* A call to a function marked "not native" is a certain exit for its
+    caller, so a function whose body is mostly calls to such functions is left interpreted
+    too. Builtins that can't be compiled and wrappers around one foreign call are the base
+    cases; no special case is needed for wrappers.
+  - The same rule is applied to re-entry functions when they are asked for.
+  - The log says, for each function left interpreted, its nodes and exits.
+
+  Check: `Map.lookup`, `Map.insert` and `List.at` in `suite` are within noise of the
+  interpreter; the count of functions left interpreted, and that none of the benchmarks that
+  win today is among them.
+
+  *Done* (`JIT/Estimate.hs`; the verdict is a fourth word in the cell, and callees not yet
+  judged are judged recursively, so the outcome doesn't depend on timing). With E = 7 the
+  suite leaves 389 functions interpreted and compiles about 230. Slower by more than 15%
+  went from 16 entries to 9: `List.foldLeft` 1.81× to 1.00×, `List.map murmurHash` 1.42× to
+  1.02×, JSON decoding 1.94× to 1.10×, `Stream` 2.35× to 1.16×, `CAS` 2.47× to 1.18×,
+  `Remote.Ref` 4.1× to 1.39×, `Shuffle` 1.25× to 0.90×. `jitSuite` is unchanged. The check
+  as written is not met: `Map.lookup` 1.15×, `Map.insert` 1.11×, `List.at` 1.22×, `Decode Nat`
+  1.18×. The wrappers themselves are left interpreted, as intended; the exit that remains is
+  in the benchmark harness's `repeat` loop, which is compiled and calls the benchmark body
+  through a function value, once per iteration. That is the case the static rule can't see
+  (see the learnings). One winner lost ground: `NatMap.fromList` 0.68× to 0.80×.
+- [x] **2. Gaps in the code generator.** Small things the exit counts show, none needing
+  design:
+  - `startsSupported` and `genSection` disagree: `NMatch` (and anything else the generator
+    compiles in the middle of a function) is accepted at the start. With step 1 deciding
+    what is worth compiling, `startsSupported` can go. Check: `fib1` runs natively.
+  - A reference to a top-level value (`App (Env)` of a `CachedVal`) is a pool constant
+    instead of an exit.
+  - Native versions of the cheap primitives in the table (`NOTB`, `LZRO`, `TZRO`, `POPC`,
+    `EQLT` on single-chunk texts if the list step's probing makes it easy, `REFN`). `RefCAS`
+    and its ticket primitives stay call-outs unless the numbers after this step say
+    otherwise.
+
+  *Done:* a function may start with anything (the rule of step 1 decides; `startsSupported`
+  now only says whether a `let` binding is generated inline); cached top-level values are
+  pool constants (the boxed part) with the unboxed word as a literal; `NOTB`, `ANDB`, `IORB`
+  (on a boolean still in a register, or read from its closure), `LZRO`, `TZRO`, `POPC`.
+  `EQLT` waits for the text step; `REFN` and the CAS primitives were left (after step 1 the
+  code around them is interpreted). Results: `fib1` 1.96× slower to 12× faster (144 µs to
+  11.9 µs), "10k arithmetic operations" 1.00× to 57× faster (it is a loop over `fib1`-style
+  matches), `NatMap.fromList` 0.80× to 6.6× faster (`not` and `leadingZeros`).
+- [x] **3. A cheaper round trip.** First measure where the 50 ns go, with a micro-benchmark (a
+  loop whose body is one call-out) and a profile. Known costs to remove: the exit and frame
+  tables are `IORef (IntMap ...)` (make them arrays), frame records are copied into a
+  `malloc`'d buffer and then into a Haskell list, the pool is read through an `IORef` on every
+  entry, `Ctx` is found through thread-local storage. Target: half. Then set step 1's E from
+  the measured cost. Check: the micro-benchmark.
+
+  *Done.* The micro-benchmark is a loop of 100000 whose body is `Nat.pow acc 1` (a
+  call-out): 80.7 ns per iteration interpreted, 77.3 ns compiled before this step, 46.8 ns
+  after. Taking out the instruction itself (about 10 ns), a round trip went from about 67 ns
+  to about 37. What changed: the exit and frame tables are arrays (the lookup was 12% of the
+  profile); the trampoline's results (`ap`, `fp`, `sp`, up to eight frame records) come back
+  in 28 spare words past the last slot of the unboxed stack, so a round trip allocates
+  nothing (the pinned buffer was 15%, and an unpinned one still cost 7%, since
+  `newByteArray#` is a call into the runtime); one capability lookup and one thread-local
+  lookup instead of three; the trace and statistics flags are read once per trampoline run
+  (each read of a CAF is an indirect jump); a call-out's re-entry loops inside the
+  trampoline instead of calling it afresh. What is left is spread thin: native entry and
+  exit code 20%, `unison_jit_enter` 9%, thread-local lookups 6%, the interpreter's dispatch
+  of the instruction and the trampoline's Haskell the rest.
+  **E stays 7:** the suite was run with E = 7 and E = 4, and 4 is worse everywhere it
+  differs (`Remote.Ref` 1.40× against 1.22×, JSON decoding 1.19× against 1.04×,
+  `List.foldLeft` 1.14× against 0.99×). An exit costs more than its round trip: after a
+  resume the rest of the function runs interpreted.
+- [x] **4. Builtin functions as callees.** Builtin combinators (`Nat.increment` and the rest
+  of `builtinTermNumbering`) are ordinary MCode but have the shared empty cell, so a native
+  call to one through a closure always exits. They get cells when the runtime starts and are
+  compiled on demand like anything else (step 1's rule decides which are worth it). Check:
+  `List.map increment` takes no `resume at Let` exits.
+
+  *Done:* the builtin combinators get cells when the base code cache is built; `on` mode
+  compiles them when hot, eager mode at startup (166 are compiled, 1153 are wrappers around
+  a foreign call or a call-out and are left interpreted). Function names had to be made
+  unique for this: a second runtime in the process has its own cache with the same group
+  numbers, so a group number seen again with different cells gets a `_v2` suffix. On the
+  suite this step changes nothing by itself, because after step 1 the list functions that
+  call builtins through function values (`List.map`, `List.foldLeft`) are interpreted; it
+  is groundwork for native lists. One small loss: `List.foldLeft` 0.99× to 1.08×, see the
+  learnings.
+- [x] **5. Lists.** Decision D19 made list operations call-outs "at first", and they are 37
+  million of the exits.
+
+  **What was decided (Paul, 2026-10-01), replacing the first plan for this step.** The first
+  plan kept `Data.Sequence` and gave native code the cases that touch no thunk, with a spike
+  to count how often that is. Instead the representation changed: a Unison `List` is now a
+  `Unison.Util.Deque` (in `lib/unison-util-rope`), a strict deque in which every field is
+  evaluated, so native code can read and build any part of a list without ever meeting a
+  thunk, and no spike is needed. The swap is a change to five runtime modules
+  (`USeq = Deque Val`); `ANF.Value` and `Term.List` keep `Data.Sequence` and convert at the
+  boundary. The deque's module exports the names `Data.Sequence` uses, so the modules
+  changed their import and little else. Its speed against `Data.Sequence` is in the progress
+  log: at or near parity for the operations at the ends, `lookup` about 2× faster on large
+  lists, `take`/`drop` about 1.5× slower and `append` 3 to 5× slower (to be tuned later).
+
+  **How native code does list operations.** C helpers in `cbits/jit_rt.c`, called from
+  generated code like the allocator is. A helper is given the list's closure, does the
+  common case by reading the deque's constructors and allocating the result with the RTS's
+  `allocate`, and returns "not handled" for anything else, which the generated code treats
+  as the slow path: a call-out to the interpreter's own primitive. Helpers never call into
+  Haskell. The cases handled:
+  - `SIZS`: always.
+  - `VWLS`, `VWRS` (the views that list patterns compile to): when the end's digit has an
+    element to give without a repair, which is three or more elements, or any at all when
+    the deque has a single level.
+  - `CONS`, `SNOC`: when the end's digit keeps its color (one to eight elements, or up to
+    nine in a single-level deque), and onto the empty list.
+  - `IDXS` (`List.at`): always; the descent through the levels is in C.
+
+  The layouts of the deque's constructors are GHC's, so they are checked at startup the
+  way the closure layouts are: the helpers learn the constructors from sample lists, a C
+  walk checks the shape and the stored counts of every constructor in about 150 sample
+  lists of different shapes, and then every helper is run against the Haskell operation it
+  stands in for on each sample. If anything differs the JIT stays off. `Deque.hs` is
+  compiled with `-O2 -funbox-strict-fields` in every build so that the layouts don't depend
+  on the build's optimization level (as `Stack.hs` and `MCode.hs` already are).
+
+  Still call-outs after this step: `CATS`, `TAKS`, `DRPS`, `SPLL`, `SPLR`, and the repair
+  cases of the views and pushes. Whether they need helpers is decided by the exit counts.
+  Check: `List.map` and `List.foldLeft` in `suite` against the interpreter; heap sanity
+  checks on the debug runtime.
+
+  *Done* (2026-10-02). With the JIT on, against the interpreter on the same build:
+  `List.map increment` 151 µs to 64.8 µs (0.43×), `List.foldLeft` 1.16 ms to 343 µs
+  (0.30×), `List.at` 130 ns to 25 ns (0.20×), "Generate 100 random numbers" 0.47×,
+  `Shuffle` 0.51×. The M6 target for lists (faster than the interpreter) is met. In the
+  list tests about one view or push in eight still goes to the interpreter (the repair
+  cases); a single-level deque whose near digit is empty is rebalanced in C, since a queue
+  on a short list hits that every few steps.
+
+  The swap itself changed the interpreter's speed in a few places (JIT off, `Data.Sequence`
+  before, the deque after): `List.range 0 1000` 58 µs to 45 µs and `List.at` 146 ns to
+  130 ns are faster; JSON parsing 7.2 µs to 10.2 µs, complex JSON parsing 10.7 µs to 18.1 µs,
+  `Multimap.fromList` 64 µs to 83 µs and `Json.toText` 7.1 µs to 8.4 µs are slower. Why
+  JSON parsing is slower isn't known yet (the parser only snocs); it is the first thing to
+  look at when the deque is tuned further.
+- [x] **5b. Text.** The same pattern for `Text` (a `Unison.Util.Rope` of chunks, strict
+  throughout; see "Native `Text` operations" in the [ideas](jit-optimization-ideas.md)):
+  C helpers for `Text.size`, the simple cases of `Text.++`, and `Text.drop`/`Text.take`
+  within a chunk, with the call-out for the rest. Two benchmarks were added to `jitSuite`
+  for this on 2026-10-01: appending `"hi"` 10000 times, and `Text.drop 1` 100000 times over
+  `Text.repeat 100000 "a"`. Check: both benchmarks clearly faster than the interpreter.
+  `Bytes` uses the same rope and would get the same treatment; it is not in this milestone
+  (noted in the ideas).
+
+  *Done* (2026-10-02): size, `++`, take, drop and equality are C helpers that port the
+  Haskell rope operations (same results, same structure) and take every case, so the only
+  slow path is a closure that isn't a text. Appending `"hi"` 10000 times: 1.48 ms
+  interpreted, 1.08 ms with the JIT before, 548 µs now. `Text.drop 1` 100000 times:
+  11.7 ms, 9.19 ms, 3.54 ms. `Nat.toText`, `uncons`, comparison and the foreign functions
+  are still call-outs (ideas).
+- [x] **6. Calls to ability handlers.** `App (Dyn i)` finds the handler in the dynamic
+  environment, which lives in the interpreter's `HEnv`. **Measured first, and not built:**
+  a handler's function begins with `RMatch` on the request, and then either `Capture`s the
+  continuation (the general case) or, for a handler the compiler found to be affine, runs
+  `InLocal`, the handler body, `Name` and `SetAff`. Every one of those reads or changes the
+  handler environment or `K`, which only the interpreter can do, so a native call to the
+  handler would exit on its first instruction: the same one exit per request as today, in a
+  different place. Making requests native means giving native code the handler environment
+  and continuation capture, which is a design of its own (noted in the ideas). What this
+  step did instead is make the static rule see such code for what it is, see step 8: the
+  ability `fib`s went from 1.19× to 1.00×.
+- [x] **7. Partial applications.** `Name` (a function with some arguments captured) is a
+  call-out today; natively it is one allocation, like a constructor with three or more
+  fields. Under-saturated calls to function values, which build the same object, come with
+  it. Check: no `Name` call-outs in the effectful loops of `suite`.
+
+  *Done* (2026-10-02), for the two forms where the function is known when the code is
+  generated: the `Name` instruction, and a `let` that applies a known function to fewer
+  arguments than it takes (this, not `Name`, is what `f = add3 x y` compiles to). Both call
+  a C helper that copies the function's closure with the arguments added, up to four of
+  them. Not done: a function *value* applied to too few arguments (the arity is only known
+  at run time, and the generated code for closure calls would need a second way to
+  continue), and more than four arguments; both still resume in the interpreter (ideas).
+- [x] **8. Measure part 1.** `suite` and `jitSuite`, `off` against `on`, results in the
+  progress log. If the first exit criterion isn't met, look at what the static rule gets
+  wrong: the cases it can't see are calls to function values that turn out not to be native,
+  and handler calls. If those are what is left, add the dynamic version (the trampoline
+  counts a function's exits against its entries and clears the cell of one that exits nearly
+  every time), or bring workers forward, whichever the exit table points to.
+
+  *Done, with three refinements to the rule instead of a dynamic check*, each from a
+  benchmark that was still slow (`fib2`, `Remote.Ref`, `List.foldLeft`):
+  - **A call to a function that is certain to exit is an exit for the caller.** When a
+    callee exits, the caller's native frame is unwound with it, and the rest of the caller
+    comes back in through the trampoline. So a call that returns here adds the callee's
+    likelihood of exiting (its certain exits on an average path, at most one) to the
+    caller's exits. A function that calls itself is walked twice, the second time with
+    what the first walk found. The likelihood is kept in the cell next to the verdict.
+  - **Arms that loop or recurse weigh four times the arms that don't.** With equal weights
+    `fib2`'s two base cases hid the recursive case, which has two handler requests.
+  - **Too small to enter from the interpreter.** A function whose average path saves less
+    than `UNISON_JIT_ENTRY_COST` (3) and has no loop is compiled, and native callers call
+    it, but the interpreter keeps interpreting it: getting into native code costs about
+    20 ns, more than interpreting `x + 1`. The verdict word says so and the interpreter
+    reads it only when it finds code in the cell. This took `List.foldLeft` from 1.08× to
+    1.00× (the builtin `+`, called per element by the interpreted fold).
+  - Also: `Any` is a builtin type, so its constructor's shape was never registered and a
+    match on it exited every time (two exits per operation in `Remote.Ref`). Registered now.
+  - `UNISON_JIT_STATS` also lists how often the trampoline entered each native function.
+
+  Result (two runs, see the progress log): every entry of `suite` is within 10% of the
+  interpreter or faster, except `Remote.Ref` at 1.2 to 1.3×. That one is a single run of
+  20 ms, measured once, early in the suite; it takes no exits and enters no native code
+  while it is timed. What it pays is the JIT warming up next to it, mostly a major GC
+  (26 ms on this heap) that lands inside the measurement more often when the compile thread
+  is allocating. Run by itself three times in a row it is 57 ms, 18.7 ms, 17.7 ms with the
+  JIT and 20.6 ms, 19.0 ms, 19.0 ms without. So the first criterion is met for everything
+  that is measured in steady state, and not for a one-shot measurement during warm-up.
+
+**Part 2: faster native code.**
+
+- [x] **9. Workers with register arguments.** Every combinator compiled in a module gets a
+  *worker*: an internal LLVM function taking its arguments as parameters (a word and a
+  pointer per argument) and returning its result the same way, so a direct call in a module
+  touches the Unison stack not at all, and an inlined callee is plain SSA code in its caller.
+  The function the cell points to becomes a thin wrapper: load the arguments from the stack,
+  call the worker, store the result. Details in the decisions below. Check: `fib 20` at 45 µs
+  or less; the IR for `fib` has no stack traffic on the recursive path; the whole test matrix,
+  since every exit path changes.
+
+  *Done:* `fib 20` 88.6 µs to 41.2 µs. It took five things, measured one at a time:
+
+  | Change | `fib 20` |
+  | --- | --- |
+  | M5 | 88.6 µs |
+  | branch weights on every exit and slow-path branch (no workers yet) | 74.0 µs |
+  | workers: arguments and result in registers | 57.4 µs |
+  | no `ap` parameter (pending arguments handled in the wrapper), the C stack check once at entry instead of per call, the allocation budget read only by code that allocates | 49.5 µs |
+  | frame offsets computed where they are used, not at entry | 48.2 µs |
+  | the fast entry: base cases return before any check or register saving | 41.2 µs |
+
+  What differs from the shape planned below: workers aren't passed `ap` (see the design);
+  which functions get one is decided by generating them (how many values a `Yield (VArgV i)`
+  returns depends on the frame depth), with a fall-back to the uniform form; and the fast
+  entry, which wasn't planned. The "tail call this" status works as planned.
+  One old race came to light: with direct calls (since M5) a function can run, and take an
+  exit that says "call me again", before the compile thread has written its cell. The
+  trampoline now waits for the cell instead of reporting an error. The `install` stress mode
+  finds it within seconds once workers make the window larger.
+- [x] **10. The batch rule, again.** With workers, a batch should buy inlining across
+  definitions. Re-measure the cross-definition benchmark and the compile totals with batching
+  on and off, and settle the bar for callers and B. Check: the cross-definition benchmark at
+  least 2× faster batched than unbatched, or batching is reduced to what pays.
+
+  *Done:* the Collatz benchmark is 69 µs batched and 258 µs with `UNISON_JIT_BATCH=1`, 3.7×
+  (it was 267 against 290 at M5). Unbatched, each of its three definitions is a module of
+  its own and every call between them goes through a cell and the Unison stack. The bars
+  and B stay as they are: nothing in either suite argues for changing them, and eager mode
+  (one module per definition, 264 µs here) shows what not batching costs.
+- [x] **11. Measure.** Both suites, all three modes; update the progress log, the design and
+  the learnings below. *Done:* see the progress log. `suite` is where part 1 left it, with
+  `fib1` and `NatMap.fromList` faster again.
+
+## Decisions made while planning M6
+
+- **Exits before workers.** Workers make fast code faster; the suite says most library code
+  isn't fast yet. A user who turns the JIT on and sees their program slow down won't care
+  about `fib`.
+- **Release work is not in M6.** Static linking, Linux, documentation and the default-on
+  decision are in the ideas document, for a later milestone.
+- **The core rule stays: native code never calls into Haskell.** The alternative for
+  call-outs would be to run native code on a C stack of its own and switch stacks to let the
+  interpreter run one instruction, so that nothing unwinds. It was considered and set aside:
+  a GC can run during the instruction and move objects, so every native frame on the parked
+  stack would have to have its values on the Unison stack beforehand and reload them
+  afterwards, which is most of the cost of unwinding, plus a parked stack per Unison thread
+  and per nested evaluation. Recorded in the [ideas](jit-optimization-ideas.md). The plan
+  instead makes exits rarer (steps 2, 4, 5, 6, 7), cheaper (step 3), and keeps code that
+  would mostly exit out of native code altogether (step 1).
+- **The safety net is static, and decided before compiling.** The first draft of this plan
+  had a dynamic rule (count exits against entries at run time and drop native code that
+  exits nearly every time), which couldn't tell a function that is all call-outs from one
+  that does real work and then calls out once. Paul's suggestion solves that by looking at
+  the code: nodes on a path are the work, and both costs are known. It needs no run-time
+  bookkeeping, it handles thin wrappers with no special case, and it never compiles the code
+  it rejects. What it can't see is behaviour: which branch is taken, and whether a function
+  value turns out to be native. Equal weights for branches and "assume native" for function
+  values are the starting guesses; step 8 checks them against the suite.
+- **The text benchmarks start at break-even, not behind.** Appending `"hi"` 10000 times
+  takes 1.53 ms interpreted and 1.51 ms with the JIT; `Text.drop 1` 100000 times takes 13.1 ms
+  and 13.0 ms. Each iteration is one call-out, but the text operation itself is 100 ns or
+  more, and the native loop around it saves about what the round trip costs. So these don't
+  need the static rule to avoid a loss; they need native text operations to show a gain,
+  and most of the gain has to come from doing the operation itself faster.
+- **Certain exits only.** Counting every exit the generator emits would reject nearly
+  everything: each call site has a "callee not compiled" exit, each division a
+  divide-by-zero exit, each function a poll. Only exits that are taken every time the code
+  runs count against a function.
+- **Workers: the shape.**
+  - Signature: `(ctx, ap, fp, u1, b1, ..., un, bn) -> {status, u, b}`, LLVM's `tailcc`
+    calling convention so that tail calls between workers of different arities are
+    guaranteed. `fp` is still passed: the frame keeps its place on the Unison stack, it just
+    isn't written until something exits.
+  - Only functions whose every return yields exactly one value get a worker; the rest keep
+    today's form. So do re-entry functions, which are always entered by the trampoline with
+    the frame on the stack; they call workers directly.
+  - Exits are unchanged in what they leave behind: a worker that exits writes its frame, and
+    each worker above it writes its frame and frame record as it passes the status up, as
+    today. The high-water mark for marking `bstk` moves from every function entry to these
+    cold paths.
+  - A tail call from a worker to something that isn't a worker in the same module (a call
+    through a cell, a closure call) must not grow the C stack, or mutual recursion across
+    modules would. The worker puts the arguments on the Unison stack as a tail call does
+    today and returns a status meaning "tail call this", with the code pointer; the wrapper
+    at the bottom does the `musttail` call, and a worker that had made a non-tail call makes
+    the call itself and carries on.
+  - Garbage collection is not a concern for values in registers: a GC can only happen back
+    in Haskell, and by then everything is on the Unison stack, as now.
+- **`suite` is the test of whether the JIT is usable; `jitSuite` is the test of whether it is
+  fast.** Both are measured at the end of each part.
+
+## Learnings and questions
+
+(filled in as steps land)
+
+- **The static rule does most of the work, and the harness loop shows its blind spot.**
+  After step 1 the remaining losses of 10 to 25% on the small benchmarks (`Map.lookup`,
+  `List.at`, `Decode Nat`, `CAS`) are all one exit site: `repeat n f`, the benchmark
+  library's loop, compiled, calling `f` through a closure whose code was (rightly) left
+  interpreted. One round trip per iteration, about 30 ns net. Real programs have the same
+  shape (`List.map f` with an `f` that isn't native). The rule assumes a function value is
+  native; steps 3 (cheaper round trip) and 8 (a dynamic check) are what can address it.
+  Step 3 was enough: with a 37 ns round trip those benchmarks are 4 to 13% *faster* than
+  the interpreter, because the loop around the call saves more than the exit costs.
+- **A tiny native function called from interpreted code is a small loss.** Entering native
+  code from the interpreter costs about 20 ns, and a function like `Nat.+` (one instruction
+  and a return) costs less than that to interpret. After step 4 the builtin `+` is compiled
+  and `List.foldLeft`, which is interpreted, calls it once per element: 8% slower. The
+  static rule can't fix this by refusing small functions, because the same function called
+  from native code must be native (a `Cons.map` with a small lambda would exit on every
+  element). The real fix is for the caller to be native (the list step), or a cheaper
+  entry.
+- **An exit costs the callers too, and the estimate has to say so.** The first version of
+  the rule counted a function's own exits. `fib2` (two handler requests per call) passed
+  it, and ran 19% slower than interpreted: each exit unwound the native callers, and every
+  one of them came back through the trampoline. Counting a call to an exiting function as
+  an exit fixed the verdict. This is the main thing the static rule needed beyond Paul's
+  original idea, and it also explains why E = 7 fits better than the measured round trip
+  (about 4 units) would suggest.
+- **`on` mode has two regimes on the suite, and I don't know why yet.** The same build,
+  run twice, gives either `Decode Nat` 157 ns, `Map.lookup` 194 ns, `List.foldLeft` 1.28 ms
+  or 180 ns, 212 ns, 1.20 ms: the benchmarks that go through the harness loop move one way
+  and the list ones the other, by 7 to 15%. Exit and entry counts are the same in both.
+  What gets compiled depends on timing (batches, and verdicts reached through a cycle), so
+  the likely cause is a function that is compiled in one run and not the other. Both
+  regimes are within the criterion. Worth finding: a deterministic choice would be better
+  than either.
+- **One-shot measurements see the warm-up.** While the compile thread works, the program
+  shares the heap with it: more allocation, so a major GC sooner. A benchmark that runs
+  once for 20 ms can absorb a whole 26 ms collection. The IR is built as Haskell `String`s,
+  which is the bulk of the compile thread's allocation (see the ideas).
+- **Exit paths cost the hot path through the register allocator.** Every native function
+  has many exits, and each needs the frame's values to write back. LLVM keeps values that
+  are live across a call in callee-saved registers, and saves and restores every one of
+  them on every call, whether or not an exit is ever taken: `fib`'s worker saved ten
+  registers, six of them only for its exit paths. Branch weights helped a lot (LLVM then
+  lays out and splits around cold code), computing frame offsets at their use helped a
+  little, and the fast entry sidesteps the problem for base cases. What is left is still
+  about half of `fib`'s per-call cost. LLVM's options for making callee-saved registers
+  look expensive (`-regalloc-csr-first-time-cost`) changed nothing here.
+- **Decide by generating, not by predicting.** Whether a function can be a worker depends
+  on frame depths that only the generator computes, so the driver tries the worker and
+  falls back. The same goes for the fast entry's "is this a boolean still in a register".
+  Both passes of the driver see the same choice, so exit and frame numbering still agree.
+- **A strict representation is worth more than a clever fast path.** The first plan for
+  lists was to find the cases of `Data.Sequence` that touch no thunk and measure how
+  common they are. Replacing the representation with one that has no thunks made every
+  case available, turned the helpers into plain C over plain constructors, and removed the
+  need for the spike. The cost is that the interpreter now runs on a younger data structure
+  (see the regressions above).
+- **Check C helpers against the Haskell they replace, at startup.** The helpers depend on
+  layouts GHC chooses. Running each one against the Haskell operation on a few hundred
+  sample values at startup caught every mistake made while writing them (a wrong field
+  order would have, too), costs a few milliseconds, and turns a silent heap corruption into
+  "the JIT is off". The same samples exercise what the helpers build, through `valid` for
+  the deque and a structure walk for the rope.
+- **The linker drops what only generated code calls.** GHC links with `-dead_strip`, and
+  two helpers that nothing in the binary referred to were gone; every module that used them
+  failed to link and quietly stayed interpreted, so the tests passed. The runtime now keeps
+  a table of the helpers, and a module that fails to link says so without `UNISON_JIT_LOG`.
+- **Per-thread state made before the settings are read is a trap.** The self-tests created
+  the thread's JIT context before the stress settings were configured; on that thread the
+  stress poll then fired on every entry, forever, but only when the program happened to run
+  on that thread. Under the stress modes the trampoline's C entry now reports a function that
+  leaves with the same exit a million times in a row without moving the stack, which found
+  this in one run.
+- **`sample` is good enough to profile the trampoline.** Run the transcript in the
+  background, `sample <pid> 5`, and resolve the addresses in the `unison` binary against
+  `nm -n`. Haskell code shows up as offsets from the nearest exported symbol, which is
+  coarse, but the C and runtime functions are named, and those were most of the waste.

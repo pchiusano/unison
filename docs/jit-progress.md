@@ -16,6 +16,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M2: calls and frames | done 2026-09-30. Test matrix (7 configurations) passes; "fib 20" 16× faster; "depth 1000000" runs natively with the C stack guard. Data and list code is slower until M3/M4. See [jit-m2.md](jit-m2.md) |
 | M3: data | done 2026-09-30. Constructors are built and matched natively (all arities), booleans stay in registers; heap sanity checks pass; tree benchmark 6× faster. List/function-value/Ref code is slower until M4. See [jit-m3.md](jit-m3.md) |
 | M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
+| M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are `Unison.Util.Deque` now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes`, the list repair cases, tuning the deque |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -51,14 +52,20 @@ Update it whenever a step finishes or something non-obvious is learned.
   meant for use) or `UNISON_JIT=eager` (compile everything as it is loaded; for testing), or
   `unison --jit on|eager`. `UNISON_JIT_THRESHOLD=N` (default 100) is the number of interpreted
   calls before a definition, or a re-entry point, is compiled; `UNISON_JIT_BATCH=B` (default
-  32) the most definitions compiled together. Diagnostics: `UNISON_JIT_LOG=1`
+  32) the most definitions compiled together. `UNISON_JIT_EXIT_COST=E` (default 7) is the
+  cost of an exit in the rule that leaves exit-heavy functions interpreted (0 compiles
+  everything; see "What isn't compiled" in the design). `UNISON_JIT_ENTRY_COST=C` (default
+  3): a compiled function that saves less than this per call is still interpreted when the
+  interpreter is the caller (0 always enters native code). Diagnostics: `UNISON_JIT_LOG=1`
   (compile log, including why a combinator or part of one was left to the interpreter),
   `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell sides; unusable
   on programs that load base, it exhausts memory during the load), `UNISON_JIT_DUMP_MCODE=1`,
-  `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS_EVERY=N` (with
+  `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS=each` (the
+  exits taken since the program last wrote output, printed after each write: per-benchmark
+  exits for a suite that prints a line per benchmark), `UNISON_JIT_STATS_EVERY=N` (with
   stats: also every N exits, for evaluations that never finish), `UNISON_JIT_DISABLE=a,b,...`
   (turn features off for bisecting a bug: `app`, `apply`, `ref`, `array`, `cmp`, `callout`,
-  `direct`). With stats, the first line is the compile totals: modules, functions, auxiliary
+  `direct`, `worker`, `list`, `text`, `name`). With stats, the first line is the compile totals: modules, functions, auxiliary
   functions, re-entry functions generated on demand and never asked for, IR size, time.
 - Seeing the generated code: `--jit-dump-ir DIR` (or `UNISON_JIT_DUMP_IR=DIR`) writes one `.ll`
   file per definition into `DIR`, with the MCode of each function as a comment above its IR and a
@@ -94,7 +101,8 @@ Update it whenever a step finishes or something non-obvious is learned.
 | File | What it is | Codebase it needs |
 | --- | --- | --- |
 | `unison-src/transcripts/idempotent/jit-tests.md` | correctness tests with known answers. Builtins only, prompt `scratch/main>`. The file contains its own expected output. | any, including empty |
-| `unison-src/transcripts-manual/jit-benchmarks.md` | `jitSuite`, the benchmarks written for the JIT. Prompt `jit-tests/main>`. Timings print to the console. It does not run the existing `suite`, which takes several minutes; run that by hand when needed. | `jit_codebase` |
+| `unison-src/transcripts-manual/jit-benchmarks.md` | `jitSuite`, the benchmarks written for the JIT. Prompt `jit-tests/main>`. Timings print to the console. | `jit_codebase` |
+| `unison-src/transcripts-manual/jit-suite.md` | the older, broader `suite` (lists, maps, text, JSON, abilities). About 5.5 minutes per run. The test of whether the JIT is usable on library code (M6). | `jit_codebase` |
 
 - The JIT test matrix: run `jit-tests.md` with `UNISON_JIT=off`, `UNISON_JIT=eager`, and
   `UNISON_JIT=eager` with `UNISON_JIT_STRESS=` each of `poll=3`, `ustack=4`, `cstack=2048`,
@@ -354,6 +362,254 @@ runs (two for `off`).
 - Startup: a transcript with one small watch expression takes 1.16 to 1.19 s with `off`, 1.17 s
   with `on`, 1.19 to 1.21 s with `eager`.
 
+- 2026-10-01, two text benchmarks added to `jitSuite` ("Text: append "hi" 10000 times",
+  "Text: drop 1, 100000 times"), every operation a call-out today. `off`: 1.53 ms and
+  13.1 ms. `on`: 1.51 ms and 13.0 ms.
+
+## The full `suite` with the JIT on (after M5)
+
+2026-10-01, optimized build, `run suite` in `jit_codebase`, one run each, no statistics. This
+is the first time `suite` was run with the JIT. It is the input to [jit-m6.md](jit-m6.md).
+
+| Benchmark | `off` | `on` | |
+| --- | --- | --- | --- |
+| Mutate a Ref 1000 times | 111.6 µs | 13.1 µs | 8.5× faster |
+| Mutate a local Remote.Ref 10k times | 19.7 ms | 104 ms | 5.3× slower |
+| Do 10k arithmetic operations | 88.2 µs | 90.2 µs | same |
+| List.map increment (range 0 1000) | 142 µs | 201 µs | 1.4× slower |
+| List.map murmurHash (range 0 1000) | 392 µs | 600 µs | 1.5× slower |
+| Multimap.fromList (range 0 1000) | 65.8 µs | 70.7 µs | 1.1× slower |
+| Stream functions | 6.01 ms | 14.4 ms | 2.4× slower |
+| Value.serializeUncompressed (10k element map) | 11.5 ms | 11.2 ms | same |
+| Value.serializeCompressed (10k element map) | 20.3 ms | 20.8 ms | same |
+| Value.deserializeCompressed (10k element map) | 23.4 ms | 27.0 ms | 1.2× slower |
+| Json.toText (per document) | 7.07 µs | 7.43 µs | same |
+| Json parsing (per document) | 7.20 µs | 7.85 µs | 1.1× slower |
+| Json complex parsing (per document) | 10.7 µs | 11.3 µs | 1.1× slower |
+| Json complex decoding (per document) | 62.9 µs | 122 µs | 1.9× slower |
+| Decode Nat | 167 ns | 200 ns | 1.2× slower |
+| Generate 100 random numbers | 83.9 µs | 58.7 µs | 1.4× faster |
+| List.foldLeft | 1.23 ms | 2.24 ms | 1.8× slower |
+| Count to 1 million | 43.5 ms | 323 µs | 135× faster |
+| Count to N (per element) | 83 ns | 4 ns | 21× faster |
+| Count to 1000 | 82.9 µs | 4.92 µs | 17× faster |
+| CAS an IO.ref 1000 times | 128 µs | 326 µs | 2.5× slower |
+| List.range (per element) | 43 ns | 46 ns | 1.1× slower |
+| List.range 0 1000 | 59.9 µs | 63.9 µs | 1.1× slower |
+| Set.fromList (range 0 1000) | 31.5 µs | 33.4 µs | 1.1× slower |
+| Map.fromList (range 0 1000) | 29.1 µs | 31.3 µs | 1.1× slower |
+| NatMap.fromList (range 0 1000) | 2.65 ms | 1.88 ms | 1.4× faster |
+| Map.lookup (1k element map) | 202 ns | 252 ns | 1.2× slower |
+| Map.insert (1k element map) | 275 ns | 323 ns | 1.2× slower |
+| Shuffle a 1000 element array | 1.34 ms | 1.73 ms | 1.3× slower |
+| Mutably mergesort a 1000 element array | 3.83 ms | 3.48 ms | 1.1× faster |
+| List.at (1k element list) | 151 ns | 203 ns | 1.3× slower |
+| Text.split / | 2.95 µs | 4.39 µs | 1.5× slower |
+| Two match | 5.69 ms | 383 µs | 15× faster |
+| Four match | 5.86 ms | 393 µs | 15× faster |
+| Thirty match | 5.35 ms | 67.0 µs | 80× faster |
+| fib1 | 144 µs | 291 µs | 2.0× slower |
+| fib2 | 334 µs | 822 µs | 2.5× slower |
+| fib3 | 334 µs | 839 µs | 2.5× slower |
+
+- 9 faster, 5 the same, 24 slower. The cause is exits: 107 million over the run (60 M resumes,
+  47 M call-outs), broken down in jit-m6.md.
+- How to run it: `unison-src/transcripts-manual/jit-suite.md`, about 5.5 minutes per mode.
+- Statistics used to distort timings badly (counting an exit summed every site's counter).
+  Since M6 step 0 counting is one atomic add, and a run with `UNISON_JIT_STATS=each` is at
+  most 7% slower than a plain one on the entries that exit most. Still, quote timings from
+  runs without statistics.
+- Re-measured at M6 step 0 (same day, same build plus the statistics change): every entry
+  within a few percent of this table, except `Remote.Ref` (80 ms with `on`, was 104).
+- To look at the MCode of a site named in the statistics (`CIx ... <group> <n>`): run with
+  `UNISON_JIT=off UNISON_JIT_DUMP_MCODE=1`, kill it once loading is done, and search the
+  dump for `<group>:<n>:`.
+
+## M6 measurements
+
+`suite`, optimized build, one run each; the ratio is to `off` (measured again at step 0:
+within a few percent of the table above). Only entries that moved or are over the 15% line
+are listed per step; the full table comes at step 8.
+
+- 2026-10-01, step 1 (the static exit rule, E = 7). 389 functions left interpreted, 117
+  compiled plus 110 re-entry functions, 5 MB of IR, 2.1 s of compile time over the run.
+  Over 15% slower: `Remote.Ref` 1.39×, `List.map increment` 1.18×, `Stream` 1.16×,
+  `Decode Nat` 1.18×, `CAS` 1.18×, `List.at` 1.22×, `fib1` 1.96×, `fib2`/`fib3` 1.97×.
+  Close to it: `Map.lookup` 1.15×, `Map.insert` 1.11×, JSON decoding 1.10×. `jitSuite`:
+  no change (319 µs, 89.7 µs, 21.6 µs, 5.03 µs, 250 µs, 63.4 µs, 48.2 µs, 59.2 µs, 269 µs,
+  1.45 ms, 12.7 ms).
+- 2026-10-01, step 2 (generator gaps). `fib1` 144 µs to 11.9 µs, "Do 10k arithmetic
+  operations" 89.5 µs to 1.56 µs, `NatMap.fromList` 2.65 ms to 403 µs, `Shuffle` 0.84×.
+  Still over 15%: `Remote.Ref` 1.25×, `List.map increment` 1.19×, `Stream` 1.18×,
+  `Decode Nat` 1.16×, `CAS` 1.17×, `List.at` 1.21×, `fib2`/`fib3` 1.96×.
+- 2026-10-01, step 3 (cheaper round trip: about 37 ns, was about 67). Over 15% now:
+  `Remote.Ref` 1.22×, `fib2`/`fib3` 1.20×. Everything else is at or below 1.07×:
+  `List.map increment` 1.01×, `Stream` 1.01×, `Decode Nat` 0.92×, `CAS` 0.87×, `Map.lookup`
+  0.94×, `List.at` 0.93×, JSON decoding 1.04×. `jitSuite` with `on`: 318 µs, 88.6 µs,
+  21.2 µs, 5.07 µs, 272 µs, 64.0 µs, 48.2 µs, 58.9 µs, 260 µs, and the text benchmarks
+  1.04 ms and 9.16 ms (`off`: 1.48 ms and 12.8 ms; they were at break-even before).
+- 2026-10-01, step 4 (builtins get cells). No change beyond noise except `List.foldLeft`
+  0.99× to 1.08×. Over 15%: `Remote.Ref` 1.20×, `fib2`/`fib3` 1.19×. `jitSuite` unchanged.
+- 2026-10-01, step 8 (the rule counts exits of callees and weighs recursive arms; small
+  functions aren't entered from the interpreter; `Any` registered). Two runs of `on` and a
+  fresh `off`, ratios to `off`:
+
+  | Benchmark | `off` | `on`, run 1 | `on`, run 2 |
+  | --- | --- | --- | --- |
+  | Mutate a Ref 1000 times | 113 µs | 0.10 | 0.10 |
+  | Mutate a local Remote.Ref 10k times (one run of 20 ms) | 19.7 ms | 1.22 | 1.30 |
+  | Do 10k arithmetic operations | 88.9 µs | 0.02 | 0.02 |
+  | List.map increment | 145 µs | 1.01 | 1.00 |
+  | List.map murmurHash | 396 µs | 1.01 | 1.01 |
+  | Multimap.fromList | 63.9 µs | 0.99 | 1.04 |
+  | Stream functions | 5.80 ms | 1.01 | 1.08 |
+  | Value.serialize, compressed, deserialize | 10.9, 20.0, 21.9 ms | 1.00, 1.01, 1.01 | 1.00, 1.02, 1.04 |
+  | Json.toText, parsing, complex parsing | 7.05, 7.19, 10.7 µs | 1.00, 1.01, 1.00 | 1.08, 1.02, 1.01 |
+  | Json complex decoding | 62.1 µs | 1.04 | 1.05 |
+  | Decode Nat | 167 ns | 1.08 | 0.94 |
+  | Generate 100 random numbers | 83.5 µs | 0.51 | 0.51 |
+  | List.foldLeft | 1.20 ms | 1.00 | 1.07 |
+  | Count to 1 million, to N, to 1000 | 43.1 ms, 82 ns, 83.2 µs | 0.01, 0.05, 0.06 | same |
+  | CAS an IO.ref 1000 times | 127 µs | 1.09 | 0.90 |
+  | List.range (per element), 0 1000 | 42 ns, 58.1 µs | 1.02, 1.00 | 1.05, 1.01 |
+  | Set.fromList, Map.fromList | 31.4, 29.0 µs | 1.00, 1.00 | 1.03, 1.07 |
+  | NatMap.fromList | 2.65 ms | 0.14 | 0.14 |
+  | Map.lookup, Map.insert | 199, 274 ns | 1.07, 1.04 | 0.97, 0.99 |
+  | Shuffle a 1000 element array | 1.32 ms | 0.74 | 0.75 |
+  | Mutably mergesort a 1000 element array | 3.57 ms | 0.20 | 0.20 |
+  | List.at | 146 ns | 1.10 | 0.94 |
+  | Text.split / | 2.87 µs | 1.02 | 1.02 |
+  | Two, Four, Thirty match | 5.64, 5.83, 5.30 ms | 0.08, 0.07, 0.01 | same |
+  | fib1 | 144 µs | 0.08 | 0.08 |
+  | fib2, fib3 | 336, 336 µs | 0.99, 1.00 | 1.00, 1.00 |
+
+  `jitSuite` with `on`: 315 µs, 88.9 µs, 22.5 µs, 5.01 µs, 270 µs, 63.8 µs, 48.1 µs,
+  58.8 µs, 270 µs, 1.06 ms, 9.07 ms. The two regimes and `Remote.Ref` are discussed in
+  jit-m6.md. The tree-insert benchmark has been at 270 µs since step 3 (250 before): to
+  look at with workers.
+- Debug-runtime (`-DS`) runs, 2026-10-01. After part 1: the tests with `on` and
+  `THRESHOLD=1` and with `eager`, and the benchmark transcript with `on` and `THRESHOLD=1`,
+  passed with no assertion failures; the run with `install=5,pool=8,alloc=64,poll=7` failed
+  with "native code disappeared from its cell", the install race described in jit-m6.md
+  step 9, fixed there. After workers (commit e91d83367) all four pass with no assertion
+  failures: 7.5 min, 7.5 min, 9 min and 4 min.
+- 2026-10-01, steps 9 to 11 (workers). `jitSuite`, optimized build, one run each:
+
+  | Benchmark | `off` | `on` | `on`, no workers | `on`, `BATCH=1` | `eager` |
+  | --- | --- | --- | --- | --- | --- |
+  | Sum 0 to 1 million | 66.4 ms | 319 µs | 322 µs | 320 µs | 319 µs |
+  | fib 20 | 1.40 ms | 41.2 µs | 73.6 µs | 41.4 µs | 41.1 µs |
+  | Cons list: map with a lambda | 86.9 µs | 17.2 µs | 21.3 µs | 17.0 µs | 16.7 µs |
+  | Cons list: foldLeft with a lambda | 86.8 µs | 5.12 µs | 4.89 µs | 4.96 µs | 4.86 µs |
+  | Binary tree: 1000 inserts | 1.69 ms | 232 µs | 276 µs | 243 µs | 223 µs |
+  | Binary tree: 1000 lookups | 768 µs | 63.0 µs | 67.2 µs | 77.1 µs | 74.1 µs |
+  | Apply a function argument 10000 times | 1.17 ms | 49.1 µs | 48.7 µs | 48.9 µs | 48.5 µs |
+  | Mutate a Ref 10000 times | 834 µs | 50.9 µs | 51.4 µs | 51.5 µs | 52.7 µs |
+  | Calls across definitions (Collatz) | 7.86 ms | 69.4 µs | 262 µs | 258 µs | 264 µs |
+  | Text: append "hi" 10000 times | 1.49 ms | 1.08 ms | 1.07 ms | 1.06 ms | 1.06 ms |
+  | Text: drop 1, 100000 times | 12.9 ms | 9.19 ms | 9.15 ms | 9.09 ms | 9.04 ms |
+
+  "No workers" is `UNISON_JIT_DISABLE=worker`; it already has the branch weights, which is
+  why its `fib 20` is 74 µs and not M5's 89. `suite` with workers: as at step 8, except
+  `fib1` 11.9 µs to 5.9 µs, `NatMap.fromList` 380 µs to 294 µs, `Two match` 430 µs to
+  403 µs; `Remote.Ref` (the one-shot entry) read 1.42× in this run.
+- Since M6 the test matrix adds `UNISON_JIT_DISABLE=worker` (the uniform form everywhere)
+  and the costs set to zero (`UNISON_JIT_EXIT_COST=0 UNISON_JIT_ENTRY_COST=0`) in the
+  stress runs, so that the rules don't hide code from the tests. A test run can go on a copy
+  of the transcript in another directory, which lets several run at once.
+- Scripts used for these runs live in the session scratch directory and are easy to
+  recreate: run the transcript, strip ANSI codes, take the lines that start with a time.
+
+- 2026-10-02, steps 5, 5b and 7 (lists on `Unison.Util.Deque`, native list, text and
+  partial-application helpers). `suite`, optimized build, one run each. "`off` before" is
+  the interpreter on `Data.Sequence` (the step 8 run); the last column is `on` against
+  `off` on the same build.
+
+  | Benchmark | `off` before | `off` | `on` | `on` / `off` |
+  | --- | --- | --- | --- | --- |
+  | List.map increment | 145 µs | 151 µs | 64.8 µs | 0.43 |
+  | List.map murmurHash | 396 µs | 402 µs | 412 µs | 1.02 |
+  | List.foldLeft | 1.20 ms | 1.16 ms | 343 µs | 0.30 |
+  | List.at | 146 ns | 130 ns | 25 ns | 0.20 |
+  | List.range 0 1000 | 58.1 µs | 45.1 µs | 44.7 µs | 0.99 |
+  | List.range (per element) | 42 ns | 102 ns | 103 ns | 1.01 |
+  | Multimap.fromList | 63.9 µs | 82.9 µs | 85.4 µs | 1.03 |
+  | Set.fromList, Map.fromList | 31.4, 29.0 µs | 27.4, 25.8 µs | 28.5, 27.5 µs | 1.04, 1.07 |
+  | Json.toText | 7.05 µs | 8.43 µs | 8.42 µs | 1.00 |
+  | Json parsing, complex parsing | 7.19, 10.7 µs | 10.2, 18.1 µs | 10.2, 18.2 µs | 1.00, 1.00 |
+  | Json complex decoding | 62.1 µs | 64.3 µs | 59.3 µs | 0.92 |
+  | Generate 100 random numbers | 83.5 µs | 84.5 µs | 39.4 µs | 0.47 |
+  | Shuffle a 1000 element array | 1.32 ms | 1.27 ms | 636 µs | 0.50 |
+  | Text.split / | 2.87 µs | 3.26 µs | 3.29 µs | 1.01 |
+  | Stream functions | 5.80 ms | 5.72 ms | 6.08 ms | 1.06 |
+  | Mutate a local Remote.Ref (one run of 20 ms) | 19.7 ms | 19.7 ms | 26.3 ms | 1.34 |
+
+  Everything not listed is as at step 8. The `on` column is from before step 7 (partial
+  applications), which the suite barely exercises. The interpreter's own regressions from
+  the swap are the "`off` before" against "`off`" columns: JSON parsing, `Multimap.fromList`
+  and `List.range` per element (see jit-m6.md and the ideas).
+
+  `jitSuite` (`off`, then `on`): 65.7 ms / 319 µs, 1.39 ms / 41.2 µs, 86.6 µs / 16.7 µs,
+  86.9 µs / 4.85 µs, 1.67 ms / 203 µs, 762 µs / 56.9 µs, 1.16 ms / 48.3 µs, 828 µs / 50.8 µs,
+  7.73 ms / 68.0 µs, text append 1.48 ms / 548 µs (was 1.08 ms), text drop 11.7 ms / 3.54 ms
+  (was 9.19 ms).
+- Since these steps the test matrix has `UNISON_JIT_DISABLE=list,text,name` in place of
+  nothing, and the transcript has sections for lists, text and partial applications. When
+  several runs start at the same moment one of them can fail at once with an error about
+  `unison.sqlite3-wal` or `credentials.json.lock` (the codebase copy racing another run's);
+  run that one again.
+
+- Debug-runtime (`-DS`) runs after steps 5, 5b and 7 (commit 88136dc40), 2026-10-02, all
+  with no assertion failures: the tests with `on` and `THRESHOLD=1` (7 min), with `eager`
+  (9 min), with `on`, `THRESHOLD=2`, both costs 0 and `install=5,pool=8,alloc=64,poll=7`
+  (8 min), and the benchmark transcript with `on` and `THRESHOLD=1` (3.5 min). The four ran
+  side by side, each on its own copy of its transcript.
+- A last `suite` and `jitSuite` with `on` after step 7: no entry moved (`fib 20` read
+  45.7 µs in that run, 41.2 µs in the one before).
+
+## The list representation: `Unison.Util.Deque` (2026-10-01)
+
+A Unison `List` is now a `Unison.Util.Deque Val` instead of a `Data.Sequence` (Paul's
+structure, in `lib/unison-util-rope`; every field strict, so native code can read and build
+lists without meeting a thunk). `USeq`, `WrapSeq` and the five runtime modules that touch
+lists use it; `ANF.Value`'s lists and `Term.List` are still `Data.Sequence` and convert at
+the boundary.
+
+- Tests: `stack build --fast --flag unison-runtime:jit --test unison-util-rope` (about a
+  minute). They compare with `Data.Sequence` as a model and check the structure's
+  invariants (`valid`) after every step.
+- Benchmark against `Data.Sequence`:
+  `stack build --work-dir .stack-work-opt --flag unison-runtime:jit --bench unison-util-rope`
+  (about 6 minutes; `--ba "--csv FILE"` for the numbers).
+- `Deque.hs` is compiled with `-O2 -funbox-strict-fields` in every build: the JIT's C
+  helpers depend on its constructor layouts.
+- Because every package depends on `unison-util-rope`, a change to it rebuilds all the local
+  packages in whichever work dir is built next (about 5 minutes for `--fast`).
+
+Time per operation, Deque with its ratio to `Data.Sequence` (below 1: the Deque is faster),
+optimized build, after the tuning done on 2026-10-01:
+
+| Operation | n = 10 | n = 100 | n = 10,000 | n = 1,000,000 |
+| --- | --- | --- | --- | --- |
+| snoc (cons is the same) | 5.7 ns (1.07×) | 14.0 (1.85×) | 14.6 (1.42×) | 26.6 (0.92×) |
+| uncons | 8.9 (1.07×) | 11.2 (1.05×) | 10.3 (0.90×) | 10.4 (0.88×) |
+| unsnoc | 3.6 (0.44×) | 12.4 (1.18×) | 10.4 (0.91×) | 10.4 (0.90×) |
+| snoc n, then uncons n | 14.5 (1.04×) | 25.8 (1.37×) | 25.3 (1.06×) | 35.7 (0.86×) |
+| queue at a steady size | 26.4 (1.77×) | 21.6 (1.10×) | 24.0 (0.93×) | 46.8 (0.85×) |
+| lookup | 9.8 (1.01×) | 18.7 (0.78×) | 47.9 (0.49×) | 82.3 (0.45×) |
+| take | 12.8 (0.99×) | 66.4 (1.89×) | 207 (1.48×) | 367 (1.47×) |
+| drop | 14.9 (1.14×) | 94.8 (2.68×) | 220 (1.57×) | 378 (1.56×) |
+| take/drop within 4 of an end | 15.9 (1.28×) | 27.8 (2.13×) | 13.1 (1.01×) | 13.1 (0.98×) |
+| append of two halves | 20.9 (1.89×) | 175 (5.4×) | 376 (4.0×) | 468 (2.8×) |
+| append of 1 to 4 elements | 100 (3.5×) | 100 (3.5×) | 74 (2.6×) | 74 (2.6×) |
+| `foldl'`, per element | 4.9 (0.43×) | 4.0 (0.39×) | 3.7 (0.36×) | 4.0 (0.38×) |
+| toList, per element | 5.0 (0.79×) | 4.4 (0.55×) | 4.1 (0.50×) | 15.8 (1.01×) |
+| `==`, per element | 14.4 (1.32×) | 8.3 (0.77×) | 8.2 (0.72×) | 32.8 (0.82×) |
+
+The snoc row flatters `Data.Sequence`, which defers work into thunks; "snoc then uncons" is
+the fair comparison. Left for later: `append` (builds each level's seam as a list, then packs
+it), `take`/`drop` around 100 elements, the queue pattern on very small lists.
+
 ## Baseline: interpreter only
 
 Measured 2026-09-29 on the optimized build of branch `jit` (commit c5bcd5ae7, no JIT code yet),
@@ -490,6 +746,17 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   The compile driver now works on *units* (one LLVM function each: a combinator or a re-entry
   function), and a table of pending units, keyed by cell, holds the re-entry functions that
   were not generated. (5) A definition is never queued twice (see the next entry).
+- 2026-10-01: M6 steps 0 to 4, 6, 8 and 9 to 11 (see jit-m6.md and "M6 measurements").
+  Paused there at Paul's request; lists (5), text (5b) and partial applications (7) are
+  open. Things worth remembering: (1) the static exit rule needed to count a callee's
+  exits against its caller, and to weigh recursive arms, before it judged ability-heavy
+  code right. (2) A round trip allocates nothing now; its results come back in spare words
+  of the unboxed stack. (3) Workers were only half the gain on `fib`: branch weights and a
+  fast entry for base cases were the rest, both because of registers LLVM saves for exit
+  paths. (4) A function can be running before its own cell is filled (direct calls), so
+  the trampoline waits for a cell rather than failing. (5) A second runtime in the process
+  reuses group numbers, so function names get a suffix. (6) One-shot timings early in a
+  run see the compile thread's allocation as a major GC.
 - 2026-10-01: after Paul's review of M5. Batches now walk callers as well as callees, as the
   design said from the start (the M5 plan had narrowed it to callees); the compile thread
   keeps the reverse index, since the code cache only records callees. The "requested" state
@@ -499,3 +766,16 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   the hottest callee (its own request had been queued while the caller's waited), so the flag
   became three states and a batch takes a neighbour whose request is still queued. Result: 8%
   on that benchmark for about twice the compile work.
+- 2026-10-02: M6 finished (steps 5, 5b, 7), after Paul's go-ahead. The order it went in:
+  Paul's `Unison.Util.Deque` got its module name, a test suite against `Data.Sequence`
+  (with an invariant checker) and a benchmark; the benchmark showed it 2 to 12 times slower
+  on small lists and 4 to 9 times slower at `take`/`drop`, so the bottom-level paths,
+  `take`/`drop` and `append` were rewritten to work on the grouped levels directly, which
+  brought it to parity or better except for `append`. Then the runtime's lists were
+  switched to it (five modules), the list, text and partial-application operations became
+  C helpers called from generated code, and the layouts they depend on are checked at
+  startup. Things that went wrong on the way, all found by the test matrix: two helpers
+  dead-stripped by the linker (modules silently not linking), and a per-thread context
+  created before the stress settings were read (a livelock under `poll` stress on one
+  thread only). `Unison.Util.Skews`, another candidate structure of Paul's, sits in the same
+  package untested.

@@ -22,12 +22,17 @@ module Unison.Runtime.JIT.Codegen
     genDeferred,
     modulePrelude,
     pushCount,
+    startsSupported,
+    callOutWorthwhile,
+    instrNative,
+    workerShape,
   )
 where
 
 import Control.Monad (forM, forM_, unless, void, when)
 import Control.Monad.State.Strict
 import Data.Char (ord)
+import Data.List (intercalate)
 import Data.Bits (shiftL, shiftR)
 import Data.Int (Int64)
 import Data.Primitive.PrimArray (primArrayToList)
@@ -42,13 +47,13 @@ import Unison.Reference (Reference)
 import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..))
 import Unison.Runtime.TypeTags qualified as TT
-import Unison.Builtin.Decls qualified as Ty (unitRef)
+import Unison.Builtin.Decls qualified as Ty (optionalRef, seqViewRef, unitRef)
 import Data.Map.Strict qualified as Map
 import Data.IntMap.Strict qualified as IM
 import Unison.Runtime.MCode hiding (Env)
 import Unison.Runtime.MCode qualified as MCode (GRef (Env))
 import Unison.Runtime.Machine.Types (MCombs, MRef, MSection)
-import Unison.Runtime.Stack (Val)
+import Unison.Runtime.Stack (Val (..))
 import Unison.Util.EnumContainers qualified as EC
 
 -- | Byte offsets of the fields of the C @Ctx@, from @unison_jit_ctx_layout@.
@@ -106,7 +111,10 @@ data Env = Env
     -- | the functions defined in the module being generated, by cell: a
     -- call to one of them is a direct call to its symbol, which LLVM can
     -- inline, instead of a call through the cell
-    envLocal :: Map.Map (Ptr NativeCell) String
+    envLocal :: Map.Map (Ptr NativeCell) String,
+    -- | the functions of this module that have a worker (see 'feWorker'),
+    -- by cell: the worker's symbol and its arity
+    envWorkers :: Map.Map (Ptr NativeCell) (String, Int)
   }
 
 -- | What an auxiliary function is generated from: the section (without its
@@ -151,7 +159,35 @@ data Function = Function
 
 -- | Declarations every module needs.
 modulePrelude :: String
-modulePrelude = "declare ptr @llvm.stacksave.p0()\ndeclare ptr @unison_jit_alloc_words(ptr, i64)\ndeclare void @unison_jit_write_mutvar(ptr, ptr, ptr)\n"
+modulePrelude =
+  unlines
+    [ "declare ptr @llvm.stacksave.p0()",
+      "declare ptr @unison_jit_alloc_words(ptr, i64)",
+      "declare void @unison_jit_write_mutvar(ptr, ptr, ptr)",
+      "declare i64 @unison_jit_list_size(ptr)",
+      "declare ptr @unison_jit_list_view(ptr, ptr, ptr, i64, i64)",
+      "declare ptr @unison_jit_list_push(ptr, ptr, i64, ptr, i64)",
+      "declare ptr @unison_jit_list_index(ptr, ptr, i64, ptr, i64)",
+      "declare i64 @unison_jit_text_size(ptr)",
+      "declare ptr @unison_jit_text_append(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_text_cut(ptr, ptr, i64, i64)",
+      "declare i64 @unison_jit_text_eq(ptr, ptr)",
+      "declare ptr @unison_jit_name(ptr, ptr, i64, i64, ptr, i64, ptr, i64, ptr, i64, ptr)",
+      "declare i64 @llvm.ctlz.i64(i64, i1)",
+      "declare i64 @llvm.cttz.i64(i64, i1)",
+      "declare i64 @llvm.ctpop.i64(i64)",
+      -- branch weights: the first target is the cold one, or the hot one
+      "!0 = !{!\"branch_weights\", i32 1, i32 4000}",
+      "!1 = !{!\"branch_weights\", i32 4000, i32 1}"
+    ]
+
+-- | Marks a conditional branch whose first target is rarely taken (an
+-- exit, a slow path), or nearly always. Without these the register
+-- allocator keeps what the exit paths need in callee-saved registers, and
+-- every call of the function pays to save and restore them.
+unlikely, likely :: String
+unlikely = ", !prof !0"
+likely = ", !prof !1"
 
 -- ---------------------------------------------------------------------------
 -- The generator
@@ -199,7 +235,15 @@ data GS = GS
     -- | highest pool index the function being generated uses
     gsMaxPool :: !Int,
     -- | re-entry functions left for later, reversed
-    gsDeferred :: [Deferred]
+    gsDeferred :: [Deferred],
+    -- | set when the function was being generated as a worker and turned
+    -- out to return other than one value somewhere; it has to be
+    -- generated in the uniform form instead (not undone by 'attempt')
+    gsNotWorker :: Bool,
+    -- | the function being generated is a worker: it doesn't load the
+    -- addresses of the Unison stacks at entry (it only needs them where
+    -- it exits), so each use loads them from @Ctx@
+    gsWorker :: Bool
   }
 
 type Gen = State GS
@@ -291,8 +335,22 @@ loadB k = do
   useSlot k
   slotKind k >>= \case
     Just c -> do
+      -- the two closures are loaded here, not at entry: most functions
+      -- only need them where they exit
+      -- (and the pool's address with them, so that it needn't be kept
+      -- across calls for this)
+      pool <- fresh "pool"
+      emit (pool ++ " = load ptr, ptr %pool.a")
+      ta <- fresh "true.a"
+      emit (ta ++ " = getelementptr ptr, ptr " ++ pool ++ ", i64 " ++ show poolIndexTrue)
+      t <- fresh "true"
+      emit (t ++ " = load ptr, ptr " ++ ta)
+      fa <- fresh "false.a"
+      emit (fa ++ " = getelementptr ptr, ptr " ++ pool ++ ", i64 " ++ show poolIndexFalse)
+      f <- fresh "false"
+      emit (f ++ " = load ptr, ptr " ++ fa)
       p <- fresh "bool"
-      emit (p ++ " = select i1 " ++ c ++ ", ptr %val.true, ptr %val.false")
+      emit (p ++ " = select i1 " ++ c ++ ", ptr " ++ t ++ ", ptr " ++ f)
       pure p
     Nothing -> do
       v <- fresh "b"
@@ -309,19 +367,42 @@ storeB k v = useSlot k >> clearKind k >> emit ("store ptr " ++ v ++ ", ptr " ++ 
 stackAddrU, stackAddrB :: Int -> Gen String
 stackAddrU k = do
   f <- fpPlus k
+  stk <- stackReg "%ustk"
   a <- fresh "ua"
-  emit (a ++ " = getelementptr i64, ptr %ustk, i64 " ++ f)
+  emit (a ++ " = getelementptr i64, ptr " ++ stk ++ ", i64 " ++ f)
   pure a
 stackAddrB k = do
   f <- fpPlus k
+  stk <- stackReg "%bstk"
   a <- fresh "ba"
-  emit (a ++ " = getelementptr ptr, ptr %bstk, i64 " ++ f)
+  emit (a ++ " = getelementptr ptr, ptr " ++ stk ++ ", i64 " ++ f)
   pure a
 
--- | The register holding @fp + k@. The entry block defines one for
--- every k up to the highest used, so using one records it.
+-- | The register holding the address of a Unison stack (@%ustk@ or
+-- @%bstk@). Loaded at entry, except in a worker, which loads it from
+-- @Ctx@ wherever it is used (see 'gsWorker').
+stackReg :: String -> Gen String
+stackReg name = do
+  lazy <- gets gsWorker
+  if lazy
+    then do
+      r <- fresh (drop 1 name)
+      emit (r ++ " = load ptr, ptr " ++ name ++ ".a")
+      pure r
+    else pure name
+
+-- | A register holding @fp + k@, computed here. (The entry block has
+-- its own, for the argument loads and the stack check. Sharing those
+-- would keep them alive across every call for the sake of the exit
+-- paths, which are where most uses are, and the register allocator would
+-- rather save them than compute them again.) Using a slot offset records
+-- it, so that the stack check covers it.
 fpPlus :: Int -> Gen String
-fpPlus k = useK k >> pure ("%fpk" ++ show k)
+fpPlus k = do
+  useK k
+  r <- fresh "fpk"
+  emit (r ++ " = add i64 %fp, " ++ show k)
+  pure r
 
 ctxField :: Env -> (CtxOffsets -> Int) -> Gen String
 ctxField env f = do
@@ -354,7 +435,21 @@ data FnEnv = FnEnv
     feTagChar, feTagFloat, feTagInt, feTagNat :: String,
     -- | the inline @Let@ bindings the code being generated is inside of,
     -- innermost first
-    feEnclosing :: [Enclosing]
+    feEnclosing :: [Enclosing],
+    -- | The function is being generated as a /worker/ (docs/jit-m6.md,
+    -- step 9): its arguments arrive as LLVM parameters instead of on the
+    -- Unison stack, and it returns @{status, u, b}@, its one result in
+    -- registers. The Unison stack is written only when something exits.
+    -- The function the cell points to is then a wrapper around it.
+    feWorker :: Bool,
+    -- | Set while generating a worker's /fast entry/: the function its
+    -- callers call, which holds only the paths that need nothing checked
+    -- (no stack room, no poll: they can't exit, call or loop) and return
+    -- at once, a base case typically. Any other path tail calls the full
+    -- worker, named here, which starts again from the top.
+    feFast :: Maybe String,
+    -- | the symbol of the LLVM function being generated
+    feSym :: String
   }
 
 -- | An inline @Let@ binding being generated. Inside it, the interpreter's
@@ -512,40 +607,188 @@ exitBlockNamed base fe d e = do
     sp <- ctxField env oSp
     f <- fpPlus d
     emit ("store i64 " ++ f ++ ", ptr " ++ sp)
+    -- a worker's entry doesn't raise the high-water mark; its exits do
+    when (feWorker fe) (markWritten env f)
     unwindEnclosing fe
-    emit ("ret i64 " ++ show ix)
+    retStatus fe (show ix)
 
 -- | Terminates the current block with a resume exit at this section.
 exitResume :: FnEnv -> Int -> MSection -> Gen ()
-exitResume fe d sect = do
-  l <- exitBlock fe d (Resume (feCix fe) sect)
-  emit ("br label %" ++ l)
+exitResume fe d sect = case feFast fe of
+  -- a fast entry can't exit (it has checked nothing): the full worker can
+  Just full -> tailToFull fe full
+  Nothing -> do
+    l <- exitBlock fe d (Resume (feCix fe) sect)
+    emit ("br label %" ++ l)
+
+-- | In a fast entry: hands the call over to the full worker, with the
+-- arguments it was called with (see 'feFast').
+tailToFull :: FnEnv -> String -> Gen ()
+tailToFull fe full = do
+  vals <- loadSources [1 .. feArity fe]
+  r <- fresh "r"
+  emit
+    ( r ++ " = musttail call tailcc " ++ workerRet ++ " @" ++ full ++ "(ptr %ctx, i64 %fp.in"
+        ++ concat [", i64 " ++ u ++ ", ptr " ++ b | (u, b) <- vals]
+        ++ ")"
+    )
+  emit ("ret " ++ workerRet ++ " " ++ r)
+
+-- | What a worker returns: the status, and when it is OK the result's
+-- unboxed word and boxed pointer. With status 'statusTailCall' the other
+-- two are instead the code pointer of a function to call and the stack
+-- pointer to call it with.
+workerRet :: String
+workerRet = "{ i64, i64, ptr }"
+
+-- | The status a worker returns to say "call this function for me, as a
+-- tail call": its arguments are on the Unison stack above the worker's
+-- frame base. A worker can't make the call itself, since the callee has
+-- the uniform signature and a different return type; the wrapper at the
+-- bottom makes it as a real tail call, and a worker that called this one
+-- with a plain call makes it as a plain call.
+statusTailCall :: Int
+statusTailCall = -2
+
+-- | Returns a status from the function being generated, in its own
+-- return type.
+retStatus :: FnEnv -> String -> Gen ()
+retStatus fe st
+  | feWorker fe = do
+      r <- fresh "ret"
+      emit (r ++ " = insertvalue " ++ workerRet ++ " undef, i64 " ++ st ++ ", 0")
+      emit ("ret " ++ workerRet ++ " " ++ r)
+  | otherwise = emit ("ret i64 " ++ st)
+
+-- | Returns a worker's three values.
+retWorker :: String -> String -> String -> Gen ()
+retWorker st u b = do
+  r0 <- fresh "ret"
+  emit (r0 ++ " = insertvalue " ++ workerRet ++ " { i64 " ++ st ++ ", i64 undef, ptr undef }, i64 " ++ u ++ ", 1")
+  r1 <- fresh "ret"
+  emit (r1 ++ " = insertvalue " ++ workerRet ++ " " ++ r0 ++ ", ptr " ++ b ++ ", 2")
+  emit ("ret " ++ workerRet ++ " " ++ r1)
+
+-- | Raises the high-water mark of slots written to the boxed stack (for
+-- marking its cards on return) to the given stack index.
+markWritten :: Env -> String -> Gen ()
+markWritten env top = do
+  maxA <- ctxField env oMaxSp
+  old <- fresh "maxsp"
+  emit (old ++ " = load i64, ptr " ++ maxA)
+  gt <- fresh "maxsp.gt"
+  emit (gt ++ " = icmp sgt i64 " ++ top ++ ", " ++ old)
+  new <- fresh "maxsp"
+  emit (new ++ " = select i1 " ++ gt ++ ", i64 " ++ top ++ ", i64 " ++ old)
+  emit ("store i64 " ++ new ++ ", ptr " ++ maxA)
+
+-- | Whether the code builds anything in the heap itself.
+allocates :: MSection -> Bool
+allocates = anyInstr $ \case
+  Pack _ _ ZArgs -> False
+  Pack {} -> True
+  Prim2 REFW _ _ -> True
+  ForeignCall _ MutableArray_write _ -> True
+  -- the list helpers allocate, and charge the budget themselves
+  Prim1 op _ -> op `elem` [VWLS, VWRS]
+  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATT, TAKT, DRPT]
+  Name {} -> True
+  _ -> False
+
+-- | Whether the code makes a call that returns to it.
+makesCalls :: MSection -> Bool
+makesCalls = \case
+  Let {} -> True
+  Ins _ rest -> makesCalls rest
+  Match _ br -> anyArm makesCalls br
+  DMatch _ _ br -> anyArm makesCalls br
+  NMatch _ _ br -> anyArm makesCalls br
+  _ -> False
+
+anyInstr :: (GInstr (RComb Val) -> Bool) -> MSection -> Bool
+anyInstr p = go
+  where
+    go = \case
+      Ins i rest -> p i || go rest
+      Let b _ _ body _ -> go b || go body
+      Match _ br -> anyArm go br
+      DMatch _ _ br -> anyArm go br
+      NMatch _ _ br -> anyArm go br
+      _ -> False
+
+anyArm :: (MSection -> Bool) -> GBranch (RComb Val) -> Bool
+anyArm p = \case
+  Test1 _ a d -> p a || p d
+  Test2 _ a _ b d -> p a || p b || p d
+  TestW d m -> p d || any (p . snd) (EC.mapToList m)
+  TestT d m -> p d || any p (Map.elems m)
+  TestY d m -> p d || any p (Map.elems m)
+
+-- | Whether a combinator can have a worker: every return it makes itself
+-- yields exactly one value. (Its tail calls return whatever their callees
+-- do; a caller that expects one value from this function gets one.) This
+-- is a first sieve: how many values a @Yield (VArgV i)@ returns depends on
+-- the frame depth, which only generating the code finds out, and
+-- generating a worker fails if it turns out not to be one.
+workerShape :: MSection -> Bool
+workerShape = \case
+  Yield args -> case args of
+    VArg1 _ -> True
+    VArgV _ -> True
+    _ -> False
+  Ins _ rest -> workerShape rest
+  Match _ br -> branches br
+  DMatch _ _ br -> branches br
+  NMatch _ _ br -> branches br
+  Let _ _ _ body _ -> workerShape body
+  -- calls, and whatever exits
+  _ -> True
+  where
+    branches = \case
+      Test1 _ a d -> workerShape a && workerShape d
+      Test2 _ a _ b d -> workerShape a && workerShape b && workerShape d
+      TestW d m -> workerShape d && all (workerShape . snd) (EC.mapToList m)
+      TestT d m -> workerShape d && all workerShape (Map.elems m)
+      TestY d m -> workerShape d && all workerShape (Map.elems m)
 
 -- ---------------------------------------------------------------------------
 -- Functions
 
 -- | Compiles one combinator, or says why it can't be.
 genFunction :: Env -> String -> CombIx -> Int -> Int -> MSection -> Ptr NativeCell -> Either String Function
-genFunction env name cix arity frameSize body cell
-  | not (startsSupported body) = Left "body starts with something the JIT doesn't compile"
-  | otherwise = runFunction env name cix arity frameSize cell (Just "head") 0 body
+genFunction env name cix arity frameSize body cell =
+  runFunction env name cix arity frameSize cell (Just "head") 0 (Map.member cell (envWorkers env)) body
 
 -- | Generates a re-entry function that was left for later.
 genDeferred :: Env -> Deferred -> Either String Function
-genDeferred env d = runFunction env (dName d) (dCix d) (dLoaded d) (dFrameSize d) (dCell d) Nothing (dBase d) (dBody d)
+genDeferred env d = runFunction env (dName d) (dCix d) (dLoaded d) (dFrameSize d) (dCell d) Nothing (dBase d) False (dBody d)
 
-runFunction :: Env -> String -> CombIx -> Int -> Int -> Ptr NativeCell -> Maybe String -> Int -> MSection -> Either String Function
-runFunction env name cix arity frameSize cell headL base body =
-  let fe = FnEnv env name cix arity frameSize cell headL base "%tag.char" "%tag.float" "%tag.int" "%tag.nat" []
-      gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity IM.empty Nothing [] [] 0 (envCells env) [] Nothing (envKnown env) (-1) []
-      (text, gs) = runState (genFunctionText fe body) gs0
+runFunction :: Env -> String -> CombIx -> Int -> Int -> Ptr NativeCell -> Maybe String -> Int -> Bool -> MSection -> Either String Function
+runFunction env name cix arity frameSize cell headL base worker body =
+  let -- a worker whose callers call a fast entry is itself named apart
+      fast = worker && freePath body
+      sym
+        | fast = name ++ "_wf"
+        | worker = workerName name
+        | otherwise = name
+      fe = FnEnv env name cix arity frameSize cell headL base "%tag.char" "%tag.float" "%tag.int" "%tag.nat" [] worker Nothing sym
+      gs0 = GS 0 [] ("head", []) [] 0 [] 0 arity IM.empty Nothing [] [] 0 (envCells env) [] Nothing (envKnown env) (-1) [] False worker
+      -- a worker comes with the function the cell points to, the wrapper,
+      -- and maybe with a fast entry
+      ((text, extra), gs) = flip runState gs0 $ do
+        t <- genFunctionText fe body
+        f <- if fast then (: []) <$> genFastEntry fe {feFast = Just sym, feSym = workerName name, feHead = Nothing} body else pure []
+        w <- if worker then (: []) <$> genWrapper fe body else pure []
+        pure (t, f ++ w)
+      wrapper = extra
    in case gsFailed gs of
+        _ | gsNotWorker gs -> Left "a worker would return other than one value"
         Just why -> Left why
         Nothing ->
           Right
             ( Function
                 name
-                (unlines (text : reverse (gsAuxText gs)))
+                (unlines (text : wrapper ++ reverse (gsAuxText gs)))
                 (reverse (gsExits gs))
                 (reverse (gsFrames gs))
                 cell
@@ -563,22 +806,195 @@ genFunctionText fe body = do
   let env = feEnv fe
       arity = feArity fe
   growIx <- gets gsNExits
-  genHead fe body
+  case feFast fe of
+    Nothing -> genHead fe body
+    Just _ -> genSection fe arity body
   startBlock "unreachable"
   gs <- get
   let blocks = [b | b@(l, _) <- reverse (gsBlocks gs), l /= "unreachable"]
       maxK = max (gsMaxK gs) (arity + feFrameSize fe)
-      entry = entryBlock env arity (feBase fe) maxK (gsMaxPool gs)
+      entry = entryBlock env (feWorker fe) (feFast fe == Nothing) arity (feBase fe) maxK (gsMaxPool gs)
       -- the grow exit, the first this function added, asks for what the
       -- entry check demanded
       fixGrow i e
         | i == growIx, GrowStack _ c <- e = GrowStack (maxK - arity) c
         | otherwise = e
   modify' (\s -> s {gsExits = zipWith fixGrow [gsNExits s - 1, gsNExits s - 2 ..] (gsExits s)})
+  let header
+        | feWorker fe =
+            "define internal tailcc " ++ workerRet ++ " @" ++ feSym fe ++ "(ptr %ctx, i64 %fp.in"
+              ++ concat [", i64 %a.u" ++ show k ++ ", ptr %a.b" ++ show k | k <- [1 .. arity]]
+              ++ ") {"
+        | otherwise = "define i64 @" ++ feSym fe ++ "(ptr %ctx, i64 %ap, i64 %fp.in, i64 %sp) {"
   pure . unlines $
-    ["define i64 @" ++ feName fe ++ "(ptr %ctx, i64 %ap, i64 %fp.in, i64 %sp) {"]
+    [header]
       ++ entry
       ++ concat [(l ++ ":") : map ("  " ++) is | (l, is) <- blocks]
+      ++ ["}"]
+
+-- | Generates a worker's fast entry (see 'feFast') as a function of its
+-- own. Its exits (there are none that can be taken) join the function's.
+genFastEntry :: FnEnv -> MSection -> Gen String
+genFastEntry fe body = do
+  s <- get
+  let gs0 = s {gsFresh = 0, gsBlocks = [], gsCur = ("head", []), gsMaxK = feArity fe, gsKinds = IM.empty, gsCaptured = Nothing, gsMaxPool = -1}
+      (text, gs) = runState (genFunctionText fe body) gs0
+  put
+    s
+      { gsExits = gsExits gs,
+        gsNExits = gsNExits gs,
+        gsFrames = gsFrames gs,
+        gsNFrames = gsNFrames gs,
+        gsNotes = gsNotes gs,
+        gsFailed = maybe (gsFailed gs) Just (gsFailed s),
+        gsNotWorker = gsNotWorker s || gsNotWorker gs
+      }
+  pure text
+
+-- | Whether some path through the code returns without needing anything
+-- checked: only instructions that can't exit, branches on words, and a
+-- return. (Statically a match on a data value counts; whether it really
+-- is a match on a boolean still in a register is known when the code is
+-- generated, see 'checkFree'.)
+freePath :: MSection -> Bool
+freePath = \case
+  Yield _ -> True
+  Ins i rest -> exitFree i && freePath rest
+  Match _ br -> plainBranch br && anyArm freePath br
+  NMatch _ _ br -> plainBranch br && anyArm freePath br
+  DMatch _ _ br -> plainBranch br && anyArm freePath br
+  _ -> False
+
+-- | Instructions whose native code has no exit.
+exitFree :: GInstr (RComb Val) -> Bool
+exitFree = \case
+  Lit l -> litSupported l
+  Prim1 op _ -> op `elem` [DECI, DECN, INCI, INCN, NEGI, COMN, COMI, TRNC, SGNI, LZRO, TZRO, POPC]
+  Prim2 op _ _ ->
+    op
+      `elem` [ ADDI, SUBI, MULI, EQLI, NEQI, LEQI, LESI, ANDI, IORI, XORI,
+               ADDN, SUBN, MULN, EQLN, NEQN, LEQN, LESN, ANDN, IORN, XORN, DRPN
+             ]
+  _ -> False
+
+plainBranch :: GBranch (RComb Val) -> Bool
+plainBranch = \case
+  Test1 {} -> True
+  Test2 {} -> True
+  TestW {} -> True
+  _ -> False
+
+-- | Whether the code for this node, at this depth, can run before the
+-- function's entry checks (see 'feFast').
+checkFree :: Int -> MSection -> Gen Bool
+checkFree d = \case
+  Yield _ -> pure True
+  Ins i _ -> pure (exitFree i)
+  Match _ br -> pure (plainBranch br)
+  NMatch _ _ br -> pure (plainBranch br)
+  -- a boolean still in a register: one branch, no closure to look at
+  DMatch _ i br -> do
+    kind <- slotKind (d - i)
+    pure (kind /= Nothing && plainBranch br)
+  _ -> pure False
+
+-- | The symbol of a function's worker.
+workerName :: String -> String
+workerName name = name ++ "_w"
+
+-- | The function a worker's cell points to. It has the uniform signature:
+-- it loads the arguments from the Unison stack, calls the worker, and on
+-- OK stores the result and the stack pointers as a @Yield@ does. If the
+-- worker asks for a tail call it makes it; any other status is an exit
+-- the worker has already prepared, and is passed on.
+--
+-- Pending arguments (an over-application: @ap@ differs from @fp@) are the
+-- interpreter's business when the function returns, so the wrapper hands
+-- such a call to the interpreter straight away, and workers never see one.
+genWrapper :: FnEnv -> MSection -> Gen String
+genWrapper fe body = do
+  let env = feEnv fe
+      name = feName fe
+      arity = feArity fe
+      field reg f = reg ++ " = getelementptr i8, ptr %ctx, i64 " ++ show (f (envCtx env))
+  pendingIx <- addExit env (Named "pending arguments" (Resume (feCix fe) body))
+  pure . unlines $
+    ["define i64 @" ++ name ++ "(ptr %ctx, i64 %ap, i64 %fp.in, i64 %sp) {"]
+      ++ map
+        ("  " ++)
+        [ "%pending = icmp ne i64 %ap, %fp.in",
+          "br i1 %pending, label %pending.exit, label %enter" ++ unlikely
+        ]
+      ++ ["enter:"]
+      ++ map
+        ("  " ++)
+        ( [ field "%ustk.a" oUstk,
+            "%ustk = load ptr, ptr %ustk.a",
+            field "%bstk.a" oBstk,
+            "%bstk = load ptr, ptr %bstk.a"
+          ]
+            ++ concat
+              [ [ "%ix" ++ k ++ " = add i64 %fp.in, " ++ k,
+                  "%u" ++ k ++ ".a = getelementptr i64, ptr %ustk, i64 %ix" ++ k,
+                  "%u" ++ k ++ " = load i64, ptr %u" ++ k ++ ".a",
+                  "%b" ++ k ++ ".a = getelementptr ptr, ptr %bstk, i64 %ix" ++ k,
+                  "%b" ++ k ++ " = load ptr, ptr %b" ++ k ++ ".a"
+                ]
+                | k <- map show [1 .. arity]
+              ]
+            ++ [ "%r = call tailcc " ++ workerRet ++ " @" ++ workerName name ++ "(ptr %ctx, i64 %fp.in"
+                   ++ concat [", i64 %u" ++ show k ++ ", ptr %b" ++ show k | k <- [1 .. arity]]
+                   ++ ")",
+                 "%st = extractvalue " ++ workerRet ++ " %r, 0",
+                 "%r.u = extractvalue " ++ workerRet ++ " %r, 1",
+                 "%r.b = extractvalue " ++ workerRet ++ " %r, 2",
+                 "switch i64 %st, label %exit [ i64 0, label %ok  i64 " ++ show statusTailCall ++ ", label %tail ]"
+               ]
+        )
+      ++ ["ok:"]
+      ++ map
+        ("  " ++)
+        [ -- the worker may have run native code that moved nothing, but
+          -- the stacks' addresses are the same for the whole native run
+          "%res = add i64 %fp.in, 1",
+          "%res.u = getelementptr i64, ptr %ustk, i64 %res",
+          "store i64 %r.u, ptr %res.u",
+          "%res.b = getelementptr ptr, ptr %bstk, i64 %res",
+          "store ptr %r.b, ptr %res.b",
+          field "%ap.a" oAp,
+          "store i64 %ap, ptr %ap.a",
+          field "%fp.a" oFp,
+          "store i64 %ap, ptr %fp.a",
+          field "%sp.a" oSp,
+          "store i64 %res, ptr %sp.a",
+          field "%maxsp.a" oMaxSp,
+          "%maxsp.old = load i64, ptr %maxsp.a",
+          "%maxsp.gt = icmp sgt i64 %res, %maxsp.old",
+          "%maxsp.new = select i1 %maxsp.gt, i64 %res, i64 %maxsp.old",
+          "store i64 %maxsp.new, ptr %maxsp.a",
+          "ret i64 0"
+        ]
+      ++ ["tail:"]
+      ++ map
+        ("  " ++)
+        [ "%fn = inttoptr i64 %r.u to ptr",
+          "%top = ptrtoint ptr %r.b to i64",
+          "%t = musttail call i64 %fn(ptr %ctx, i64 %ap, i64 %fp.in, i64 %top)",
+          "ret i64 %t"
+        ]
+      ++ ["exit:", "  ret i64 %st"]
+      -- the frame is as the caller left it: only the stack pointers go back
+      ++ ["pending.exit:"]
+      ++ map
+        ("  " ++)
+        [ field "%p.ap.a" oAp,
+          "store i64 %ap, ptr %p.ap.a",
+          field "%p.fp.a" oFp,
+          "store i64 %fp.in, ptr %p.fp.a",
+          field "%p.sp.a" oSp,
+          "store i64 %sp, ptr %p.sp.a",
+          "ret i64 " ++ show pendingIx
+        ]
       ++ ["}"]
 
 -- | Generates an auxiliary function in this module: the code for @body@
@@ -610,8 +1026,8 @@ genAuxFunction later fe loaded base body = do
           pure (Just (name, cell))
     (_, cell : cells) -> do
       let name = feName fe ++ "_r" ++ show (gsNAux s)
-          fe' = fe {feName = name, feArity = loaded, feCell = cell, feHead = Nothing, feBase = base, feEnclosing = []}
-          gs0 = s {gsFresh = 0, gsBlocks = [], gsCur = ("head", []), gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1}
+          fe' = fe {feName = name, feArity = loaded, feCell = cell, feHead = Nothing, feBase = base, feEnclosing = [], feWorker = False, feFast = Nothing, feSym = name}
+          gs0 = s {gsFresh = 0, gsBlocks = [], gsCur = ("head", []), gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1, gsWorker = False}
           (text, gs) = runState (genFunctionText fe' body) gs0
       case gsFailed gs of
         Just why -> put s {gsNotes = (name ++ ": " ++ why) : gsNotes gs} >> pure Nothing
@@ -632,17 +1048,17 @@ genAuxFunction later fe loaded base body = do
               }
           pure (Just (name, cell))
 
--- The first instruction decides whether compiling is worth anything: a
--- section that only calls out and yields the result is better interpreted.
+-- | Whether a @Let@ binding is generated inline: its first node must be
+-- one the generator has code for. A binding that would exit straight away
+-- is better left to the interpreter along with its @Let@, which saves the
+-- binding's frame record. (Whether a whole function is worth compiling is
+-- decided before this, in JIT.Estimate.)
 startsSupported :: MSection -> Bool
 startsSupported = \case
-  Ins (Lit _) _ -> True
-  Ins (Pack {}) _ -> True
-  Ins (Prim1 op _) _ | prim1Supported op -> True
-  Ins (Prim2 op _ _) _ | prim2Supported op -> True
-  Ins i rest -> callOutWorthwhile i rest
+  Ins i rest -> instrNative i || callOutWorthwhile i rest
   Match {} -> True
   DMatch {} -> True
+  NMatch {} -> True
   Call {} -> True
   App _ (MCode.Env _ _) _ -> True
   App _ (Stk _) _ -> True
@@ -662,60 +1078,82 @@ callOutWorthwhile i rest = case (pushCount i, rest) of
 -- stack check, then a branch to the loop head. @maxK@ is the highest
 -- frame offset the function touches, which is at least the frame size and
 -- covers the arguments of every call it makes.
-entryBlock :: Env -> Int -> Int -> Int -> Int -> [String]
-entryBlock env arity base maxK maxPool =
+entryBlock :: Env -> Bool -> Bool -> Int -> Int -> Int -> Int -> [String]
+entryBlock env worker checks arity base maxK maxPool =
   map ("  " ++) $
     -- %fp is the combinator's frame pointer, %fpb the interpreter's (the
     -- one passed in); they differ by the frame base
     [ "%fp = sub i64 %fp.in, " ++ show base,
       "%fpb = add i64 %fp, " ++ show base
     ]
+      -- A worker isn't passed the stack pointer: its arguments, were they
+      -- on the stack, would end there. Nor is it passed @ap@: a worker
+      -- never has pending arguments (its wrapper sees to that, and native
+      -- callers don't pass any), so @ap@ is the frame pointer.
+      ++ concat [["%sp = add i64 %fp.in, " ++ show arity, "%ap = add i64 %fp.in, 0"] | worker]
       ++ ["%u" ++ show k ++ " = alloca i64" | k <- [1 .. maxK]]
       ++ ["%b" ++ show k ++ " = alloca ptr" | k <- [1 .. maxK]]
       ++ ["%fpk" ++ show k ++ " = add i64 %fp, " ++ show k | k <- [0 .. maxK]]
-      ++ [ ctxLoad "ptr" "%ustk" oUstk,
-           ctxLoad "ptr" "%bstk" oBstk,
+      ++ [ (if worker then ctxAddr else ctxLoad "ptr") "%ustk" oUstk,
+           (if worker then ctxAddr else ctxLoad "ptr") "%bstk" oBstk,
            ctxLoad "ptr" "%pool" oPool,
            ctxLoad "ptr" "%hplim.p" oHplim,
            ctxLoad "i64" "%stack.size" oStackSize
          ]
-      ++ concat [poolLoad "%tag.char" poolIndexCharTag, poolLoad "%tag.float" poolIndexFloatTag, poolLoad "%tag.int" poolIndexIntTag, poolLoad "%tag.nat" poolIndexNatTag, poolLoad "%val.true" poolIndexTrue, poolLoad "%val.false" poolIndexFalse]
+      ++ concat [poolLoad "%tag.char" poolIndexCharTag, poolLoad "%tag.float" poolIndexFloatTag, poolLoad "%tag.int" poolIndexIntTag, poolLoad "%tag.nat" poolIndexNatTag]
       ++ concat
-        [ [ "%arg.u" ++ show k ++ ".a = getelementptr i64, ptr %ustk, i64 %fpk" ++ show k,
-            "%arg.u" ++ show k ++ " = load i64, ptr %arg.u" ++ show k ++ ".a",
-            "store i64 %arg.u" ++ show k ++ ", ptr %u" ++ show k,
-            "%arg.b" ++ show k ++ ".a = getelementptr ptr, ptr %bstk, i64 %fpk" ++ show k,
-            "%arg.b" ++ show k ++ " = load ptr, ptr %arg.b" ++ show k ++ ".a",
-            "store ptr %arg.b" ++ show k ++ ", ptr %b" ++ show k
-          ]
+        [ if worker
+            then
+              [ "store i64 %a.u" ++ show k ++ ", ptr %u" ++ show k,
+                "store ptr %a.b" ++ show k ++ ", ptr %b" ++ show k
+              ]
+            else
+              [ "%arg.u" ++ show k ++ ".a = getelementptr i64, ptr %ustk, i64 %fpk" ++ show k,
+                "%arg.u" ++ show k ++ " = load i64, ptr %arg.u" ++ show k ++ ".a",
+                "store i64 %arg.u" ++ show k ++ ", ptr %u" ++ show k,
+                "%arg.b" ++ show k ++ ".a = getelementptr ptr, ptr %bstk, i64 %fpk" ++ show k,
+                "%arg.b" ++ show k ++ " = load ptr, ptr %arg.b" ++ show k ++ ".a",
+                "store ptr %arg.b" ++ show k ++ ", ptr %b" ++ show k
+              ]
           | k <- [1 .. arity]
         ]
-      -- the high-water mark of slots this function may write, for marking bstk on return
-      ++ [ "%maxsp.a = getelementptr i8, ptr %ctx, i64 " ++ show (oMaxSp (envCtx env)),
-           "%maxsp.old = load i64, ptr %maxsp.a",
-           "%maxsp.gt = icmp sgt i64 %fpk" ++ show maxK ++ ", %maxsp.old",
-           "%maxsp.new = select i1 %maxsp.gt, i64 %fpk" ++ show maxK ++ ", i64 %maxsp.old",
-           "store i64 %maxsp.new, ptr %maxsp.a"
-         ]
+      -- the high-water mark of slots this function may write, for marking
+      -- bstk on return. A worker writes the stack only where it exits or
+      -- calls through the stack, and raises the mark there.
+      ++ ( if worker
+             then []
+             else
+               [ "%maxsp.a = getelementptr i8, ptr %ctx, i64 " ++ show (oMaxSp (envCtx env)),
+                 "%maxsp.old = load i64, ptr %maxsp.a",
+                 "%maxsp.gt = icmp sgt i64 %fpk" ++ show maxK ++ ", %maxsp.old",
+                 "%maxsp.new = select i1 %maxsp.gt, i64 %fpk" ++ show maxK ++ ", i64 %maxsp.old",
+                 "store i64 %maxsp.new, ptr %maxsp.a"
+               ]
+         )
       -- A constant past the pool's first array may not be in the array this
       -- run was entered with, if this function was installed after the run
       -- began (see Pool). Then exit, to be entered again with the current one.
-      ++ ( if maxPool < poolStableSize
+      ++ ( if maxPool < poolStableSize || not checks
              then []
              else
                [ "%pool.n.a = getelementptr i64, ptr %pool, i64 " ++ show (rPtrsCount (envRts env) - rPtrsHeader (envRts env)),
                  "%pool.n = load i64, ptr %pool.n.a",
                  "%pool.ok = icmp ugt i64 %pool.n, " ++ show maxPool,
-                 "br i1 %pool.ok, label %entry.room, label %stale",
+                 "br i1 %pool.ok, label %entry.room, label %stale" ++ likely,
                  "entry.room:"
                ]
          )
       -- the interpreter's check: sp + size + 1 < stack size, else grow
-      ++ [ "%need = add i64 %sp, " ++ show (maxK - arity + 1),
-           "%room = icmp slt i64 %need, %stack.size",
-           "br i1 %room, label %head, label %grow"
-         ]
+      ++ ( if checks
+             then
+               [ "%need = add i64 %sp, " ++ show (maxK - arity + 1),
+                 "%room = icmp slt i64 %need, %stack.size",
+                 "br i1 %room, label %head, label %grow" ++ likely
+               ]
+             else ["br label %head"]
+         )
   where
+    ctxAddr name f = name ++ ".a = getelementptr i8, ptr %ctx, i64 " ++ show (f (envCtx env))
     ctxLoad ty name f =
       name ++ ".a = getelementptr i8, ptr %ctx, i64 " ++ show (f (envCtx env)) ++ "\n  " ++ name ++ " = load " ++ ty ++ ", ptr " ++ name ++ ".a"
     poolLoad name ix =
@@ -740,14 +1178,40 @@ genHead fe body = do
   emit (hp ++ " = load volatile ptr, ptr %hplim.p")
   stopHp <- fresh "stop"
   emit (stopHp ++ " = icmp eq ptr " ++ hp ++ ", null")
-  -- the allocation budget: exhausted once it goes negative
-  leftA <- ctxField env oAllocLeft
-  left <- fresh "alloc.left"
-  emit (left ++ " = load i64, ptr " ++ leftA)
-  over <- fresh "over"
-  emit (over ++ " = icmp slt i64 " ++ left ++ ", 0")
-  stop <- fresh "stop"
-  emit (stop ++ " = or i1 " ++ stopHp ++ ", " ++ over)
+  -- The allocation budget: exhausted once it goes negative. Only code
+  -- that allocates needs to look (a callee that allocates looks itself).
+  stopAlloc <-
+    if allocates body
+      then do
+        leftA <- ctxField env oAllocLeft
+        left <- fresh "alloc.left"
+        emit (left ++ " = load i64, ptr " ++ leftA)
+        over <- fresh "over"
+        emit (over ++ " = icmp slt i64 " ++ left ++ ", 0")
+        stop <- fresh "stop"
+        emit (stop ++ " = or i1 " ++ stopHp ++ ", " ++ over)
+        pure stop
+      else pure stopHp
+  -- A worker that makes calls checks the C stack here, once, instead of
+  -- before each call. If the budget for native calls is used up, it goes
+  -- back to the trampoline (its callers unwinding as for any exit) and is
+  -- entered again at the bottom of the C stack.
+  stop <-
+    if feWorker fe && makesCalls body
+      then do
+        csp <- fresh "csp"
+        emit (csp ++ " = call ptr @llvm.stacksave.p0()")
+        cspi <- fresh "csp"
+        emit (cspi ++ " = ptrtoint ptr " ++ csp ++ " to i64")
+        lim <- ctxField env oCStackLimit
+        limv <- fresh "lim"
+        emit (limv ++ " = load i64, ptr " ++ lim)
+        deep <- fresh "deep"
+        emit (deep ++ " = icmp ult i64 " ++ cspi ++ ", " ++ limv)
+        stop <- fresh "stop"
+        emit (stop ++ " = or i1 " ++ stopAlloc ++ ", " ++ deep)
+        pure stop
+      else pure stopAlloc
   reenter <- exitBlock fe d (Reenter (feCell fe))
   bodyLabel <- freshLabel "body"
   when (envStressPoll env) $ do
@@ -766,15 +1230,24 @@ genHead fe body = do
     emit ("store i64 " ++ reset ++ ", ptr " ++ left)
     stop' <- fresh "stop"
     emit (stop' ++ " = or i1 " ++ stop ++ ", " ++ fire)
-    emit ("br i1 " ++ stop' ++ ", label %" ++ reenter ++ ", label %" ++ bodyLabel)
+    emit ("br i1 " ++ stop' ++ ", label %" ++ reenter ++ ", label %" ++ bodyLabel ++ unlikely)
   unless (envStressPoll env) $
-    emit ("br i1 " ++ stop ++ ", label %" ++ reenter ++ ", label %" ++ bodyLabel)
+    emit ("br i1 " ++ stop ++ ", label %" ++ reenter ++ ", label %" ++ bodyLabel ++ unlikely)
   startBlock bodyLabel
   genSection fe d body
 
 -- | Generates a section at frame depth @d@. Every path ends in a terminator.
 genSection :: FnEnv -> Int -> MSection -> Gen ()
-genSection fe d sect = case sect of
+genSection fe d sect = case feFast fe of
+  Nothing -> genSectionFull fe d sect
+  -- the fast entry: what can run unchecked runs here, and anything else
+  -- is the full worker's, called with the arguments this was called with
+  Just full -> do
+    free <- checkFree d sect
+    if free then genSectionFull fe d sect else tailToFull fe full
+
+genSectionFull :: FnEnv -> Int -> MSection -> Gen ()
+genSectionFull fe d sect = case sect of
   Ins i rest -> genInstr fe d i sect (\d' -> genSection fe d' rest)
   Yield args -> genYield fe d args sect
   Call _ cix comb args -> genCall fe d cix comb args sect
@@ -805,25 +1278,50 @@ genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCom
   Just (Comb (LamI bodyArity _ _ _))
     | m <- bodyArity - d,
       m >= 0 -> case binding of
+        Call _ ccix comb ZArgs
+          | m == 1,
+            Just (u, ix) <- cachedConstant fe ccix comb -> do
+              pushCached d u ix
+              genSection fe (d + 1) body
+        App _ (MCode.Env ccix comb) ZArgs
+          | m == 1,
+            Just (u, ix) <- cachedConstant fe ccix comb -> do
+              pushCached d u ix
+              genSection fe (d + 1) body
         Call _ _ comb args
           | Comb (LamI arity _ _ ccell) <- unRComb comb,
             let srcs = argSources fe d args,
             length srcs == arity -> do
               bcell <- bodyCell
               ix <- addFrame env (Frame bcix f body bcell)
-              genNonTailCall fe d d ccell srcs sect (Just (ix, d)) $ do
-                loadResults d m
+              genNonTailCall fe d d ccell srcs m sect (Just (ix, d)) $
                 genSection fe (d + m) body
-        App _ r@(MCode.Env _ comb) args
+        App _ r@(MCode.Env ccix comb) args
           | enabled fe "app",
             Comb (LamI arity _ _ ccell) <- unRComb comb,
             let srcs = argSources fe d args,
             length srcs == arity -> do
               bcell <- bodyCell
               ix <- addFrame env (Frame bcix f body bcell)
-              genNonTailCall fe d d ccell srcs sect (Just (ix, d)) $ do
-                loadResults d m
+              genNonTailCall fe d d ccell srcs m sect (Just (ix, d)) $
                 genSection fe (d + m) body
+          -- Fewer arguments than the function takes: the value of the binding
+          -- is a partial application, built here (see "Partial applications"
+          -- in jit_rt.c) from the function's closure in the pool.
+          | enabled fe "name",
+            Nothing <- feFast fe,
+            m == 1,
+            Comb info@(LamI arity _ _ _) <- unRComb comb,
+            let srcs = argSources fe d args,
+            not (null srcs),
+            length srcs < arity,
+            length srcs <= 4,
+            Just pix <- Map.lookup (KeyComb ccix info) (envPool env) -> do
+              slow <- exitBlock fe d (Resume (feCix fe) sect)
+              vals <- loadSources srcs
+              fn <- poolValue pix
+              listHelper d slow (nameCall fn vals)
+              genSection fe (d + 1) body
           | enabled fe "app",
             ZArgs <- args,
             m == 1,
@@ -834,8 +1332,7 @@ genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCom
         App _ (Stk i) args | enabled fe "app" -> do
           bcell <- bodyCell
           ix <- addFrame env (Frame bcix f body bcell)
-          genClosureCall fe d d (d - i) (argSources fe d args) sect (Just (ix, d)) $ do
-            loadResults d m
+          genClosureCall fe d d (d - i) (argSources fe d args) m sect (Just (ix, d)) $
             genSection fe (d + m) body
         _ | startsSupported binding -> do
               bcell <- bodyCell
@@ -885,36 +1382,30 @@ loadResults base m =
 -- size) and those of the enclosing bindings are written, and the status is
 -- passed on. If the callee can't be called, the interpreter resumes at
 -- @sect@.
-genNonTailCall :: FnEnv -> Int -> Int -> Ptr NativeCell -> [Int] -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
-genNonTailCall fe d base ccell srcs sect ownFrame continue =
-  genNonTailCallWith fe d base (loadCallee (feEnv fe) ccell) (fpPlus (base + length srcs)) srcs sect ownFrame continue
+genNonTailCall :: FnEnv -> Int -> Int -> Ptr NativeCell -> [Int] -> Int -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
+genNonTailCall fe d base ccell srcs m sect ownFrame continue
+  | m == 1,
+    Just (wname, arity) <- Map.lookup ccell (envWorkers (feEnv fe)),
+    arity == length srcs =
+      genWorkerCall fe d base wname srcs sect ownFrame continue
+  | otherwise =
+      genNonTailCallWith fe d base (loadCallee (feEnv fe) ccell) (fpPlus (base + length srcs)) srcs m sect ownFrame continue
 
 -- | 'genNonTailCall' with the callee given by a generator (the code
 -- pointer and an i1 saying the call can't be made), and the callee's
 -- stack pointer given by another, run after the arguments are in place
--- (a closure call copies its captured arguments there).
-genNonTailCallWith :: FnEnv -> Int -> Int -> Gen (String, String) -> Gen String -> [Int] -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
-genNonTailCallWith fe d base getCallee getTop srcs sect ownFrame continue = do
-  let env = feEnv fe
-      n = length srcs
+-- (a closure call copies its captured arguments there). The callee's @m@
+-- results are loaded from the stack into their slots before the
+-- continuation runs.
+genNonTailCallWith :: FnEnv -> Int -> Int -> Gen (String, String) -> Gen String -> [Int] -> Int -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
+genNonTailCallWith fe d base getCallee getTop srcs m sect ownFrame continue = do
+  let n = length srcs
   (fnp, skip) <- getCallee
   slow <- exitBlock fe d (Resume (feCix fe) sect)
   guardL <- freshLabel "guard"
-  emit ("br i1 " ++ skip ++ ", label %" ++ slow ++ ", label %" ++ guardL)
+  emit ("br i1 " ++ skip ++ ", label %" ++ slow ++ ", label %" ++ guardL ++ unlikely)
   startBlock guardL
-  -- the C stack guard: exit instead of calling when the budget is used up
-  csp <- fresh "csp"
-  emit (csp ++ " = call ptr @llvm.stacksave.p0()")
-  cspi <- fresh "csp"
-  emit (cspi ++ " = ptrtoint ptr " ++ csp ++ " to i64")
-  lim <- ctxField env oCStackLimit
-  limv <- fresh "lim"
-  emit (limv ++ " = load i64, ptr " ++ lim)
-  deep <- fresh "deep"
-  emit (deep ++ " = icmp ult i64 " ++ cspi ++ ", " ++ limv)
-  callL <- freshLabel "call"
-  emit ("br i1 " ++ deep ++ ", label %" ++ slow ++ ", label %" ++ callL)
-  startBlock callL
+  cStackGuard fe slow
   -- arguments go above the callee's base, as moveArgs would put them
   vals <- loadSources srcs
   forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
@@ -930,16 +1421,130 @@ genNonTailCallWith fe d base getCallee getTop srcs sect ownFrame continue = do
   emit (ok ++ " = icmp eq i64 " ++ r ++ ", 0")
   -- the callee is exiting: record the frames the interpreter would have
   -- pushed, and pass the status along
-  unwind <- sideBlock "unwind" $ do
-    writeFrame base
-    forM_ ownFrame $ \(ix, fdepth) -> case feEnclosing fe of
-      [] -> writeRecord env ix (fdepth - feBase fe) Nothing
-      e : _ -> writeRecord env ix (fdepth - enBase e) (Just "0")
-    unwindEnclosing fe
-    emit ("ret i64 " ++ r)
+  unwind <- sideBlock "unwind" (unwindWith fe base ownFrame r)
   contL <- freshLabel "cont"
-  emit ("br i1 " ++ ok ++ ", label %" ++ contL ++ ", label %" ++ unwind)
+  emit ("br i1 " ++ ok ++ ", label %" ++ contL ++ ", label %" ++ unwind ++ likely)
   startBlock contL
+  loadResults base m
+  continue
+
+-- | The C stack guard: branches to @slow@ instead of going on to a call
+-- when the budget for native non-tail calls is used up. A worker has
+-- checked at entry (see 'genHead') and doesn't check again here. Every
+-- cycle of calls still passes a check: an edge without one goes from a
+-- worker to a function with the uniform signature, whose own calls check.
+cStackGuard :: FnEnv -> String -> Gen ()
+cStackGuard fe _ | feWorker fe = pure ()
+cStackGuard fe slow = do
+  let env = feEnv fe
+  csp <- fresh "csp"
+  emit (csp ++ " = call ptr @llvm.stacksave.p0()")
+  cspi <- fresh "csp"
+  emit (cspi ++ " = ptrtoint ptr " ++ csp ++ " to i64")
+  lim <- ctxField env oCStackLimit
+  limv <- fresh "lim"
+  emit (limv ++ " = load i64, ptr " ++ lim)
+  deep <- fresh "deep"
+  emit (deep ++ " = icmp ult i64 " ++ cspi ++ ", " ++ limv)
+  callL <- freshLabel "call"
+  emit ("br i1 " ++ deep ++ ", label %" ++ slow ++ ", label %" ++ callL ++ unlikely)
+  startBlock callL
+
+-- | What a caller does when its callee comes back with the status in
+-- register @r@, which isn't OK: write the slots up to @base@ back to the
+-- stack, write the frame record for this @Let@ (if given) and those of
+-- the enclosing bindings, and return the status.
+unwindWith :: FnEnv -> Int -> Maybe (Int, Int) -> String -> Gen ()
+unwindWith fe base ownFrame r = do
+  let env = feEnv fe
+  writeFrame base
+  forM_ ownFrame $ \(ix, fdepth) -> case feEnclosing fe of
+    [] -> writeRecord env ix (fdepth - feBase fe) Nothing
+    e : _ -> writeRecord env ix (fdepth - enBase e) (Just "0")
+  unwindEnclosing fe
+  retStatus fe r
+
+-- | A call to a function of this module that has a worker, expecting one
+-- result: the arguments go in registers and the result comes back in
+-- registers, so the Unison stack isn't touched unless the callee exits.
+-- The callee's frame still has its place on the stack, above @base@, and
+-- this function's stack check has made room for its arguments there
+-- (the callee writes them if it exits before anything else).
+--
+-- The worker may come back asking for a tail call it couldn't make
+-- itself ('statusTailCall'): its callee's arguments are on the stack
+-- above @base@, and the call is made here, as a plain call through the
+-- stack.
+genWorkerCall :: FnEnv -> Int -> Int -> String -> [Int] -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
+genWorkerCall fe d base wname srcs sect ownFrame continue = do
+  let env = feEnv fe
+      n = length srcs
+  slow <- exitBlock fe d (Resume (feCix fe) sect)
+  -- the callee stress mode still takes the slow path now and then
+  when (envStressCallee env) $ do
+    fire <- stressFire env oStressCalleeLeft oStressCallee
+    goL <- freshLabel "go"
+    emit ("br i1 " ++ fire ++ ", label %" ++ slow ++ ", label %" ++ goL ++ unlikely)
+    startBlock goL
+  cStackGuard fe slow
+  vals <- loadSources srcs
+  useK (base + max n 1)
+  bp <- fpPlus base
+  r <- fresh "r"
+  emit
+    ( r ++ " = call tailcc " ++ workerRet ++ " @" ++ wname ++ "(ptr %ctx, i64 " ++ bp
+        ++ concat [", i64 " ++ u ++ ", ptr " ++ b | (u, b) <- reverse vals]
+        ++ ")"
+    )
+  st <- fresh "st"
+  emit (st ++ " = extractvalue " ++ workerRet ++ " " ++ r ++ ", 0")
+  ru <- fresh "r.u"
+  emit (ru ++ " = extractvalue " ++ workerRet ++ " " ++ r ++ ", 1")
+  rb <- fresh "r.b"
+  emit (rb ++ " = extractvalue " ++ workerRet ++ " " ++ r ++ ", 2")
+  ok <- fresh "ok"
+  emit (ok ++ " = icmp eq i64 " ++ st ++ ", 0")
+  callL <- gets (fst . gsCur)
+  contL <- freshLabel "cont"
+  notOkL <- freshLabel "notok"
+  tailL <- freshLabel "tailcall"
+  tailOkL <- freshLabel "tailcall.ok"
+  unwindL <- freshLabel "unwind"
+  emit ("br i1 " ++ ok ++ ", label %" ++ contL ++ ", label %" ++ notOkL ++ likely)
+  -- not OK: a tail call to make, or an exit
+  r2 <- fresh "r"
+  sideBlockNamed notOkL $ do
+    tc <- fresh "tc"
+    emit (tc ++ " = icmp eq i64 " ++ st ++ ", " ++ show statusTailCall)
+    emit ("br i1 " ++ tc ++ ", label %" ++ tailL ++ ", label %" ++ unwindL ++ unlikely)
+  u2 <- fresh "u"
+  b2 <- fresh "b"
+  sideBlockNamed tailL $ do
+    fn <- fresh "fn"
+    emit (fn ++ " = inttoptr i64 " ++ ru ++ " to ptr")
+    top <- fresh "top"
+    emit (top ++ " = ptrtoint ptr " ++ rb ++ " to i64")
+    emit (r2 ++ " = call i64 " ++ fn ++ "(ptr %ctx, i64 " ++ bp ++ ", i64 " ++ bp ++ ", i64 " ++ top ++ ")")
+    ok2 <- fresh "ok"
+    emit (ok2 ++ " = icmp eq i64 " ++ r2 ++ ", 0")
+    emit ("br i1 " ++ ok2 ++ ", label %" ++ tailOkL ++ ", label %" ++ unwindL ++ likely)
+  sideBlockNamed tailOkL $ do
+    ua <- stackAddrU (base + 1)
+    emit (u2 ++ " = load i64, ptr " ++ ua)
+    ba <- stackAddrB (base + 1)
+    emit (b2 ++ " = load ptr, ptr " ++ ba)
+    emit ("br label %" ++ contL)
+  sideBlockNamed unwindL $ do
+    status <- fresh "status"
+    emit (status ++ " = phi i64 [ " ++ st ++ ", %" ++ notOkL ++ " ], [ " ++ r2 ++ ", %" ++ tailL ++ " ]")
+    unwindWith fe base ownFrame status
+  startBlock contL
+  u <- fresh "u"
+  emit (u ++ " = phi i64 [ " ++ ru ++ ", %" ++ callL ++ " ], [ " ++ u2 ++ ", %" ++ tailOkL ++ " ]")
+  b <- fresh "b"
+  emit (b ++ " = phi ptr [ " ++ rb ++ ", %" ++ callL ++ " ], [ " ++ b2 ++ ", %" ++ tailOkL ++ " ]")
+  storeU (base + 1) u
+  storeB (base + 1) b
   continue
 
 -- | Runs a generator that may fail. On failure the state is rolled back
@@ -952,7 +1557,7 @@ attempt g = do
   case gsFailed after of
     Nothing -> pure True
     Just why -> do
-      put before {gsFresh = gsFresh after, gsNotes = why : gsNotes after}
+      put before {gsFresh = gsFresh after, gsNotes = why : gsNotes after, gsNotWorker = gsNotWorker after}
       pure False
 
 -- | Branch on an i64 value. @arm@ generates one arm at depth @d@; if it
@@ -1174,18 +1779,29 @@ genYield fe d args _sect
             storeB (enBase e + n - j) b
           emit ("br label %" ++ enBody e)
 genYield fe d args sect = do
-  let env = feEnv fe
-      base = feBase fe
+  let base = feBase fe
   -- pending arguments (fp /= ap) mean over-application; leave that to the interpreter
   pending <- fresh "pending"
   emit (pending ++ " = icmp ne i64 %ap, %fpb")
   slow <- exitBlock fe d (Resume (feCix fe) sect)
   fast <- freshLabel "yield"
-  emit ("br i1 " ++ pending ++ ", label %" ++ slow ++ ", label %" ++ fast)
+  emit ("br i1 " ++ pending ++ ", label %" ++ slow ++ ", label %" ++ fast ++ unlikely)
   startBlock fast
   let srcs = argSources fe d args
       n = length srcs
   vals <- loadSources srcs
+  -- a worker hands its one result back in registers
+  if feWorker fe
+    then case vals of
+      [(u, b)] -> retWorker "0" u b
+      _ -> modify' (\s -> s {gsFailed = Just "a worker yields other than one value", gsNotWorker = True})
+    else genYieldStack fe base n vals
+
+-- | The rest of a return through the stack: the results go above the
+-- frame base, and the stack pointers into @Ctx@.
+genYieldStack :: FnEnv -> Int -> Int -> [(String, String)] -> Gen ()
+genYieldStack fe base n vals = do
+  let env = feEnv fe
   forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
     ua <- stackAddrU (base + n - j)
     emit ("store i64 " ++ u ++ ", ptr " ++ ua)
@@ -1203,13 +1819,17 @@ genYield fe d args sect = do
 -- | A tail call: to this function (a loop) or to another one through its cell.
 genCall :: FnEnv -> Int -> CombIx -> RComb Val -> Args -> MSection -> Gen ()
 genCall fe d cix comb args sect
+  -- a top-level value, evaluated when it was loaded: a constant, returned
+  | ZArgs <- args,
+    Just (u, ix) <- cachedConstant fe cix comb = do
+      pushCached d u ix
+      genYield fe (d + 1) (VArg1 0) sect
   | e : _ <- feEnclosing fe = case unRComb comb of
       -- a tail call inside an inline binding is a call that returns to the body
       Comb (LamI arity _ _ ccell)
         | let srcs = argSources fe d args,
           length srcs == arity ->
-            genNonTailCall fe d (enBase e) ccell srcs sect Nothing $ do
-              loadResults (enBase e) (enResults e)
+            genNonTailCall fe d (enBase e) ccell srcs (enResults e) sect Nothing $
               emit ("br label %" ++ enBody e)
       _ -> exitResume fe d sect
   | cix == feCix fe,
@@ -1231,25 +1851,59 @@ genCall fe d cix comb args sect
             base = feBase fe
         if n /= arity
           then exitResume fe d sect
-          else do
-            (fnp, isNull) <- loadCallee env cell
-            slow <- exitBlock fe d (Resume (feCix fe) sect)
-            go <- freshLabel "tail"
-            emit ("br i1 " ++ isNull ++ ", label %" ++ slow ++ ", label %" ++ go)
-            startBlock go
-            vals <- loadSources srcs
-            forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
-              ua <- stackAddrU (base + n - j)
-              emit ("store i64 " ++ u ++ ", ptr " ++ ua)
-              ba <- stackAddrB (base + n - j)
-              emit ("store ptr " ++ b ++ ", ptr " ++ ba)
-            f <- fpPlus (base + n)
-            r <- fresh "r"
-            emit (r ++ " = musttail call i64 " ++ fnp ++ "(ptr %ctx, i64 %ap, i64 %fpb, i64 " ++ f ++ ")")
-            emit ("ret i64 " ++ r)
+          else case Map.lookup cell (envWorkers env) of
+            -- worker to worker: a real tail call with the arguments in registers
+            Just (wname, _) | feWorker fe -> do
+              when (envStressCallee env) $ do
+                fire <- stressFire env oStressCalleeLeft oStressCallee
+                slow <- exitBlock fe d (Resume (feCix fe) sect)
+                goL <- freshLabel "tail"
+                emit ("br i1 " ++ fire ++ ", label %" ++ slow ++ ", label %" ++ goL ++ unlikely)
+                startBlock goL
+              vals <- loadSources srcs
+              r <- fresh "r"
+              emit
+                ( r ++ " = musttail call tailcc " ++ workerRet ++ " @" ++ wname ++ "(ptr %ctx, i64 %fpb"
+                    ++ concat [", i64 " ++ u ++ ", ptr " ++ b | (u, b) <- reverse vals]
+                    ++ ")"
+                )
+              emit ("ret " ++ workerRet ++ " " ++ r)
+            _ -> do
+              (fnp, isNull) <- loadCallee env cell
+              slow <- exitBlock fe d (Resume (feCix fe) sect)
+              go <- freshLabel "tail"
+              emit ("br i1 " ++ isNull ++ ", label %" ++ slow ++ ", label %" ++ go ++ unlikely)
+              startBlock go
+              vals <- loadSources srcs
+              forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
+                ua <- stackAddrU (base + n - j)
+                emit ("store i64 " ++ u ++ ", ptr " ++ ua)
+                ba <- stackAddrB (base + n - j)
+                emit ("store ptr " ++ b ++ ", ptr " ++ ba)
+              f <- fpPlus (base + n)
+              tailCallThroughStack fe fnp f
       _ -> exitResume fe d sect
   where
     env = feEnv fe
+
+-- | A tail call to a function with the uniform signature, its arguments
+-- already on the stack above the frame base, with the stack pointer in
+-- @top@. A worker can't make it (the return types differ): it returns
+-- 'statusTailCall' with the code pointer and stack pointer, and whoever
+-- called it makes the call.
+tailCallThroughStack :: FnEnv -> String -> String -> Gen ()
+tailCallThroughStack fe fnp top
+  | feWorker fe = do
+      -- the callee's entry raises the high-water mark over its arguments
+      fni <- fresh "fn"
+      emit (fni ++ " = ptrtoint ptr " ++ fnp ++ " to i64")
+      tp <- fresh "top"
+      emit (tp ++ " = inttoptr i64 " ++ top ++ " to ptr")
+      retWorker (show statusTailCall) fni tp
+  | otherwise = do
+      r <- fresh "r"
+      emit (r ++ " = musttail call i64 " ++ fnp ++ "(ptr %ctx, i64 %ap, i64 %fpb, i64 " ++ top ++ ")")
+      emit ("ret i64 " ++ r)
 
 -- | A call to a function value (@App@). A known combinator used as a value
 -- (@Env@) with the right number of arguments is a plain call. A value on
@@ -1259,6 +1913,7 @@ genCall fe d cix comb args sect
 genApp :: FnEnv -> Int -> MRef -> Args -> MSection -> Gen ()
 genApp fe d r args sect = case r of
   MCode.Env cix comb
+    | CachedVal {} <- unRComb comb, ZArgs <- args -> genCall fe d cix comb args sect
     | Comb (LamI arity _ _ _) <- unRComb comb,
       length (argSources fe d args) == arity ->
         genCall fe d cix comb args sect
@@ -1269,8 +1924,7 @@ genApp fe d r args sect = case r of
         genYield fe (d + 1) (VArg1 0) sect
   Stk i
     | e : _ <- feEnclosing fe ->
-        genClosureCall fe d (enBase e) (d - i) (argSources fe d args) sect Nothing $ do
-          loadResults (enBase e) (enResults e)
+        genClosureCall fe d (enBase e) (d - i) (argSources fe d args) (enResults e) sect Nothing $
           emit ("br label %" ++ enBody e)
     | otherwise -> do
         let srcs = argSources fe d args
@@ -1284,7 +1938,7 @@ genApp fe d r args sect = case r of
         emit (skip ++ " = or i1 " ++ skip0 ++ ", " ++ pending)
         slow <- exitBlock fe d (Resume (feCix fe) sect)
         go <- freshLabel "tail"
-        emit ("br i1 " ++ skip ++ ", label %" ++ slow ++ ", label %" ++ go)
+        emit ("br i1 " ++ skip ++ ", label %" ++ slow ++ ", label %" ++ go ++ unlikely)
         startBlock go
         vals <- loadSources srcs
         forM_ (zip [0 ..] vals) $ \(j, (u, b)) -> do
@@ -1293,10 +1947,26 @@ genApp fe d r args sect = case r of
           ba <- stackAddrB (base + n - j)
           emit ("store ptr " ++ b ++ ", ptr " ++ ba)
         top <- copyCaptured fe (base + n)
-        r' <- fresh "r"
-        emit (r' ++ " = musttail call i64 " ++ fnp ++ "(ptr %ctx, i64 %ap, i64 %fpb, i64 " ++ top ++ ")")
-        emit ("ret i64 " ++ r')
+        tailCallThroughStack fe fnp top
   _ -> exitResume fe d sect
+
+-- | A top-level value that was evaluated when it was loaded: its unboxed
+-- word and the pool index of its boxed part.
+cachedConstant :: FnEnv -> CombIx -> RComb Val -> Maybe (Int, Int)
+cachedConstant fe cix comb = case unRComb comb of
+  CachedVal _ v -> (,) (getUnboxedVal v) <$> Map.lookup (KeyCached cix (getBoxedVal v)) (envPool (feEnv fe))
+  _ -> Nothing
+
+-- | Pushes a cached top-level value.
+pushCached :: Int -> Int -> Int -> Gen ()
+pushCached d u ix = do
+  usePool ix
+  a <- fresh "pool.a"
+  emit (a ++ " = getelementptr ptr, ptr %pool, i64 " ++ show ix)
+  v <- fresh "const"
+  emit (v ++ " = load ptr, ptr " ++ a)
+  storeU (d + 1) (show u)
+  storeB (d + 1) v
 
 -- | The pool index of a known combinator's closure (an @App@ with no
 -- arguments of a combinator with some arity), if it has one.
@@ -1310,9 +1980,9 @@ combConstant fe = \case
 
 -- | A non-tail call to the closure in slot @k@ with the given argument
 -- slots; the callee's frame starts at @base@. See 'genNonTailCall'.
-genClosureCall :: FnEnv -> Int -> Int -> Int -> [Int] -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
-genClosureCall fe d base k srcs sect ownFrame continue =
-  genNonTailCallWith fe d base (closureCallee fe d k (length srcs)) (copyCaptured fe (base + length srcs)) srcs sect ownFrame continue
+genClosureCall :: FnEnv -> Int -> Int -> Int -> [Int] -> Int -> MSection -> Maybe (Int, Int) -> Gen () -> Gen ()
+genClosureCall fe d base k srcs m sect ownFrame continue =
+  genNonTailCallWith fe d base (closureCallee fe d k (length srcs)) (copyCaptured fe (base + length srcs)) srcs m sect ownFrame continue
 
 -- | Examines the closure in slot @k@ for a call with @n@ supplied
 -- arguments: it must be a @PAp@ whose arity is @n@ plus its captured
@@ -1467,10 +2137,12 @@ copyCaptured fe from = do
   slot1 <- fresh "slot"
   emit (slot1 ++ " = add i64 " ++ slot ++ ", 1")
   dstU <- fresh "ua"
-  emit (dstU ++ " = getelementptr i64, ptr %ustk, i64 " ++ slot1)
+  ustk <- stackReg "%ustk"
+  emit (dstU ++ " = getelementptr i64, ptr " ++ ustk ++ ", i64 " ++ slot1)
   emit ("store i64 " ++ u ++ ", ptr " ++ dstU)
   dstB <- fresh "ba"
-  emit (dstB ++ " = getelementptr ptr, ptr %bstk, i64 " ++ slot1)
+  bstk <- stackReg "%bstk"
+  emit (dstB ++ " = getelementptr ptr, ptr " ++ bstk ++ ", i64 " ++ slot1)
   emit ("store ptr " ++ b ++ ", ptr " ++ dstB)
   emit (k1 ++ " = add i64 " ++ k ++ ", 1")
   emit ("br label %" ++ headL)
@@ -1478,14 +2150,7 @@ copyCaptured fe from = do
   top <- fresh "top"
   emit (top ++ " = add i64 " ++ fromR ++ ", " ++ count)
   -- the high-water mark for card marking on return
-  maxA <- ctxField env oMaxSp
-  old <- fresh "maxsp"
-  emit (old ++ " = load i64, ptr " ++ maxA)
-  gt <- fresh "maxsp.gt"
-  emit (gt ++ " = icmp sgt i64 " ++ top ++ ", " ++ old)
-  new <- fresh "maxsp"
-  emit (new ++ " = select i1 " ++ gt ++ ", i64 " ++ top ++ ", i64 " ++ old)
-  emit ("store i64 " ++ new ++ ", ptr " ++ maxA)
+  markWritten env top
   pure top
 
 -- ---------------------------------------------------------------------------
@@ -1500,7 +2165,7 @@ litSupported = \case
   _ -> False
 
 prim1Supported :: Prim1 -> Bool
-prim1Supported op = op `elem` [DECI, DECN, INCI, INCN, NEGI, COMN, COMI, TRNC, SGNI]
+prim1Supported op = op `elem` [DECI, DECN, INCI, INCN, NEGI, COMN, COMI, TRNC, SGNI, LZRO, TZRO, POPC]
 
 prim2Supported :: Prim2 -> Bool
 prim2Supported op =
@@ -1508,6 +2173,21 @@ prim2Supported op =
     `elem` [ ADDI, SUBI, MULI, DIVI, MODI, EQLI, NEQI, LEQI, LESI, ANDI, IORI, XORI, SHLI, SHRI,
              ADDN, SUBN, MULN, DIVN, MODN, EQLN, NEQN, LEQN, LESN, ANDN, IORN, XORN, SHLN, SHRN, DRPN
            ]
+
+-- | Whether 'genInstr' has native code for an instruction (at least a fast
+-- path), as opposed to calling out for it every time. Must agree with the
+-- cases of 'genInstr'; the estimate of what compiling a function saves
+-- relies on it (see JIT.Estimate).
+instrNative :: GInstr comb -> Bool
+instrNative = \case
+  Lit _ -> True
+  Pack {} -> True
+  Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT]
+  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATT, TAKT, DRPT, EQLT]
+  ForeignCall _ f _ -> f `elem` [MutableArray_size, MutableArray_read, MutableArray_write]
+  -- (up to four arguments; more is rare, and then it is a call-out)
+  Name r _ -> case r of Dyn _ -> False; _ -> True
+  _ -> False
 
 -- | An instruction at depth @d@; continues with the depth after it.
 genInstr :: FnEnv -> Int -> GInstr (RComb Val) -> MSection -> (Int -> Gen ()) -> Gen ()
@@ -1538,9 +2218,122 @@ genInstr fe d instr sect k = case instr of
     x <- loadU (d - i)
     genPrim1 fe d op x sect
     k (d + 1)
+  Prim1 NOTB i -> do
+    slow <- callOutExit True fe d instr sect
+    c <- loadBoolean fe (d - i) slow
+    r <- fresh "not"
+    emit (r ++ " = xor i1 " ++ c ++ ", true")
+    resultBool fe d r
+    k (d + 1)
+  Prim2 op i j | op `elem` [ANDB, IORB] -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadBoolean fe (d - i) slow
+    y <- loadBoolean fe (d - j) slow
+    r <- fresh "bool"
+    emit (r ++ " = " ++ (if op == ANDB then "and" else "or") ++ " i1 " ++ x ++ ", " ++ y)
+    resultBool fe d r
+    k (d + 1)
   Prim1 REFR i | enabled fe "ref" -> do
     genRefRead fe d (d - i) instr sect
     k (d + 1)
+  -- A partial application: a copy of the function's closure with the
+  -- arguments added (a C helper; see "Partial applications" in jit_rt.c).
+  Name r args
+    | enabled fe "name",
+      srcs <- argSources fe d args,
+      length srcs <= 4,
+      Just closure <- nameClosure r -> do
+        slow <- callOutExit True fe d instr sect
+        vals <- loadSources srcs
+        f <- closure
+        listHelper d slow (nameCall f vals)
+        k (d + 1)
+    where
+      nameClosure = \case
+        Stk i -> Just (loadB (d - i))
+        MCode.Env cix comb
+          | Comb info <- unRComb comb,
+            Just ix <- Map.lookup (KeyComb cix info) (envPool (feEnv fe)) ->
+              Just (poolValue ix)
+        _ -> Nothing
+  -- Lists: C helpers do the common cases (see "Lists" in jit_rt.c) and
+  -- answer "not handled" for the rest, which the interpreter then runs.
+  Prim1 SIZS i | enabled fe "list" -> do
+    slow <- callOutExit True fe d instr sect
+    l <- loadB (d - i)
+    n <- fresh "size"
+    emit (n ++ " = call i64 @unison_jit_list_size(ptr " ++ l ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp slt i64 " ++ n ++ ", 0")
+    branchIf "list" miss slow
+    result fe d (feTagNat fe) n
+    k (d + 1)
+  Prim1 op i
+    | enabled fe "list",
+      op == VWLS || op == VWRS,
+      Just emptyIx <- Map.lookup (KeyEnum Ty.seqViewRef TT.seqViewEmptyTag) (envPool (feEnv fe)) -> do
+        let PackedTag elemTag = TT.seqViewElemTag
+        slow <- callOutExit True fe d instr sect
+        l <- loadB (d - i)
+        e <- poolValue emptyIx
+        listHelper d slow ("@unison_jit_list_view(ptr %ctx, ptr " ++ l ++ ", ptr " ++ e ++ ", i64 " ++ show elemTag ++ ", i64 " ++ (if op == VWLS then "1" else "0") ++ ")")
+        k (d + 1)
+  Prim2 op i j | enabled fe "list", op == CONS || op == SNOC -> do
+    -- cons takes the element first, snoc the list
+    let (kl, kx) = if op == CONS then (d - j, d - i) else (d - i, d - j)
+    slow <- callOutExit True fe d instr sect
+    l <- loadB kl
+    u <- loadU kx
+    b <- loadB kx
+    listHelper d slow ("@unison_jit_list_push(ptr %ctx, ptr " ++ l ++ ", i64 " ++ u ++ ", ptr " ++ b ++ ", i64 " ++ (if op == CONS then "1" else "0") ++ ")")
+    k (d + 1)
+  -- Text: the same arrangement (see "Text" in jit_rt.c). The helpers handle
+  -- every text; the slow path is only for a closure that isn't one.
+  Prim1 SIZT i | enabled fe "text" -> do
+    slow <- callOutExit True fe d instr sect
+    t <- loadB (d - i)
+    n <- fresh "size"
+    emit (n ++ " = call i64 @unison_jit_text_size(ptr " ++ t ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp slt i64 " ++ n ++ ", 0")
+    branchIf "text" miss slow
+    result fe d (feTagNat fe) n
+    k (d + 1)
+  Prim2 CATT i j | enabled fe "text" -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadB (d - i)
+    y <- loadB (d - j)
+    listHelper d slow ("@unison_jit_text_append(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ")")
+    k (d + 1)
+  Prim2 op i j | enabled fe "text", op == TAKT || op == DRPT -> do
+    slow <- callOutExit True fe d instr sect
+    n <- loadU (d - i)
+    t <- loadB (d - j)
+    listHelper d slow ("@unison_jit_text_cut(ptr %ctx, ptr " ++ t ++ ", i64 " ++ n ++ ", i64 " ++ (if op == TAKT then "1" else "0") ++ ")")
+    k (d + 1)
+  Prim2 EQLT i j | enabled fe "text" -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadB (d - i)
+    y <- loadB (d - j)
+    r <- fresh "eq"
+    emit (r ++ " = call i64 @unison_jit_text_eq(ptr " ++ x ++ ", ptr " ++ y ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp slt i64 " ++ r ++ ", 0")
+    branchIf "text" miss slow
+    c <- fresh "bool"
+    emit (c ++ " = icmp ne i64 " ++ r ++ ", 0")
+    resultBool fe d c
+    k (d + 1)
+  Prim2 IDXS i j
+    | enabled fe "list",
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+        slow <- callOutExit True fe d instr sect
+        ix <- loadU (d - i)
+        l <- loadB (d - j)
+        none <- poolValue noneIx
+        listHelper d slow ("@unison_jit_list_index(ptr %ctx, ptr " ++ l ++ ", i64 " ++ ix ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ")")
+        k (d + 1)
   Prim2 REFW i j
     | enabled fe "ref",
       Just unitIx <- Map.lookup (KeyEnum Ty.unitRef TT.unitTag) (envPool (feEnv fe)) -> do
@@ -1569,6 +2362,32 @@ genInstr fe d instr sect k = case instr of
     genPrim2 fe d op x y sect
     k (d + 1)
   _ -> genCallOut fe d instr sect
+
+-- | The boolean in slot @k@ as an i1. One still held as an i1 costs
+-- nothing; otherwise the closure must be an enumeration (else @slow@),
+-- and it is true unless its tag is the false constructor's, which is how
+-- the interpreter reads one.
+loadBoolean :: FnEnv -> Int -> String -> Gen String
+loadBoolean fe k slow =
+  slotKind k >>= \case
+    Just c -> pure c
+    Nothing -> do
+      let layout = lEnum (envLayouts (feEnv fe))
+          PackedTag false = TT.falseTag
+      p <- loadB k
+      raw <- fresh "raw"
+      emit (raw ++ " = ptrtoint ptr " ++ p ++ " to i64")
+      tagBits <- fresh "ptrtag"
+      emit (tagBits ++ " = and i64 " ++ raw ++ ", 7")
+      notEnum <- fresh "notenum"
+      emit (notEnum ++ " = icmp ne i64 " ++ tagBits ++ ", " ++ show (lPtrTag layout))
+      branchIf "enum" notEnum slow
+      base <- fresh "base"
+      emit (base ++ " = and i64 " ++ raw ++ ", -8")
+      packed <- loadAt base "tag" "i64" (lFieldOffset layout (lPtrs layout))
+      c <- fresh "bool"
+      emit (c ++ " = icmp ne i64 " ++ packed ++ ", " ++ show false)
+      pure c
 
 -- | An instruction the generator has no code for: the interpreter runs
 -- it, and native code continues after it in an auxiliary function (a
@@ -1772,7 +2591,7 @@ refFields fe k slow = do
       rts = envRts (feEnv fe)
       check what c = do
         l <- freshLabel what
-        emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ l)
+        emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ l ++ unlikely)
         startBlock l
       loadFrom from what ty off = do
         a <- fresh (what ++ ".a")
@@ -1900,7 +2719,7 @@ genUniversal fe d op ki kj instr sect = do
   fast <- fresh "fast"
   emit (fast ++ " = and i1 " ++ same ++ ", " ++ known)
   go <- freshLabel "univ"
-  emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ slow)
+  emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ slow ++ likely)
   startBlock go
   let signedUnsigned s u = do
         cs <- cmp s ui uj
@@ -1946,7 +2765,7 @@ taggedObject what raw info slow = do
 branchIf :: String -> String -> String -> Gen ()
 branchIf what c slow = do
   l <- freshLabel what
-  emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ l)
+  emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ l ++ unlikely)
   startBlock l
 
 -- | A load of the given type at a byte offset from an address held in an i64.
@@ -2065,6 +2884,37 @@ genArrayOp fe d ka mki mwrite instr sect = do
           storeU (d + 1) u
           storeB (d + 1) b
 
+-- | The call that builds a partial application of the closure @f@ with up
+-- to four more arguments (given as unboxed and boxed halves).
+nameCall :: String -> [(String, String)] -> String
+nameCall f vals =
+  "@unison_jit_name(ptr %ctx, ptr " ++ f ++ ", i64 " ++ show (length vals) ++ ", " ++ intercalate ", " padded ++ ")"
+  where
+    arg (u, b) = "i64 " ++ u ++ ", ptr " ++ b
+    padded = map arg vals ++ replicate (4 - length vals) "i64 0, ptr null"
+
+-- | Calls a list helper that returns a boxed result, or null for a case
+-- it leaves to the interpreter (@slow@); pushes the result.
+listHelper :: Int -> String -> String -> Gen ()
+listHelper d slow call = do
+  r <- fresh "list"
+  emit (r ++ " = call ptr " ++ call)
+  miss <- fresh "miss"
+  emit (miss ++ " = icmp eq ptr " ++ r ++ ", null")
+  branchIf "list" miss slow
+  storeU (d + 1) "-1"
+  storeB (d + 1) r
+
+-- | A pool entry, loaded.
+poolValue :: Int -> Gen String
+poolValue ix = do
+  usePool ix
+  a <- fresh "pool.a"
+  emit (a ++ " = getelementptr ptr, ptr %pool, i64 " ++ show ix)
+  v <- fresh "const"
+  emit (v ++ " = load ptr, ptr " ++ a)
+  pure v
+
 -- | Records that the function uses this pool index.
 usePool :: Int -> Gen ()
 usePool ix = modify' (\s -> s {gsMaxPool = max (gsMaxPool s) ix})
@@ -2105,7 +2955,7 @@ exitIf :: FnEnv -> Int -> MSection -> String -> Gen ()
 exitIf fe d sect c = do
   slow <- exitBlock fe d (Resume (feCix fe) sect)
   ok <- freshLabel "ok"
-  emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ ok)
+  emit ("br i1 " ++ c ++ ", label %" ++ slow ++ ", label %" ++ ok ++ unlikely)
   startBlock ok
 
 genPrim1 :: FnEnv -> Int -> Prim1 -> String -> MSection -> Gen ()
@@ -2122,6 +2972,9 @@ genPrim1 fe d op x _sect = case op of
     r <- fresh "r"
     emit (r ++ " = select i1 " ++ neg ++ ", i64 0, i64 " ++ x)
     nat r
+  LZRO -> count "ctlz" ", i1 false"
+  TZRO -> count "cttz" ", i1 false"
+  POPC -> count "ctpop" ""
   SGNI -> do
     neg <- cmp "slt" x "0"
     pos <- cmp "sgt" x "0"
@@ -2134,6 +2987,10 @@ genPrim1 fe d op x _sect = case op of
   where
     int = result fe d (feTagInt fe)
     nat = result fe d (feTagNat fe)
+    count name flag = do
+      r <- fresh "r"
+      emit (r ++ " = call i64 @llvm." ++ name ++ ".i64(i64 " ++ x ++ flag ++ ")")
+      nat r
 
 genPrim2 :: FnEnv -> Int -> Prim2 -> String -> String -> MSection -> Gen ()
 genPrim2 fe d op x y sect = case op of

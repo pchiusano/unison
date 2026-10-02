@@ -29,6 +29,7 @@ module Unison.Runtime.MCode
     GCombInfo (..),
     NativeCell,
     readNativeCode,
+    readNativeEntry,
     writeNativeCode,
     bumpNativeCount,
     readNativeCount,
@@ -38,6 +39,8 @@ module Unison.Runtime.MCode
     releaseNativeCell,
     takeNativeCell,
     nativeCellRequested,
+    readNativeVerdict,
+    writeNativeVerdict,
     NativeCellPool (..),
     newNativeCells,
     nativeCellAt,
@@ -81,7 +84,7 @@ where
 import Data.Bifoldable (Bifoldable (..))
 import Data.Bifunctor (Bifunctor, bimap, first)
 import Data.Bitraversable (Bitraversable (..), bifoldMapDefault, bimapDefault)
-import Data.Bits (shiftL, shiftR, (.|.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import Data.Coerce
 import Data.Functor ((<&>))
 import Data.Map.Strict qualified as M
@@ -128,7 +131,7 @@ import Control.Monad (forM_, when)
 import Control.Monad.State.Strict (runState, state)
 import Unison.Runtime.JIT.Config qualified as JIT
 import Foreign.Marshal.Alloc (callocBytes)
-import Foreign.Ptr (plusPtr)
+import Foreign.Ptr (plusPtr, nullPtr)
 import GHC.Exts (Word#, atomicCasWordAddr#, eqWord#, isTrue#, plusAddr#)
 import GHC.IO (IO (..))
 import GHC.Ptr (Ptr (..))
@@ -725,11 +728,13 @@ data GCombInfo comb
   deriving stock (Show, Eq, Ord, Functor, Foldable, Traversable)
 
 -- | A native code cell (see docs/jit-design.md): the mutable part of a
--- combinator, 24 bytes outside the Haskell heap. A pointer to the
+-- combinator, 32 bytes outside the Haskell heap. A pointer to the
 -- combinator's compiled code, null until it is compiled; a count of calls
 -- made while it was null; and a state: 0 until the JIT has been asked to
 -- compile it, 1 while the request is queued, 2 once the compile thread has
 -- taken it. It only moves forward, so a combinator is asked for only once.
+-- Last, the JIT's verdict on whether the combinator is worth compiling
+-- (see 'readNativeVerdict').
 -- Cells never move, so generated code can refer to them by address.
 --
 -- The count starts at minus the JIT's compilation threshold when the JIT
@@ -739,12 +744,26 @@ data GCombInfo comb
 data NativeCell
 
 nativeCellSize :: Int
-nativeCellSize = 24
+nativeCellSize = 32
 
 -- | Reads the compiled code pointer of a cell. Null means "interpret".
 readNativeCode :: Ptr NativeCell -> IO (Ptr ())
 readNativeCode cell = peekByteOff cell 0
 {-# INLINE readNativeCode #-}
+
+-- | The compiled code the interpreter should enter, if any. Null means
+-- "interpret": there is no code, or the function is so small that getting
+-- into native code and back costs more than interpreting it (verdict 3;
+-- native callers still call it directly).
+readNativeEntry :: Ptr NativeCell -> IO (Ptr ())
+readNativeEntry cell = do
+  code <- peekByteOff cell 0
+  if code == nullPtr
+    then pure code
+    else do
+      verdict <- peekByteOff cell 24 :: IO Int
+      pure (if verdict .&. 3 == 3 then nullPtr else code)
+{-# INLINE readNativeEntry #-}
 
 -- | Installs compiled code. A single pointer write; readers on other
 -- threads see either the old value or the new one.
@@ -797,6 +816,19 @@ casNativeState (Ptr cell) from to = IO $ \s ->
 -- | Whether a request for the cell is queued.
 nativeCellRequested :: Ptr NativeCell -> IO Bool
 nativeCellRequested cell = (== (1 :: Int)) <$> peekByteOff cell 16
+
+-- | What the JIT has decided about compiling the cell's combinator. Zero:
+-- nothing yet. Otherwise the low two bits say: 1 worth compiling, 2 better
+-- left to the interpreter, because native code for it would spend its time
+-- leaving native code, 3 worth compiling for native callers but too small
+-- to be worth entering from the interpreter. The bits above hold an
+-- estimate the JIT keeps for judging callers (see JIT.Estimate). Only the thread that compiles writes
+-- this; the interpreter reads it when it finds code in the cell.
+readNativeVerdict :: Ptr NativeCell -> IO Int
+readNativeVerdict cell = peekByteOff cell 24
+
+writeNativeVerdict :: Ptr NativeCell -> Int -> IO ()
+writeNativeVerdict cell v = pokeByteOff cell 24 v
 
 -- | The count a combinator's cell starts with: minus the threshold in the
 -- JIT's @on@ mode, zero (never hot) otherwise.

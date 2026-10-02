@@ -100,6 +100,18 @@ collatzTotal n =
   go acc i = if i > n then acc else go (acc + collatzSteps i) (i + 1)
   go 0 1
 
+-- Text: every operation here is a call-out until native code can work on
+-- the rope directly.
+textAppend : Nat -> Text
+textAppend n =
+  go acc i = if i == n then acc else go (acc Text.++ "hi") (i + 1)
+  go "" 0
+
+textDrain : Nat -> Text -> Text
+textDrain n t =
+  go rem i = if i == n then rem else go (Text.drop 1 rem) (i + 1)
+  go t 0
+
 jitSuite : '{IO, Exception} ()
 jitSuite = do
   printTime "Sum 0 to 1 million" 1 (n -> repeat n do sumTo 1000000)
@@ -117,6 +129,10 @@ jitSuite = do
   printTime "Apply a function argument 10000 times" 1 (n -> repeat n do applyN 10000 (x -> x + 3) 0)
   printTime "Mutate a Ref 10000 times" 1 (n -> repeat n do refLoop 10000)
   printTime "Calls across definitions: Collatz steps for 1 to 1000" 1 (n -> repeat n do collatzTotal 1000)
+  printTime "Text: append \"hi\" 10000 times" 1 (n -> repeat n do textAppend 10000)
+  printTime "Text: drop 1, 100000 times" 1 let
+    t = Text.repeat 100000 "a"
+    n -> repeat n do textDrain 100000 t
 ```
 
 ``` ucm

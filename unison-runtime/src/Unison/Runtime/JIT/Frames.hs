@@ -11,8 +11,10 @@ module Unison.Runtime.JIT.Frames
   )
 where
 
+import Control.Monad (forM_)
 import Data.IORef
-import Data.IntMap.Strict qualified as IM
+import Data.Primitive.SmallArray (SmallMutableArray, copySmallMutableArray, newSmallArray, readSmallArray, getSizeofSmallMutableArray, writeSmallArray)
+import GHC.Exts (RealWorld)
 import Foreign.Ptr (Ptr)
 import System.IO.Unsafe (unsafePerformIO)
 import Unison.Runtime.MCode (CombIx, NativeCell)
@@ -25,28 +27,43 @@ data Frame = Frame !CombIx !Int !MSection !(Ptr NativeCell)
 -- | 1-based.
 type FrameIndex = Int
 
-data Table = Table !Int !(IM.IntMap Frame)
+-- | Like the exits table: an array that grows by copying, written only by
+-- the thread that compiles.
+data Table = Table !Int !(SmallMutableArray RealWorld Frame)
 
 table :: IORef Table
-table = unsafePerformIO (newIORef (Table 1 IM.empty))
+table = unsafePerformIO (newIORef . Table 1 =<< newSmallArray 1024 unknown)
 {-# NOINLINE table #-}
+
+unknown :: Frame
+unknown = error "JIT: unknown frame index"
 
 -- | Adds a module's frames and returns the index of the first one. The
 -- rest follow consecutively, in the order given.
 registerFrames :: [Frame] -> IO FrameIndex
-registerFrames frames = atomicModifyIORef' table $ \(Table next m) ->
+registerFrames frames = do
+  Table next arr <- readIORef table
+  size <- getSizeofSmallMutableArray arr
   let n = length frames
-   in (Table (next + n) (m <> IM.fromList (zip [next ..] frames)), next)
+  arr' <-
+    if next + n <= size
+      then pure arr
+      else do
+        bigger <- newSmallArray (max (2 * size) (next + n)) unknown
+        copySmallMutableArray bigger 0 arr 0 next
+        pure bigger
+  forM_ (zip [next ..] frames) $ \(i, f) -> writeSmallArray arr' i $! f
+  writeIORef table (Table (next + n) arr')
+  pure next
 
 -- | Overwrites frames registered earlier, starting at the given index
 -- (see replaceExits).
 replaceFrames :: FrameIndex -> [Frame] -> IO ()
-replaceFrames base frames = atomicModifyIORef' table $ \(Table next m) ->
-  (Table next (IM.fromList (zip [base ..] frames) <> m), ())
+replaceFrames base frames = do
+  Table _ arr <- readIORef table
+  forM_ (zip [base ..] frames) $ \(i, f) -> writeSmallArray arr i $! f
 
 lookupFrame :: FrameIndex -> IO Frame
 lookupFrame i = do
-  Table _ m <- readIORef table
-  case IM.lookup i m of
-    Just f -> pure f
-    Nothing -> error ("JIT: unknown frame index " ++ show i)
+  Table _ arr <- readIORef table
+  readSmallArray arr i

@@ -131,6 +131,7 @@ module Unison.Runtime.Stack
     dumpAP,
     dumpFP,
     alloc,
+    nativeOutWords,
     peek,
     upeek,
     bpeek,
@@ -1017,12 +1018,22 @@ type BSeg = Array Closure
 
 type Seg = (USeg, BSeg)
 
+-- | Words past the last slot of the unboxed stack that native code's
+-- entry point writes its results to: @ap@, @fp@, @sp@, a count of frame
+-- records, and up to eight records of three words. Must match
+-- UNISON_JIT_OUT_WORDS in jit_rt.h.
+nativeOutWords :: Int
+nativeOutWords = 28
+
 alloc :: IO Stack
 alloc = do
   -- The JIT's `ustack` stress mode starts with a tiny stack, so that
   -- growing it is exercised constantly.
   let slots = fromMaybe 512 (JIT.stressStack JIT.config)
-  ustk <- newByteArray (bytes slots)
+  -- the unboxed stack has a few words to spare past its last slot, where
+  -- the JIT's trampoline gets its results back (see JIT.Native); growing
+  -- and duplicating the stack keep them
+  ustk <- newByteArray (bytes (slots + nativeOutWords))
   bstk <- newArray slots BlackHole
   pure $ Stack {ap = -1, fp = -1, sp = -1, ustk, bstk}
 {-# INLINE alloc #-}

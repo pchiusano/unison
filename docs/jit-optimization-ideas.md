@@ -42,17 +42,17 @@ than deleting it.
 
 ## Calls
 
-- **Workers with register arguments** (M6 in the plan). A self-recursive function's worker
-  calls itself directly with LLVM arguments; only the wrapper touches the Unison stack. Exit
-  status has to travel back through the register chain. See the M6 notes in the plan.
-  This is also where batching should start to pay (Paul, 2026-10-01). Today a direct call in
-  a module still passes everything through the Unison stack: the caller stores the arguments
-  to `ustk` and `bstk`, the callee loads them at entry, the results come back the same way,
-  and LLVM can't remove those stores when it inlines, because the stacks are reachable from
-  `Ctx`. So a direct call saves only the cell load and null test, which is the 8% M5 measured
-  on the cross-definition benchmark. Workers should therefore cover every direct call within
-  a module, not only self-recursion: then an inlined callee is plain SSA code in its caller.
-  Re-measure the batch rule (the bar for callers, B) once workers exist.
+- **Workers with register arguments.** Done in M6 (see the design, "Workers"). Left over:
+  - Re-entry functions still pass everything through the stack. One that is hot (a loop
+    that exits every iteration re-enters every iteration) could get a worker-like body.
+  - Functions that return several values keep the uniform form.
+  - The registers saved for exit paths (see jit-m6.md's learnings): half of `fib`'s
+    per-call cost. Ideas: write only the slots the continuation can read (needs liveness
+    for frame slots, and a look at what captured continuations do with dead slots); or
+    keep type tags out of registers by passing unboxed values without them (see
+    "Unboxed values without the tag write").
+  - The type-tag closures are loaded through the pool at entry (two loads); they could be
+    fields of `Ctx`.
 
 - **Direct calls within a module.** Done in M5: functions compiled together call each other by
   symbol, and LLVM can inline them.
@@ -78,11 +78,32 @@ than deleting it.
   lookup in C, or a call-out could return the value. Seen in the test transcript's ability
   loops: one exit per handler call. Noted 2026-09-30 during M4.
 
+- **Tiny native functions called from the interpreter.** Done in M6 step 8: the verdict
+  "too small to enter" keeps the interpreter interpreting them. A leaner entry for leaf
+  functions would be the other way.
+
+- **Native ability requests.** A request (`App (Dyn i)`) is an exit today, and so is
+  everything a handler starts with (`RMatch`, `Capture`, `InLocal`, `SetAff`, `Reset`),
+  because the handler environment and `K` belong to the interpreter. The affine case (the
+  handler runs and returns to the requester, no continuation captured) is the one that
+  could be made native without continuation capture: it needs the dynamic environment
+  readable from native code, `RMatch` as a match on the request's closure, and `InLocal`
+  and `SetAff` as updates to an environment native code can see. Looked at in M6 step 6
+  and left for a plan of its own; until then the static rule keeps request-heavy code
+  interpreted. Noted 2026-10-01.
+
+- **Build IR without `String`.** The generator builds each module as Haskell `String`s
+  (megabytes of them), which is most of what the compile thread allocates. That
+  allocation is shared with the running program: more GCs, and major ones sooner (M6:
+  a one-shot 20 ms benchmark absorbing a 26 ms collection during warm-up). A builder over
+  byte arrays, or LLVM's C API for building IR directly, would cut it. Noted 2026-10-01.
+
 - **Hoist the self cell load.** A function's own cell is loaded before every self non-tail
   call; loading it once at entry is enough (the cell can't change under a running function).
 
-- **Move the pending-arguments check to entry.** `Yield` compares `ap` with `fp` before every
-  return. It's one compare, but it could be done once at entry instead.
+- **Move the pending-arguments check to entry.** Done for workers in M6: the wrapper
+  checks, and workers have no `ap`. Functions with the uniform signature still compare
+  before every return.
 
 ## Code size
 
@@ -108,7 +129,9 @@ than deleting it.
 
 ## Builtins
 
-- **Native `Text` operations.** Text-heavy code bounces through the trampoline on every
+- **Native `Text` operations.** (Size, `++`, take, drop and equality were done in M6 step
+  5b; what is left is in "More of `Text` natively" below. The rest of this entry is the
+  original note.) Text-heavy code bounces through the trampoline on every
   `Text.++`, `Text.size`, `Int.toText` and so on, and each bounce also unwinds every native
   caller above it, which makes their `let` re-entry points hot (`Duration.toText` has about 40
   call-out continuations, nearly all for `Int.toText` and `++`). A Unison `Text` is a
@@ -141,7 +164,76 @@ than deleting it.
   removes a call-out continuation and cools the re-entry points of its callers. Noted
   2026-09-30 after M4.
 
+- **`Bytes` operations.** `Bytes` is the same rope as `Text` (`Unison.Util.Rope`, chunks of
+  byte arrays), so the text helpers of M6 step 5b carry over almost unchanged: size, append,
+  take, drop, `at`, equality. Not done in M6 (Paul, 2026-10-01: note it for later).
+- **More of `Text` natively.** Done in M6: size, `++`, take, drop, equality. Left as
+  call-outs: `Nat.toText` and `Int.toText` (a C helper that formats into a fresh byte
+  array), `uncons`/`unsnoc`, comparison (`<=`, `<`), `indexOf`, and everything that is a
+  foreign function rather than a primitive. The exit counts of a text-heavy program say
+  which to do next.
+- **The list cases still left to the interpreter.** The C helpers of M6 step 5 take the
+  cases that need no repair. Left: a view or push whose digit changes color (about one in
+  eight on a long list: the node moves between levels, which in C means porting `place`
+  and `repair` from `Deque.hs`), and `++`, `take`, `drop` and the two splits (`SPLL`,
+  `SPLR`, which list patterns like `[a, b] ++ rest` compile to). All are possible in C,
+  since nothing in a deque is a thunk; the question each time is whether the port is worth
+  keeping in step with the Haskell.
+- **Partial applications of function values.** M6 step 7 builds a partial application
+  natively when the function is known at code generation. A function value applied to too
+  few arguments (`g = f x` where `f` is itself a closure) still resumes in the interpreter:
+  whether the call is under-saturated is only known at run time, so the closure-call code
+  needs a second continuation that joins the body with the new closure instead of a call's
+  result. The helper already handles closures with arguments captured. Also: more than
+  four arguments at once.
+- **The deque itself.** Two things, in this order:
+  - *What the swap cost the interpreter.* With the JIT off, against the interpreter on
+    `Data.Sequence`: JSON parsing 7.2 µs to 10.2 µs and complex JSON parsing 10.7 µs to
+    18.1 µs per document, `Multimap.fromList` 64 µs to 83 µs, `Json.toText` 7.1 µs to
+    8.4 µs, `List.range` per element 42 ns to 102 ns (`List.range 0 1000` itself got
+    faster). The JSON parser only snocs onto small lists, so the cause isn't obvious; a
+    profile of that one benchmark is the place to start. `List.range` per element is a
+    very large list built in one go, so it may be the garbage collector's view of the
+    structure rather than the building.
+  - *The operations that trail `Data.Sequence`* (table in the progress log): `append` is 3
+    to 5 times slower (each level builds its seam as a list and then packs it; packing
+    straight from the digits would cut that), appending one to four elements about 3
+    times, `take`/`drop` about 1.5 times (2 to 2.7 times around 100 elements), pushes at
+    around 100 elements about 1.4 times, and a queue on a list of ten about 1.8 times.
+
+  `Unison.Util.Skews` (two skew binary lists back to back, also Paul's) is in the same
+  package as a possible alternative: it compiles, nothing uses it, and it hasn't been
+  measured against either structure.
+
+## Release
+
+Taken out of M6 on 2026-10-01 so that milestone could be about performance on real programs;
+for a later milestone.
+
+- **Compiled programs** (`run.compiled`, the standalone path in `Interface.hs` that
+  restores a code cache from a file) build their combinators without native code cells, so
+  the JIT does nothing there. Noticed 2026-10-01, not checked further.
+- **Static linking of LLVM** (D4 said dynamic first, static before release).
+- **Linux x86-64**, then the remaining Unix platforms (D6). Skipped so far: every spike and
+  test has run on macOS arm64 only.
+- **Documentation** for users: the modes, the environment variables, what to expect.
+- **Whether the JIT is on by default**, and whether the `jit` package flag stays.
+- **Native versions of more builtins** as call-out statistics from real programs show them
+  to be hot (see "Builtins").
+
 ## Stack and frames
+
+- **Call-outs without unwinding: native code on its own C stack.** Today an exit in a callee
+  unwinds every native caller, and each comes back through a re-entry point. If native code
+  ran on a C stack of its own, a call-out could switch back to the Haskell thread's stack,
+  let the interpreter run the one instruction, and switch back in, with all the native frames
+  still there. The obstacle is the GC: it can run during that instruction and move objects,
+  so every parked native frame would need its live values on the Unison stack before any
+  call and would have to reload them afterwards (a flag set by the trampoline could make the
+  reload conditional). There would also be a parked stack per Unison thread and per nested
+  evaluation, and exceptions thrown by the instruction would have to discard it. Considered
+  when M6 was planned and set aside in favour of making exits rarer and cheaper; worth
+  revisiting if exits still dominate after M6. Noted 2026-10-01.
 
 - **Dedicated C stack for native runs** (D13). GHC worker threads get 512 KB stacks, so the
   native call budget is about 250 KB, roughly 1600 frames of a small function; deeper recursion

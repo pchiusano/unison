@@ -901,7 +901,7 @@ enter ::
   IO ()
 enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
   (RComb (Comb (LamI a f entry cell))) -> do
-    native <- readNativeCode cell
+    native <- readNativeEntry cell
     if native == nullPtr
       then do
         countInterpreted env cref cell
@@ -911,12 +911,12 @@ enter !yld env henv !activeThreads !stk !k !cref !sck !args = \case
         stk <- acceptArgs stk a
         eval yld env henv activeThreads stk k cref entry
       else do
-        when (JIT.trace JIT.config) $
+        when jitTracing $
           JIT.jitDump ("enter native " ++ show cref ++ " arity " ++ show a ++ " args " ++ show args ++ " cell " ++ show cell ++ " code " ++ show native ++ " stack before " ++ show stk)
         stk <- if sck then pure stk else ensure stk f
         stk <- moveArgs stk args
         stk <- acceptArgs stk a
-        when (JIT.trace JIT.config) $ JIT.jitDump ("  stack after " ++ show stk)
+        when jitTracing $ JIT.jitDump ("  stack after " ++ show stk)
         runNative yld env henv activeThreads stk k (castPtrToFunPtr native)
   (RComb (CachedVal _ val)) -> do
     stk <- discardFrame stk
@@ -943,6 +943,12 @@ countReentry cell = do
   when hot (jitRequestCell cell)
 {-# INLINE countReentry #-}
 
+jitTracing, jitStats :: Bool
+jitTracing = JIT.trace JIT.config
+jitStats = JIT.stats JIT.config
+{-# NOINLINE jitTracing #-}
+{-# NOINLINE jitStats #-}
+
 -- The trampoline: runs compiled code for a combinator whose frame has
 -- been set up as `enter` sets it up, then acts on the status it returns.
 -- See docs/jit-design.md, "How the interpreter interacts with native code".
@@ -956,52 +962,65 @@ runNative ::
   K ->
   FunPtr NativeFn ->
   IO ()
-runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
+runNative !yld env henv0 !activeThreads !stk0 !k0 fn0 = go fn0 henv0 stk0 k0
   where
-    go (Stack ap fp sp ustk bstk) = do
+    -- read once: these are consulted several times per round trip
+    !tracing = jitTracing
+    !counting = jitStats
+    go fn henv (Stack ap fp sp ustk bstk) k = do
       pool <- currentPool
-      (status, ap', fp', sp', records) <- enterNative fn ustk bstk pool ap fp sp
-      let stk = Stack ap' fp' sp' ustk bstk
-      when (JIT.trace JIT.config) $
-        JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")" ++ concatMap (("\n  frame record " ++) . show) records)
+      let !size = sizeofMutableArray bstk
+      when counting $ countEntry (castFunPtrToPtr fn)
+      status <- enterNative fn ustk bstk pool size ap fp sp
+      ap' <- outAp ustk size
+      fp' <- outFp ustk size
+      sp' <- outSp ustk size
+      let !stk = Stack ap' fp' sp' ustk bstk
       if status == statusOK
-        then yield yld env henv activeThreads stk k
+        then do
+          when tracing $ JIT.jitDump ("native returned OK with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")")
+          yield yld env henv activeThreads stk k
         else
           if status == statusError
             then die [] "native code reported an error"
             else do
-              when (JIT.stats JIT.config) $ do
+              -- the frame records of the native callers above the exit;
+              -- they can be read once
+              n <- outFrameCount ustk size
+              records <- if n == 0 then pure [] else outFrames ustk size
+              when tracing $
+                JIT.jitDump ("native returned " ++ show status ++ " with ap/fp/sp " ++ show (ap', fp', sp') ++ " (entered with " ++ show (ap, fp, sp) ++ ")" ++ concatMap (("\n  frame record " ++) . show) records)
+              when counting $ do
                 total <- countExit status
                 let every = JIT.statsEvery JIT.config
                 when (every > 0 && total `mod` every == 0) printJITStats
               -- Records are written innermost caller first; K has the
               -- innermost frame on top, so build from the last record.
-              k <- foldM pushRecord k (reverse records)
-              act stk k =<< lookupExit status
+              k <- if n == 0 then pure k else foldM pushRecord k (reverse records)
+              act henv stk k =<< lookupExit status
     pushRecord k (FrameRecord i fsz asz) = do
       Frame cix f sect cell <- lookupFrame i
       pure (Push fsz asz cix f sect cell k)
-    act stk k = \case
-      Named _ e -> act stk k e
+    act henv stk k = \case
+      Named _ e -> act henv stk k e
       Resume cix sect -> do
-        when (JIT.trace JIT.config) $ JIT.jitDump ("resume " ++ show cix ++ " at\n" ++ prettySection 4 sect "")
+        when tracing $ JIT.jitDump ("resume " ++ show cix ++ " at\n" ++ prettySection 4 sect "")
         eval yld env henv activeThreads stk k cix sect
       GrowStack n cell -> do
-        when (JIT.trace JIT.config) $ JIT.jitDump ("grow stack by " ++ show n)
+        when tracing $ JIT.jitDump ("grow stack by " ++ show n)
         stk <- ensureGenerously stk n
-        again cell stk k
+        again cell henv stk k
       Reenter cell -> do
-        when (JIT.trace JIT.config) $ JIT.jitDump "reenter"
+        when tracing $ JIT.jitDump "reenter"
         Conc.yield
-        again cell stk k
+        again cell henv stk k
       -- The interpreter runs one instruction, then native code continues
       -- after it, with whatever the instruction did to the handler
       -- environment and K. The exception case is eval's, except that the
       -- handler's continuation can be native too.
       CallOut cix instr rest n cell -> do
-        when (JIT.trace JIT.config) $ JIT.jitDump ("call out " ++ show cix ++ " for " ++ show instr)
-        code <- readNativeCode cell
-        let cell' = if n == 1 then cell else noNativeCell
+        when tracing $ JIT.jitDump ("call out " ++ show cix ++ " for " ++ show instr)
+        code <- readNativeEntry cell
         exec env henv activeThreads stk k cix instr >>= \case
           (exception, henv, !stk', !k')
             | exception -> do
@@ -1009,21 +1028,32 @@ runNative !yld env henv !activeThreads !stk0 !k fn = go stk0
                 fv <- peek stk'
                 bpoke stk' $ Data1 exceptionRef TT.exceptionRaiseTag fv
                 (stk', fsz, asz) <- saveFrame stk'
-                let kk = Push fsz asz fakeCix 10 rest cell' k'
+                let cell' = if n == 1 then cell else noNativeCell
+                    kk = Push fsz asz fakeCix 10 rest cell' k'
                 apply yld env henv activeThreads stk' kk False (VArg1 0) eh
             | code /= nullPtr, sp stk' == sp stk + n, fp stk' == fp stk ->
-                runNative yld env henv activeThreads stk' k' (castPtrToFunPtr code)
+                go (castPtrToFunPtr code) henv stk' k'
             | otherwise -> do
                 when (code == nullPtr) (countReentry cell)
-                when (JIT.trace JIT.config) $ JIT.jitDump ("  no re-entry: pushed " ++ show (sp stk' - sp stk) ++ ", expected " ++ show n ++ "; fp " ++ show (fp stk, fp stk') ++ ", code " ++ show code)
+                when tracing $ JIT.jitDump ("  no re-entry: pushed " ++ show (sp stk' - sp stk) ++ ", expected " ++ show n ++ "; fp " ++ show (fp stk, fp stk') ++ ", code " ++ show code)
                 eval yld env henv activeThreads stk' k' cix rest
     -- The exit says which function to call again. It is the one that took
     -- the exit, which after tail calls need not be the one entered here.
-    again cell stk k = do
-      code <- readNativeCode cell
-      if code == nullPtr
-        then die [] "native code disappeared from its cell"
-        else runNative yld env henv activeThreads stk k (castPtrToFunPtr code)
+    --
+    -- Its cell can still be empty: the functions of a module call each
+    -- other directly, and one can be running before the compile thread
+    -- has written the cell of another that it called. The cell is about
+    -- to be filled, so wait for it.
+    again cell henv stk k = wait (10000 :: Int)
+      where
+        wait n = do
+          code <- readNativeCode cell
+          if code /= nullPtr
+            then go (castPtrToFunPtr code) henv stk k
+            else
+              if n == 0
+                then die [] "native code disappeared from its cell"
+                else Conc.threadDelay 1000 >> wait (n - 1)
 
 -- fast path by-name delaying
 name :: Stack -> Args -> Val -> IO Stack
@@ -1083,13 +1113,13 @@ apply !yld env henv !activeThreads !stk !k !ck !args !val =
               stk <- moveArgs stk args
               stk <- dumpSeg stk seg A
               stk <- acceptArgs stk a
-              native <- readNativeCode cell
+              native <- readNativeEntry cell
               if native == nullPtr || "apply" `elem` JIT.disabled JIT.config
                 then do
                   countInterpreted env cix cell
                   eval yld env henv activeThreads stk k cix entry
                 else do
-                  when (JIT.trace JIT.config) $
+                  when jitTracing $
                     JIT.jitDump ("apply native " ++ show cix ++ " arity " ++ show a ++ " stack " ++ show stk)
                   runNative yld env henv activeThreads stk k (castPtrToFunPtr native)
           | otherwise -> do
@@ -1348,7 +1378,7 @@ yield !yld env henv0 !activeThreads !stk = leap
       stk <- restoreFrame stk fsz asz
       stk <- ensure stk f
       -- The Let body may have native code (the re-entry point).
-      native <- readNativeCode cell
+      native <- readNativeEntry cell
       if native == nullPtr
         then do
           countReentry cell

@@ -1,6 +1,10 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+-- The JIT's C helpers read and build these constructors (unison-runtime's
+-- cbits/jit_rt.c), so their layout must be the same in every build: fields are
+-- unpacked only when optimizing.
+{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
 
 module Unison.Util.Text where
 

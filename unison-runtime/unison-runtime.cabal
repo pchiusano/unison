@@ -73,6 +73,7 @@ library
       Unison.Runtime.JIT.Codegen
       Unison.Runtime.JIT.Compile
       Unison.Runtime.JIT.Config
+      Unison.Runtime.JIT.Estimate
       Unison.Runtime.JIT.Exits
       Unison.Runtime.JIT.Frames
       Unison.Runtime.JIT.Layout

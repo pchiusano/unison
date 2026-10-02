@@ -81,7 +81,7 @@ import Unison.Runtime.Decompile qualified as Decomp
 import Unison.Runtime.Exception (RuntimeExn (BU, PE), die)
 import Unison.Runtime.Foreign.Function (functionUnreplacements)
 import Unison.Runtime.InternalError (CompileExn (CE))
-import Unison.Runtime.JIT (printJITStats, registerDataTypes, startJIT)
+import Unison.Runtime.JIT (jitCompileGroup, printJITStats, registerDataTypes, startJIT)
 import Unison.Runtime.MCode
   ( newNativeCellPool,
     Args (..),
@@ -880,7 +880,15 @@ startRuntime :: Bool -> RuntimeHost -> Text -> IO (Runtime Symbol)
 startRuntime sandboxed runtimeHost version = do
   startJIT
   registerDataTypes (fmap (either id id) builtinDataSpec)
-  ctxVar <- newIORef =<< baseContext sandboxed
+  -- Any is a builtin type, not a declaration: one constructor, one field
+  registerDataTypes (Map.singleton Type.anyRef [1])
+  ctx <- baseContext sandboxed
+  -- in the JIT's eager mode the builtin combinators are compiled now, like
+  -- everything else is when it is loaded
+  builtinCombs <- readTVarIO (combs (ccache ctx))
+  for_ (EC.mapToList builtinCombs) \(w, cmbs) ->
+    for_ (EC.lookup w builtinTermBackref) \r -> jitCompileGroup r w cmbs
+  ctxVar <- newIORef ctx
   (activeThreads, cleanupThreads) <- case runtimeHost of
     -- Don't bother tracking open threads when running standalone, they'll all be cleaned up
     -- when the process itself exits.

@@ -17,6 +17,7 @@ import Data.Map.Strict qualified as M
 import Data.Set qualified as S
 import Data.Word
 #if !defined(mingw32_HOST_OS)
+import Foreign.Ptr (nullPtr)
 import GHC.Event (getSystemTimerManager, registerTimeout)
 #else
 import System.CPUTime
@@ -199,6 +200,19 @@ initialNativeCells = 16384
 
 baseCCache :: Bool -> IO (CCache ())
 baseCCache sandboxed = do
+  -- The builtin combinators get native code cells like any loaded code, so
+  -- that the JIT can compile the ones that are worth it and native code
+  -- can call them (docs/jit-m6.md, step 4).
+  let uncelled =
+        srcCombs
+          & sanitizeCombsOfForeignFuncs sandboxed sandboxedForeignFuncs
+      (cellCount, _) = attachNativeCells nullPtr uncelled
+  NativeCellPool cells _ _ <- newNativeCellPool cellCount
+  let combs :: EnumMap Word64 MCombs
+      combs =
+        snd (attachNativeCells cells uncelled)
+          & absurdCombs
+          & resolveCombs Nothing
   CCache sandboxed noTrace ()
     <$> newTVarIO srcCombs
     <*> newTVarIO combs
@@ -226,12 +240,6 @@ baseCCache sandboxed = do
       numberedTermLookup
         & mapWithKey
           (\k v -> let r = builtinTermBackref ! k in emitComb @Symbol rns r k mempty (0, v))
-    combs :: EnumMap Word64 MCombs
-    combs =
-      srcCombs
-        & sanitizeCombsOfForeignFuncs sandboxed sandboxedForeignFuncs
-        & absurdCombs
-        & resolveCombs Nothing
 
 lookupCode :: CCache prof -> Referent -> IO (Maybe (Referenced Code))
 lookupCode env (Ref link) =

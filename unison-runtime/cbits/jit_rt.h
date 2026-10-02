@@ -43,7 +43,18 @@ typedef struct UnisonJitCtx {
   // Allocation budget in words; native code charges it and the entry poll
   // fires when it is exhausted. Refilled by the trampoline.
   int64_t alloc_left;
+
+  // Not read by generated code (and so not in the layout the Haskell side
+  // checks): the lowest address of this thread's C stack, plus the reserve.
+  int64_t stack_floor;
 } UnisonJitCtx;
+
+// unison_jit_enter hands its results back in spare words past the last slot
+// of the unboxed stack (nativeOutWords in Stack.hs): ap, fp, sp, the number
+// of frame records, then up to this many records inline. More than this
+// many go in a malloc'd copy.
+#define UNISON_JIT_INLINE_FRAMES 8
+#define UNISON_JIT_OUT_WORDS (4 + 3 * UNISON_JIT_INLINE_FRAMES)
 
 // Status values returned by native code. Positive values are exit indices.
 #define UNISON_JIT_OK 0

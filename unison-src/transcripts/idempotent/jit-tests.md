@@ -932,3 +932,428 @@ sumWith f n =
            ⧩
            155
 ```
+
+## Bits, booleans, numeric matches and top-level values
+
+Counting bits, `not` on booleans that are values rather than branch conditions, a function
+whose body starts with a match on a number, and top-level values that are evaluated once
+when they are loaded.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+bits : Nat -> Nat
+bits n =
+  go acc i =
+    if i == n then acc
+    else go (acc + Nat.leadingZeros i + Nat.trailingZeros i + Nat.popCount i) (i + 1)
+  go 0 0
+
+structural type Flags = Flags Boolean Boolean
+
+countFlags : Nat -> Nat
+countFlags n =
+  step = cases Flags a b -> Flags (Boolean.not b) a
+  go f acc i =
+    if i == n then acc
+    else match f with
+      Flags a b -> go (step f) (if Boolean.not a then acc + 1 else if b then acc + 2 else acc) (i + 1)
+  go (Flags true false) 0 0
+
+fibMatch : Nat -> Nat
+fibMatch = cases
+  0 -> 0
+  1 -> 1
+  n -> fibMatch (n - 1) + fibMatch (n - 2)
+
+limit : Nat
+limit = 3 * 1000 + 7
+
+banner : Text
+banner = "ab" Text.++ "cd"
+
+useTop : Nat -> Nat
+useTop n =
+  go acc i = if i == n then acc else go (acc + limit + Text.size banner) (i + 1)
+  go 0 0
+
+-- a function that returns a function, called with more arguments than it
+-- takes: the extra one is applied to its result
+choose : Nat -> Nat -> Nat
+choose x = if x == 0 then (y -> y + 1) else (y -> y * 2)
+
+overApply : Nat -> Nat
+overApply n =
+  go acc i = if i == n then acc else go (acc + choose (Nat.mod i 2) i) (i + 1)
+  go 0 0
+
+> bits 1000
+> countFlags 1000
+> fibMatch 20
+> useTop 1000
+> (limit, banner)
+> overApply 1000
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + structural type Flags
+
+  + banner     : Text
+  + bits       : Nat -> Nat
+  + choose     : Nat -> Nat -> Nat
+  + countFlags : Nat -> Nat
+  + fibMatch   : Nat -> Nat
+  + limit      : Nat
+  + overApply  : Nat -> Nat
+  + useTop     : Nat -> Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    48 | > bits 1000
+           ⧩
+           61010
+
+    49 | > countFlags 1000
+           ⧩
+           1000
+
+    50 | > fibMatch 20
+           ⧩
+           6765
+
+    51 | > useTop 1000
+           ⧩
+           3011000
+
+    52 | > (limit, banner)
+           ⧩
+           (3007, "abcd")
+
+    53 | > overApply 1000
+           ⧩
+           750000
+```
+
+## Lists
+
+List primitives have native fast paths (C helpers that read and build the list's
+structure directly): size, the views at both ends that pattern matching uses, cons, snoc
+and `List.at`. Cases they don't handle (a digit that needs a repair) go to the interpreter.
+
+``` unison
+use Nat + - * / == < > <= >=
+use List +: :+
+
+build : Nat -> [Nat]
+build n =
+  go acc i = if i == n then acc else go (acc :+ i) (i + 1)
+  go [] 0
+
+buildFront : Nat -> [Nat]
+buildFront n =
+  go acc i = if i == n then acc else go (i +: acc) (i + 1)
+  go [] 0
+
+sumFront : [Nat] -> Nat
+sumFront l =
+  go acc = cases
+    [] -> acc
+    h +: t -> go (acc + h) t
+  go 0 l
+
+sumBack : [Nat] -> Nat
+sumBack l =
+  go acc = cases
+    [] -> acc
+    i :+ x -> go (acc + x) i
+  go 0 l
+
+sumAt : [Nat] -> Nat
+sumAt l =
+  n = List.size l
+  go acc i =
+    if i == n then acc
+    else match List.at i l with
+      Some x -> go (acc + x * (Nat.mod i 3)) (i + 1)
+      None -> acc
+  go 0 0
+
+-- a queue: add at the back, take from the front, at a steady size
+queue : Nat -> Nat -> Nat
+queue size n =
+  go q acc i =
+    if i == n then acc + List.size q
+    else match q :+ i with
+      h +: t -> go t (acc + h) (i + 1)
+      [] -> acc
+  go (build size) 0 0
+
+-- small lists, both ends at once, and indices out of range
+edges : Nat -> Nat
+edges n =
+  one = cases
+    [] -> 0
+    [x] -> x
+    x +: (rest :+ y) -> x * 2 + y + List.size rest
+  go acc i =
+    if i == n then acc
+    else
+      l = build (Nat.mod i 13)
+      missing = match List.at i l with
+        None -> 1
+        Some _ -> 0
+      go (acc + one l + missing) (i + 1)
+  go 0 0
+
+-- lists the interpreter made in other ways: appended and cut
+mixed : Nat -> Nat
+mixed n =
+  l = build n List.++ buildFront n
+  m = List.drop 37 (List.take (n + 100) l)
+  sumFront m + sumBack m + sumAt m + List.size m
+
+-- elements that are boxed values
+pairs : Nat -> Nat
+pairs n =
+  go acc i = if i == n then acc else go (acc :+ ("ab", i)) (i + 1)
+  walk acc = cases
+    [] -> acc
+    (t, k) +: rest -> walk (acc + Text.size t + k) rest
+  walk 0 (go [] 0)
+
+> sumFront (build 100000)
+> sumBack (buildFront 100000)
+> sumAt (build 30000)
+> queue 10 100000
+> queue 3000 100000
+> edges 2000
+> mixed 5000
+> pairs 20000
+> (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + build      : Nat -> [Nat]
+  + buildFront : Nat -> [Nat]
+  + edges      : Nat -> Nat
+  + mixed      : Nat -> Nat
+  + pairs      : Nat -> Nat
+  + queue      : Nat -> Nat -> Nat
+  + sumAt      : [Nat] -> Nat
+  + sumBack    : [Nat] -> Nat
+  + sumFront   : [Nat] -> Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    81 | > sumFront (build 100000)
+           ⧩
+           4999950000
+
+    82 | > sumBack (buildFront 100000)
+           ⧩
+           4999950000
+
+    83 | > sumAt (build 30000)
+           ⧩
+           450005000
+
+    84 | > queue 10 100000
+           ⧩
+           4998950110
+
+    85 | > queue 3000 100000
+           ⧩
+           4708953000
+
+    86 | > edges 2000
+           ⧩
+           20594
+
+    87 | > mixed 5000
+           ⧩
+           38978757
+
+    88 | > pairs 20000
+           ⧩
+           200030000
+
+    89 | > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+           ⧩
+           (0, 0, 0, Some 1, None)
+```
+
+## Text
+
+Text primitives with native versions (C helpers that read and build the rope directly):
+size, `++`, take, drop and equality.
+
+``` unison
+use Nat + - * / == < > <= >=
+use Text ++
+
+grow : Nat -> Text
+grow n =
+  go acc i = if i == n then acc else go (acc ++ "ab") (i + 1)
+  go "" 0
+
+growFront : Nat -> Text
+growFront n =
+  go acc i = if i == n then acc else go (Nat.toText i ++ acc) (i + 1)
+  go "" 0
+
+-- drop a character at a time
+eat : Text -> Nat
+eat t =
+  go acc t = if Text.size t == 0 then acc else go (acc + Text.size t) (Text.drop 1 t)
+  go 0 t
+
+-- take all but the last character, until nothing is left
+chop : Text -> Nat
+chop t =
+  go acc t = if Text.eq t "" then acc else go (acc + 1) (Text.take (Text.size t - 1) t)
+  go 0 t
+
+-- a text cut in two and put together again is the same text, in other chunks
+recut : Text -> Nat
+recut t =
+  n = Text.size t
+  go acc i =
+    if i > n then acc
+    else
+      u = Text.take i t ++ Text.drop i t
+      go (if Text.eq u t then acc + 1 else acc) (i + 7)
+  go 0 0
+
+-- characters of more than one byte
+wide : Nat -> Nat
+wide n =
+  go acc t i =
+    if i == n then acc + Text.size t
+    else go (acc + Text.size (Text.take 3 t)) (Text.drop 1 (t ++ "é€😀")) (i + 1)
+  go 0 "λx" 0
+
+> Text.size (grow 20000)
+> Text.size (growFront 3000)
+> eat (grow 2000)
+> chop (growFront 500)
+> recut (grow 3000)
+> wide 5000
+> (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + chop      : Text -> Nat
+  + eat       : Text -> Nat
+  + grow      : Nat -> Text
+  + growFront : Nat -> Text
+  + recut     : Text -> Nat
+  + wide      : Nat -> Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    45 | > Text.size (grow 20000)
+           ⧩
+           40000
+
+    46 | > Text.size (growFront 3000)
+           ⧩
+           10890
+
+    47 | > eat (grow 2000)
+           ⧩
+           8002000
+
+    48 | > chop (growFront 500)
+           ⧩
+           1390
+
+    49 | > recut (grow 3000)
+           ⧩
+           858
+
+    50 | > wide 5000
+           ⧩
+           25001
+
+    51 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+           ⧩
+           (true, false, "ab", "bab", "", 0)
+```
+
+## Partial applications
+
+A function with some of its arguments supplied is a value built natively (the `Name`
+instruction): a copy of the function's closure with the arguments added.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+add3 : Nat -> Nat -> Nat -> Nat
+add3 a b c = a + b * 2 + c * 3
+
+applyAll : (Nat -> Nat) -> Nat -> Nat -> Nat
+applyAll f n acc = if n == 0 then acc else applyAll f (n - 1) (f acc)
+
+-- a closure made fresh in every iteration, from a known function
+fresh : Nat -> Nat
+fresh n =
+  go acc i = if i == n then acc else
+    f = add3 i (i + 1)
+    go (acc + f 1 + f 2) (i + 1)
+  go 0 0
+
+-- more arguments added to a function value that already holds some
+more : Nat -> Nat
+more n =
+  go acc i = if i == n then acc else
+    f = add3 i
+    g = f (i + 1)
+    go (acc + g i + applyAll g 3 0) (i + 1)
+  go 0 0
+
+-- five captured values: more than the helper takes, so the interpreter builds it
+five : Nat -> Nat
+five n =
+  go acc i = if i == n then acc else
+    a = i + 1
+    b = i + 2
+    c = i + 3
+    d = i + 4
+    f x = a + b + c + d + i + x
+    go (acc + applyAll f 2 0) (i + 1)
+  go 0 0
+
+> fresh 20000
+> more 5000
+> five 3000
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + add3     : Nat -> Nat -> Nat -> Nat
+  + applyAll : (Nat ->{g} Nat) -> Nat -> Nat ->{g} Nat
+  + five     : Nat -> Nat
+  + fresh    : Nat -> Nat
+  + more     : Nat -> Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    38 | > fresh 20000
+           ⧩
+           1200200000
+
+    39 | > more 5000
+           ⧩
+           562527500
+
+    40 | > five 3000
+           ⧩
+           45045000
+```
