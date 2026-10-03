@@ -165,18 +165,20 @@ than deleting it.
   removes a call-out continuation and cools the re-entry points of its callers. Noted
   2026-09-30 after M4.
 
-- **`Bytes` operations.** `Bytes` is the same rope as `Text` (`Unison.Util.Rope`, chunks of
-  byte arrays), so the text helpers carry over almost unchanged: size, append, take, drop,
-  `at`, equality. Not done in M6 (Paul, 2026-10-01: note it for later). It is the next
-  piece of work after the rope's replacement (Paul, 2026-10-02). The C functions for the
-  rope's top level read a chunk's size and cut and join chunks through a handful of small
-  functions (`chunk_size`, `chunk_take`, `chunk_drop`, `chunk_join`); a `Bytes` chunk is
-  `Chunk offset size array`, so the port is those four plus the wrapper (`WrapBytes`).
+- **`Bytes` operations.** Done 2026-10-02: the C rope functions take a `RopeKind`, and
+  `Bytes.size`, `++`, `take`, `drop`, `at` and `flatten` are native, as is universal `==`
+  on two texts or two bytes (see the progress log, "The bytes helpers"). Left as
+  call-outs: `indexOf` (a search over the chunks, with the needle usually one chunk),
+  `fromList`/`toList` (a walk of a list of Nats into a fresh array, and back), the
+  `encodeNat*`/`decodeNat*`/`index*` foreign functions (a few bytes read at a position:
+  `rope_chunk_at` finds them, with a copy only when they straddle two chunks), and
+  comparison. The exit counts of a bytes-heavy program (a parser, a hash) say which first.
 - **More of `Text` natively.** Done in M6: size, `++`, take, drop, equality. Left as
   call-outs: `Nat.toText` and `Int.toText` (a C helper that formats into a fresh byte
   array), `uncons`/`unsnoc`, comparison (`<=`, `<`), `indexOf`, and everything that is a
-  foreign function rather than a primitive. The exit counts of a text-heavy program say
-  which to do next. Since the rope became a finger tree the first and last chunks are the
+  foreign function rather than a primitive. Universal `==` on two texts is native since
+  2026-10-02 (with the bytes work); universal `<`, `<=` and `compare` on texts aren't. The
+  exit counts of a text-heavy program say which to do next. Since the rope became a finger tree the first and last chunks are the
   heads of two lists at the top of the structure, so `uncons`, `unsnoc` and a character
   lookup are a few loads and one small allocation, and `rope_chunk_at` (used by equality)
   already finds the chunk holding a position.

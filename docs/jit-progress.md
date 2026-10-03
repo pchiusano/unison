@@ -19,6 +19,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are a strict structure now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes` |
 | After M6: lists on a strict finger tree (`Unison.Util.Deque`) | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
 | After M6: text on the same finger tree (`Unison.Util.Rope`) | done 2026-10-02. The rope of chunks behind `Text` and `Bytes` is the Deque's finger tree with chunks for elements (it shares the Deque's code below the top level); the C text helpers are ports of it. Building a text piece by piece 3 to 4× faster, walking it by character 2×; `jitSuite`'s text appends 556 µs to 311 µs with the JIT. See "The text representation" below |
+| After M6: `Bytes` natively | done 2026-10-02. The C rope helpers take a kind (text or bytes) that says what a chunk is, and `Bytes.size`, `++`, `take`, `drop`, `at` and `flatten` are native, as is universal `==` on two texts or two bytes. `jitSuite`: appending two bytes 10000 times 1.03 ms interpreted, 310 µs with the JIT; `Bytes.drop 1` 100000 times 8.69 ms to 2.77 ms; `Bytes.at` over 100000 bytes 10.1 ms to 7.4 ms. See "The bytes helpers" below |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -770,6 +771,75 @@ texts was rewritten on the way (the seam is joined without rebuilding either sid
 the shorter side's digit is the one copied); it didn't move `Json.toText`, but made the
 rope benchmark's appends 10 to 40% faster.
 
+## The bytes helpers (2026-10-02)
+
+`Bytes` is `Foreign (WrapBytes rope)` over the same `Unison.Util.Rope`, with
+`Unison.Util.Bytes.Chunk` (a byte offset, a size and a `ByteArray`) for chunks. The C text
+section of `cbits/jit_rt.c` became a "Ropes" section: every rope function takes a `RopeKind`
+that holds the kind's constructors (the wrapper, `One`, `Deep`, the chunk, `Empty`), the
+threshold, and where the chunk's fields are (count, offset, length; the array is field 0)
+and whether element counts are characters that have to be turned into bytes through UTF-8.
+The rope operations themselves are unchanged; the text helpers are the same functions with
+the text kind, and the bytes helpers the bytes kind, with `Bytes.at` (a `Some` of the byte,
+built as `List.at` builds its result) and `Bytes.flatten` (one copy into a fresh array; a
+one-chunk rope is returned as it is) besides. Universal `==` (`Universal.==`, the one most
+code uses) takes two texts or two bytes through a helper now, before falling back to the
+interpreter for anything else that isn't a pair of numbers.
+
+- The startup check is the text's for the bytes kind (`probeBytes`, "bytes helper checks" in
+  the log, 2.6 ms on the optimized build, 6 ms on the fast one), with `Bytes.at` and
+  `flatten` against the Haskell operations too; `UNISON_JIT_STRESS=bytes=N` is the random
+  test (200,000 steps take 0.75 s on the optimized build). The test transcript passes with
+  the JIT on, in eager mode with `bytes=200000,texts=20000,lists=20000`, with the text and
+  bytes helpers disabled, and on both builds, with output identical to the interpreter's. The sample that teaches the chunk's layout is cut from a longer one so that its
+  offset (1) and its size (3) differ and the two word fields can't be mixed up.
+- The check caught a real problem on its first run: `Unison.Util.Bytes` wasn't compiled with
+  `-O2`, and at `-O0` GHC ignores `UNPACK` pragmas, so the chunk's two `Int`s were boxed on
+  the fast build and unboxed on the optimized one. The module is now compiled with
+  `-O2 -funbox-strict-fields` in every build, like `Rope`, `Text` and `Deque.Internal`.
+- `UNISON_JIT_DISABLE=bytes` turns the bytes cases off (`text` the text ones; with both off,
+  universal `==` is as before). The test transcript has a Bytes section (built from either
+  end, drained with `at` and `drop`, chopped with `take`, recut, woven, flattened) whose
+  expected output was generated with the JIT off.
+- Still call-outs: `Bytes.indexOf`, `fromList`/`toList` (`PAKB`/`UPKB`), the
+  `decodeNat*`/`encodeNat*` and `index*` foreign functions, and comparison (`<`, `compare`).
+
+Three benchmarks were added to `jitSuite` (optimized build, 2026-10-02; interpreter / JIT):
+
+| Benchmark | Interpreter | JIT |
+| --- | --- | --- |
+| Bytes: append 2 bytes 10000 times | 1.03 ms | 310 µs |
+| Bytes: drop 1, 100000 times | 8.69 ms | 2.77 ms |
+| Bytes: at, 100000 times (a `match` on each `Optional`) | 10.1 ms | 7.4 ms |
+
+The first two are what the text versions get (318 µs and 2.66 ms on the same run). `Bytes.at`
+gains less: each step allocates a `Some`, matches on it, and the index itself walks the tree
+to the chunk (the 100000-byte sample was built two bytes at a time, so it is 1600 chunks of
+64; `rope_chunk_at` is O(log n) in that), about 74 ns a step in all. The text and list
+checks and the rest of `jitSuite` are unchanged (every other row within 2% of the previous
+run).
+
+## Open bugs
+
+- **Eager mode on the optimized build crashes on an `Optional` returned to a watch
+  expression from a call-out** (found 2026-10-02 while adding the Bytes tests; it is in the
+  commit before the Bytes work too, so it isn't theirs). Minimal reproduction on the
+  optimized build: a transcript with the watch `> (List.at 6 [1, 2, 3], 1)` run with
+  `UNISON_JIT=eager UNISON_JIT_DISABLE=list` segfaults; so does `> Text.uncons "abc"` with
+  nothing disabled, and `> List.at 1 [1, 2, 3]` with the list helpers off. `> Bytes.at 5
+  (bgrow 3)` (a `Some` of a fresh Nat) and `> Nat.toText 5` are fine, and so is consuming
+  the `Optional` natively (`match ... with None -> 1; Some _ -> 2`). The fast build, the
+  debug build (`-O0`) and `UNISON_JIT=on` never crash. The debug RTS (an optimized build
+  with `--ghc-options=-debug`, work dir `.stack-work-optdebug`) shows the GC's `evacuate`
+  faulting on a NULL pointer field of a thunk allocated by `Unison.Runtime.Decompile`, so
+  the decompiler was handed a value with a null closure in it; `+RTS -DS` doesn't assert
+  first. Marking every card of the boxed stack dirty on exit made no difference, and the
+  generated IR is the same as for the passing `Some`. lldb needs `--source-on-crash` with
+  the RTS's timer signals passed (`process handle SIGALRM SIGVTALRM SIGUSR2 -s false -n
+  false -p true`) and `PAGER=cat`, else it stalls. The worktree `/Users/pchiusano/unison-old`
+  holds commit 45cabf81b with an optimized build (`.stack-work-opt`) for bisecting. The Bytes
+  tests print `Bytes.at` through a `match` (`byteAt`) to stay clear of it.
+
 ## Baseline: interpreter only
 
 Measured 2026-09-29 on the optimized build of branch `jit` (commit c5bcd5ae7, no JIT code yet),
@@ -974,3 +1044,15 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   to the `.cabal` file by hand. (4) The first `suite` run after the swap read
   `Value.deserializeCompressed` 20% slower; a rerun of that benchmark alone read the old
   number. One run of `suite` is not evidence for a 20% change in a 20 ms benchmark.
+- 2026-10-02: `Bytes` natively (Paul: "go ahead with the native Bytes implementation
+  next"). The C text section became one parameterised by a `RopeKind`; see "The bytes
+  helpers". Things worth remembering: (1) the startup check failed closed on its first run
+  ("check 5": the chunk constructor's shape) because `UNPACK` pragmas are ignored at `-O0`
+  and `Unison.Util.Bytes` had no `-O2` of its own; every module whose constructors the C
+  side reads needs `{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}` (Deque.Internal, Rope,
+  Text, Bytes). (2) The `jit_codebase` has no `Optional.getOrElse`; test code uses a
+  `match`. (3) With `use Nat ==` in a stanza, `==` on anything but Nats won't resolve;
+  write `Universal.==` for the universal one.
+  (4) A watch expression whose value is an `Optional` from a call-out crashes eager mode on
+  the optimized build; this is older than the Bytes work (see "Open bugs"), and cost most
+  of the session to pin down that far.

@@ -27,7 +27,7 @@ import Unison.Runtime.JIT.Compile
 import Unison.Runtime.JIT.Config
 import Unison.Runtime.JIT.Exits
 import Unison.Runtime.JIT.LLVM
-import Unison.Runtime.JIT.Layout (probeLayouts, probeLists, probeNames, probeTexts)
+import Unison.Runtime.JIT.Layout (probeBytes, probeLayouts, probeLists, probeNames, probeTexts)
 import Unison.Runtime.JIT.Native (configureNative, ctxLayout, rtsFacts)
 import Unison.Runtime.MCode (CombIx (..), GComb (..), GCombInfo (..), NativeCell, claimNativeCell, combDeps, nativeCellRequested, noNativeCell, prettyIns, prettySection, readNativeCount, releaseNativeCell, takeNativeCell, writeNativeCount)
 import Unison.Runtime.Machine.Types (CCache (combRefs, combs), MCombs)
@@ -94,7 +94,10 @@ initJIT = do
             Right () ->
               timed "text helper checks" (probeTexts ls (stressTexts config)) >>= \case
                 Left e -> pure (Left e)
-                Right () -> fmap (const ls) <$> probeNames ls
+                Right () ->
+                  timed "bytes helper checks" (probeBytes ls (stressBytes config)) >>= \case
+                    Left e -> pure (Left e)
+                    Right () -> fmap (const ls) <$> probeNames ls
       (offs, _) <- ctxLayout
       case (layouts, offs) of
         (Left e, _) -> jitLog (e ++ "; the JIT is off")

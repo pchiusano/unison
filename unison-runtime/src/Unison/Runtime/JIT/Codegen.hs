@@ -177,6 +177,12 @@ modulePrelude =
       "declare ptr @unison_jit_text_append(ptr, ptr, ptr)",
       "declare ptr @unison_jit_text_cut(ptr, ptr, i64, i64)",
       "declare i64 @unison_jit_text_eq(ptr, ptr)",
+      "declare i64 @unison_jit_bytes_size(ptr)",
+      "declare ptr @unison_jit_bytes_append(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_bytes_cut(ptr, ptr, i64, i64)",
+      "declare i64 @unison_jit_foreign_eq(ptr, ptr, i64)",
+      "declare ptr @unison_jit_bytes_index(ptr, ptr, i64, ptr, i64, ptr)",
+      "declare ptr @unison_jit_bytes_flatten(ptr, ptr)",
       "declare ptr @unison_jit_name(ptr, ptr, i64, i64, ptr, i64, ptr, i64, ptr, i64, ptr)",
       "declare i64 @llvm.ctlz.i64(i64, i1)",
       "declare i64 @llvm.cttz.i64(i64, i1)",
@@ -695,8 +701,8 @@ allocates = anyInstr $ \case
   Prim2 REFW _ _ -> True
   ForeignCall _ MutableArray_write _ -> True
   -- the list helpers allocate, and charge the budget themselves
-  Prim1 op _ -> op `elem` [VWLS, VWRS]
-  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT]
+  Prim1 op _ -> op `elem` [VWLS, VWRS, FLTB]
+  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, CATB, TAKB, DRPB, IDXB]
   Seq _ -> True
   Name {} -> True
   _ -> False
@@ -2188,8 +2194,8 @@ instrNative :: GInstr comb -> Bool
 instrNative = \case
   Lit _ -> True
   Pack {} -> True
-  Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT]
-  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, EQLT]
+  Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT, SIZB, FLTB]
+  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, EQLT, CATB, TAKB, DRPB, IDXB]
   Seq _ -> True
   ForeignCall _ f _ -> f `elem` [MutableArray_size, MutableArray_read, MutableArray_write]
   -- (up to four arguments; more is rare, and then it is a call-out)
@@ -2369,6 +2375,45 @@ genInstr fe d instr sect k = case instr of
     emit (c ++ " = icmp ne i64 " ++ r ++ ", 0")
     resultBool fe d c
     k (d + 1)
+  -- Bytes: the same rope with chunks of bytes and the same helpers (see
+  -- "Ropes" in jit_rt.c), plus Bytes.at and Bytes.flatten.
+  Prim1 SIZB i | enabled fe "bytes" -> do
+    slow <- callOutExit True fe d instr sect
+    b <- loadB (d - i)
+    n <- fresh "size"
+    emit (n ++ " = call i64 @unison_jit_bytes_size(ptr " ++ b ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp slt i64 " ++ n ++ ", 0")
+    branchIf "bytes" miss slow
+    result fe d (feTagNat fe) n
+    k (d + 1)
+  Prim1 FLTB i | enabled fe "bytes" -> do
+    slow <- callOutExit True fe d instr sect
+    b <- loadB (d - i)
+    listHelper d slow ("@unison_jit_bytes_flatten(ptr %ctx, ptr " ++ b ++ ")")
+    k (d + 1)
+  Prim2 CATB i j | enabled fe "bytes" -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadB (d - i)
+    y <- loadB (d - j)
+    listHelper d slow ("@unison_jit_bytes_append(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ")")
+    k (d + 1)
+  Prim2 op i j | enabled fe "bytes", op == TAKB || op == DRPB -> do
+    slow <- callOutExit True fe d instr sect
+    n <- loadU (d - i)
+    b <- loadB (d - j)
+    listHelper d slow ("@unison_jit_bytes_cut(ptr %ctx, ptr " ++ b ++ ", i64 " ++ n ++ ", i64 " ++ (if op == TAKB then "1" else "0") ++ ")")
+    k (d + 1)
+  Prim2 IDXB i j
+    | enabled fe "bytes",
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+        slow <- callOutExit True fe d instr sect
+        ix <- loadU (d - i)
+        b <- loadB (d - j)
+        none <- poolValue noneIx
+        listHelper d slow ("@unison_jit_bytes_index(ptr %ctx, ptr " ++ b ++ ", i64 " ++ ix ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ feTagNat fe ++ ")")
+        k (d + 1)
   Prim2 IDXS i j
     | enabled fe "list",
       Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
@@ -2764,8 +2809,42 @@ genUniversal fe d op ki kj instr sect = do
   fast <- fresh "fast"
   emit (fast ++ " = and i1 " ++ same ++ ", " ++ known)
   go <- freshLabel "univ"
-  emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ slow ++ likely)
-  startBlock go
+  -- which kinds of rope the equality helper is to take: texts, bytes
+  let kinds = (if enabled fe "text" then 1 else 0) + (if enabled fe "bytes" then 2 else 0) :: Int
+  if op == EQLU && kinds /= 0
+    then do
+      -- two texts or two bytes are compared by the helper; anything else
+      -- that isn't a pair of numbers goes to the interpreter
+      feq <- freshLabel "feq"
+      emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ feq ++ likely)
+      startBlock feq
+      r <- fresh "eq"
+      emit (r ++ " = call i64 @unison_jit_foreign_eq(ptr " ++ bi ++ ", ptr " ++ bj ++ ", i64 " ++ show kinds ++ ")")
+      miss <- fresh "miss"
+      emit (miss ++ " = icmp slt i64 " ++ r ++ ", 0")
+      ok <- freshLabel "feq.ok"
+      emit ("br i1 " ++ miss ++ ", label %" ++ slow ++ ", label %" ++ ok ++ unlikely)
+      startBlock ok
+      c2 <- fresh "c"
+      emit (c2 ++ " = icmp ne i64 " ++ r ++ ", 0")
+      join <- freshLabel "univ.join"
+      emit ("br label %" ++ join)
+      startBlock go
+      c1 <- cmp "eq" ui uj
+      emit ("br label %" ++ join)
+      startBlock join
+      c <- fresh "c"
+      emit (c ++ " = phi i1 [ " ++ c1 ++ ", %" ++ go ++ " ], [ " ++ c2 ++ ", %" ++ ok ++ " ]")
+      resultBool fe d c
+    else do
+      emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ slow ++ likely)
+      startBlock go
+      genUniversalFast fe d op isInt ui uj
+
+-- | The rest of 'genUniversal': the comparison of two words of the same
+-- numeric type.
+genUniversalFast :: FnEnv -> Int -> Prim2 -> String -> String -> String -> Gen ()
+genUniversalFast fe d op isInt ui uj = do
   let signedUnsigned s u = do
         cs <- cmp s ui uj
         cu <- cmp u ui uj

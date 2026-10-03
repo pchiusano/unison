@@ -88,12 +88,14 @@ data Config = Config
     stressLists :: Int,
     -- | the same for the text helpers (stress mode @texts=N@)
     stressTexts :: Int,
+    -- | and for the bytes helpers (stress mode @bytes=N@)
+    stressBytes :: Int,
     -- | features turned off for debugging, from @UNISON_JIT_DISABLE@
     -- (comma separated): @app@ (closure calls), @apply@ (the interpreter
     -- entering native code for a closure), @ref@, @array@, @cmp@
-    -- (universal comparison), @callout@ (call-outs become resumes), @direct@
-    -- (calls within a module go through cells), @worker@ (no workers with
-    -- register arguments)
+    -- (universal comparison), @list@, @text@, @bytes@ (the C helpers for
+    -- those), @callout@ (call-outs become resumes), @direct@ (calls within a
+    -- module go through cells), @worker@ (no workers with register arguments)
     disabled :: [String]
   }
   deriving (Show)
@@ -139,6 +141,7 @@ config = unsafePerformIO $ do
         stressPool = setting "pool",
         stressLists = fromMaybe 0 (setting "lists"),
         stressTexts = fromMaybe 0 (setting "texts"),
+        stressBytes = fromMaybe 0 (setting "bytes"),
         statsEvery = fromMaybe 0 (every >>= readMaybe),
         disabled = disabledFeatures
       }

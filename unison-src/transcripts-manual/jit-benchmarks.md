@@ -112,6 +112,25 @@ textDrain n t =
   go rem i = if i == n then rem else go (Text.drop 1 rem) (i + 1)
   go t 0
 
+-- Bytes: the same rope as Text, with the same native operations
+bytesAppend : Nat -> Bytes -> Bytes
+bytesAppend n piece =
+  go acc i = if i == n then acc else go (acc Bytes.++ piece) (i + 1)
+  go Bytes.empty 0
+
+bytesDrain : Nat -> Bytes -> Bytes
+bytesDrain n b =
+  go rem i = if i == n then rem else go (Bytes.drop 1 rem) (i + 1)
+  go b 0
+
+-- every byte, by position
+bytesSum : Bytes -> Nat
+bytesSum b =
+  go acc i = match Bytes.at i b with
+    None -> acc
+    Some x -> go (acc + x) (i + 1)
+  go 0 0
+
 jitSuite : '{IO, Exception} ()
 jitSuite = do
   printTime "Sum 0 to 1 million" 1 (n -> repeat n do sumTo 1000000)
@@ -133,6 +152,15 @@ jitSuite = do
   printTime "Text: drop 1, 100000 times" 1 let
     t = Text.repeat 100000 "a"
     n -> repeat n do textDrain 100000 t
+  printTime "Bytes: append 2 bytes 10000 times" 1 let
+    hi = Bytes.fromList [104, 105]
+    n -> repeat n do bytesAppend 10000 hi
+  printTime "Bytes: drop 1, 100000 times" 1 let
+    b = bytesAppend 50000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesDrain 100000 b
+  printTime "Bytes: at, 100000 times" 1 let
+    b = bytesAppend 50000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesSum b
 ```
 
 ``` ucm

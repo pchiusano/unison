@@ -27,6 +27,9 @@ module Unison.Runtime.JIT.Native
     textInit,
     textCheck,
     textTest,
+    bytesInit,
+    bytesCheck,
+    bytesTest,
     closureInit,
     nameTest,
     hplimValue,
@@ -224,6 +227,25 @@ textCheck (MutableArray arr#) = (== 1) <$> c_textCheck arr#
 textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
 textTest (MutableArray arr#) op a = fromIntegral <$> c_textTest arr# (fromIntegral op) (fromIntegral a)
 
+foreign import ccall unsafe "unison_jit_bytes_init" c_bytesInit :: MutableArray# RealWorld Any -> Ptr Int64 -> IO Int64
+
+foreign import ccall unsafe "unison_jit_bytes_check" c_bytesCheck :: MutableArray# RealWorld Any -> IO Int64
+
+foreign import ccall unsafe "unison_jit_bytes_test" c_bytesTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> IO Int64
+
+-- | And for the bytes helpers (see unison_jit_bytes_init and
+-- unison_jit_bytes_test).
+bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+bytesInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
+  mapM_ (\(i, v) -> pokeElemOff p i (fromIntegral v)) (zip [0 ..] infos)
+  fromIntegral <$> c_bytesInit arr# p
+
+bytesCheck :: MutableArray RealWorld Any -> IO Bool
+bytesCheck (MutableArray arr#) = (== 1) <$> c_bytesCheck arr#
+
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> IO Int
+bytesTest (MutableArray arr#) op a b = fromIntegral <$> c_bytesTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b)
+
 foreign import ccall unsafe "unison_jit_closure_init" c_closureInit :: Ptr Int64 -> IO ()
 
 foreign import ccall unsafe "unison_jit_name_test" c_nameTest :: MutableArray# RealWorld Any -> Int64 -> IO Int64
@@ -285,6 +307,15 @@ textCheck _ = pure False
 
 textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
 textTest _ _ _ = pure 0
+
+bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+bytesInit _ _ = pure 0
+
+bytesCheck :: MutableArray RealWorld Any -> IO Bool
+bytesCheck _ = pure False
+
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> IO Int
+bytesTest _ _ _ _ = pure 0
 
 closureInit :: [Int] -> IO ()
 closureInit _ = pure ()

@@ -11,13 +11,14 @@ module Unison.Runtime.JIT.Layout
     probeLayouts,
     probeLists,
     probeTexts,
+    probeBytes,
     probeNames,
   )
 where
 
 import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
-import Data.Maybe (catMaybes)
+import Data.Maybe (catMaybes, isJust)
 import Data.Bits (shiftR, xor, (.&.), (.|.))
 import Data.Primitive.Array (MutableArray, arrayFromList, newArray, readArray, writeArray)
 import Data.IORef (newIORef)
@@ -26,11 +27,12 @@ import Foreign.Ptr (IntPtr (..), ptrToIntPtr)
 import GHC.Exts (Any, RealWorld)
 import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Builtin.Decls qualified as Ty (optionalRef, seqViewRef)
-import Unison.Runtime.JIT.Native (closureInit, listCheck, listInit, listTest, nameTest, probeClosure, textCheck, textInit, textTest)
+import Unison.Runtime.JIT.Native (bytesCheck, bytesInit, bytesTest, closureInit, listCheck, listInit, listTest, nameTest, probeClosure, textCheck, textInit, textTest)
 import Unison.Runtime.MCode (CombIx (..), GCombInfo (..), GSection (..), noNativeCell)
 import Unison.Runtime.Stack
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
+import Unison.Util.Bytes qualified as By
 import Unison.Util.Deque qualified as Sq
 import Unison.Util.Rope qualified as Rope
 import Unison.Util.Text qualified as UText
@@ -390,7 +392,7 @@ probeTexts ls steps = do
   arr <- newArray 4 first :: IO (MutableArray RealWorld Any)
   put arr 1 (wrap (UText.pack (replicate (th + 1) 'a') <> UText.pack (replicate (th + 1) 'b')))
   put arr 2 (wrap UText.empty)
-  ok <- textInit arr [lForeignInfo ls, th]
+  ok <- textInit arr [lForeignInfo ls, th, 0]
   if ok /= 1
     then pure (Left ("the text constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
     else do
@@ -515,6 +517,186 @@ probeTexts ls steps = do
       case e1 ++ e2 of
         e : _ -> pure (Left e)
         [] -> if steps > 0 then stress 0 (replicate 8 UText.empty) else pure (Right ())
+
+-- | The bytes helpers: the same arrangement as 'probeTexts' for @Bytes@,
+-- which is the same rope with chunks of bytes, plus @Bytes.at@ and
+-- @Bytes.flatten@. Stress mode @bytes=N@.
+probeBytes :: Layouts -> Int -> IO (Either String ())
+probeBytes ls steps = do
+  let wrap :: By.Bytes -> Any
+      wrap b = any' $! Foreign (WrapBytes b)
+      put :: MutableArray RealWorld Any -> Int -> Any -> IO ()
+      put a i v = evaluate v >>= writeArray a i
+      bytes :: [Int] -> By.Bytes
+      bytes = By.fromWord8s . map fromIntegral
+      same a b = BoxedVal a == BoxedVal b
+      PackedTag someTag = TT.someTag
+      !none = Enum Ty.optionalRef TT.noneTag
+      -- "abc", cut from a longer chunk so that its offset and its size differ
+      first = wrap (By.drop 1 (bytes [120, 97, 98, 99]))
+      th = Rope.threshold
+      pieces = [[], [1], [97, 98, 99], [0, 255, 128, 7, 0], [0 .. 255], replicate (th - 1) 120, replicate th 121, replicate (th + 1) 122, take 600 (cycle [0 .. 255])]
+      base = map bytes pieces
+      digits i = map fromEnum (show (i :: Int))
+      grown = [foldl (\acc i -> acc <> bytes (digits i)) mempty [1 .. n] | n <- [5, 40, 300]]
+      grownL = [foldl (\acc i -> bytes (digits i) <> acc) mempty [1 .. n] | n <- [40, 300]]
+      big = mconcat (replicate 2000 (bytes [0xC3, 0xA9]))
+      chunky = foldl (\acc i -> acc <> bytes (take (th `div` 2 + 1) (drop (i `mod` 7) (cycle [0 .. 255])))) mempty [1 .. 260 :: Int]
+      samples = base ++ grown ++ grownL ++ [big, By.drop 7 big, By.take 1500 big, By.drop 100 (grown !! 2), By.take 400 (grownL !! 1), chunky, By.drop 1000 chunky]
+  -- (every sample goes through `put`: see probeLists on `evaluate`)
+  arr <- newArray 4 (wrap By.empty) :: IO (MutableArray RealWorld Any)
+  put arr 0 first
+  put arr 1 (wrap (bytes (replicate (th + 1) 97) <> bytes (replicate (th + 1) 98)))
+  put arr 2 (wrap By.empty)
+  ok <- bytesInit arr [lForeignInfo ls, th, 1]
+  if ok /= 1
+    then pure (Left ("the bytes constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
+    else do
+      let result :: IO (Maybe By.Bytes)
+          result = do
+            c <- unsafeCoerce <$> readArray arr 3 :: IO Closure
+            good <- do
+              put arr 0 (any' c)
+              bytesCheck arr
+            pure $ case c of
+              Foreign (WrapBytes b) | good -> Just b
+              _ -> Nothing
+          -- Bytes.at through the helper, against the interpreter's answer
+          at :: By.Bytes -> Int -> IO Bool
+          at b i = do
+            put arr 0 (wrap b)
+            put arr 1 (any' none)
+            put arr 2 (any' natTypeTag)
+            h <- bytesTest arr 5 i (fromIntegral someTag)
+            c <- unsafeCoerce <$> readArray arr 3 :: IO Closure
+            pure (h == 1 && same c (maybe none (Data1 Ty.optionalRef TT.someTag . NatVal . fromIntegral) (By.at i b)))
+          -- Bytes.flatten: the same bytes, in one chunk
+          flat :: By.Bytes -> IO (Maybe By.Bytes)
+          flat b = do
+            put arr 0 (wrap b)
+            h <- bytesTest arr 6 0 0
+            r <- result
+            pure $ case r of
+              Just f | h == 1, f == b, length (By.chunks f) <= 1 -> Just f
+              _ -> Nothing
+          one :: By.Bytes -> IO [String]
+          one b = do
+            let n = By.size b
+            put arr 0 (wrap b)
+            shape <- bytesCheck arr
+            size <- bytesTest arr 3 0 0
+            cuts <- forM ([-1 .. min n (if n > 600 then 12 else 70)] ++ [(n * j) `div` 13 | j <- [1 .. 12], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
+              put arr 0 (wrap b)
+              h1 <- bytesTest arr 1 k 0
+              r1 <- result
+              put arr 0 (wrap b)
+              h2 <- bytesTest arr 2 k 0
+              r2 <- result
+              -- a negative count is a Nat too large to be a size
+              let tk = if k < 0 then b else By.take k b
+                  dr = if k < 0 then By.empty else By.drop k b
+              pure (h1 == 1 && r1 == Just tk && h2 == 1 && r2 == Just dr)
+            ats <- mapM (at b) ([-1, 0, 1, n - 1, n] ++ [(n * j) `div` 7 | j <- [1 .. 6]])
+            fl <- flat b
+            pure . catMaybes $
+              [ if shape then Nothing else Just "a bytes isn't laid out as expected",
+                if size == n then Nothing else Just "Bytes.size differs from the interpreter's",
+                if and cuts then Nothing else Just ("Bytes.take or Bytes.drop differs from the interpreter's on a bytes of " ++ show n),
+                if and ats then Nothing else Just ("Bytes.at differs from the interpreter's on a bytes of " ++ show n),
+                if isJust fl then Nothing else Just ("Bytes.flatten differs from the interpreter's on a bytes of " ++ show n)
+              ]
+          two :: By.Bytes -> By.Bytes -> IO [String]
+          two a b = do
+            put arr 0 (wrap a)
+            put arr 1 (wrap b)
+            eq <- bytesTest arr 4 0 0
+            h <- bytesTest arr 0 0 0
+            r <- result
+            pure . catMaybes $
+              [ if eq == (if a == b then 1 else 0) then Nothing else Just "Bytes equality differs from the interpreter's",
+                if h == 1 && r == Just (a <> b) then Nothing else Just ("Bytes.++ differs from the interpreter's on bytes of " ++ show (By.size a) ++ " and " ++ show (By.size b))
+              ]
+          -- the longer test: random operations on eight bytes
+          mix :: Int -> Int
+          mix z0 =
+            let z1 = (z0 `xor` (z0 `shiftR` 30)) * (-4658895280553007687)
+                z2 = (z1 `xor` (z1 `shiftR` 27)) * (-7723592293110705685)
+             in (z2 `xor` (z2 `shiftR` 31)) .&. maxBound
+          values = cycle ([0 .. 255] ++ [255, 0, 128, 1])
+          stress :: Int -> [By.Bytes] -> IO (Either String ())
+          stress step pool
+            | step >= steps = pure (Right ())
+            | otherwise = do
+                let r k = mix (step * 16 + k)
+                    i = r 0 `mod` 8
+                    t = pool !! i
+                    e = pool !! (r 1 `mod` 8)
+                    n = By.size t
+                    full = n <= 3000 || r 2 `mod` 16 == 0
+                    pos = case r 3 `mod` 4 of
+                      0 -> r 4 `mod` 12
+                      1 -> n - r 4 `mod` 12
+                      _ -> r 4 `mod` (n + 2) - 1
+                    op = r 5 `mod` 16
+                    piece k = bytes (take (r k `mod` (if even (r (k + 1)) then 7 else 90)) (drop (r (k + 2) `mod` 40) values))
+                    -- what a helper built, if it is laid out right and is the expected bytes
+                    -- (the bytes are compared when `whole`; the size always)
+                    verdict :: Bool -> Int -> By.Bytes -> IO (Maybe By.Bytes)
+                    verdict whole h expected = do
+                      got <- result
+                      pure $ case got of
+                        Just g | h == 1, By.size g == By.size expected, not whole || g == expected -> Just g
+                        _ -> Nothing
+                    cat whole a b = do
+                      put arr 0 (wrap a)
+                      put arr 1 (wrap b)
+                      h <- bytesTest arr 0 0 0
+                      verdict whole h (a <> b)
+                    cut whole tk k x = do
+                      put arr 0 (wrap x)
+                      h <- bytesTest arr (if tk then 1 else 2) k 0
+                      verdict whole h (if tk then (if k < 0 then x else By.take k x) else (if k < 0 then By.empty else By.drop k x))
+                    sameAs a b = do
+                      put arr 0 (wrap a)
+                      put arr 1 (wrap b)
+                      eq <- bytesTest arr 4 0 0
+                      pure (eq == (if a == b then 1 else 0))
+                    times :: Int -> (By.Bytes -> IO (Maybe By.Bytes)) -> By.Bytes -> IO (Maybe By.Bytes)
+                    times 0 _ x = pure (Just x)
+                    times k f x = f x >>= maybe (pure Nothing) (times (k - 1) f)
+                res <-
+                  if
+                    | op < 2 -> cat full t (piece 6)
+                    | op < 4 -> cat full (piece 6) t
+                    | op == 4 -> cut full True pos t
+                    | op == 5 -> cut full False pos t
+                    | op == 6 -> cut full False pos t >>= maybe (pure Nothing) (cut full True (r 6 `mod` 200))
+                    | op <= 8 -> if n + By.size e > 60000 then cut full True (r 6 `mod` 50) t else cat full t e
+                    | op == 9 -> do
+                        -- the same bytes cut into chunks differently, and another bytes
+                        a <- sameAs t (By.take pos t <> By.drop pos t)
+                        b <- sameAs t e
+                        c <- if n > 0 then sameAs t (By.take (n - 1) t <> piece 9) else pure True
+                        pure (if a && b && c then Just t else Nothing)
+                    | op == 10 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) x (piece 9)) t
+                    | op == 11 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) (piece 9) x) t
+                    | op == 12 -> times (r 6 `mod` 40) (cut (n <= 300) False 1) t
+                    | op == 13 -> times (r 6 `mod` 40) (\x -> cut (n <= 300) True (By.size x - 1) x) t
+                    | op == 14 -> do
+                        oks <- mapM (at t) [pos, 0, n - 1, r 6 `mod` (n + 1)]
+                        pure (if and oks then Just t else Nothing)
+                    | otherwise -> flat t
+                case res of
+                  Nothing -> pure (Left ("the bytes helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a bytes of " ++ show n ++ ")"))
+                  Just t' -> stress (step + 1) (take i pool ++ [t'] ++ drop (i + 1) pool)
+      e1 <- concat <$> mapM one samples
+      -- equal bytes cut into chunks differently must compare equal
+      let recut b = By.take 3 b <> By.drop 3 b
+          some = [b | (j, b) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
+      e2 <- concat <$> sequence ([two a b | a <- some, b <- some] ++ [two b (recut b) | b <- samples])
+      case e1 ++ e2 of
+        e : _ -> pure (Left e)
+        [] -> if steps > 0 then stress 0 (replicate 8 By.empty) else pure (Right ())
 
 -- | Partial applications: the helper for the @Name@ instruction against
 -- what the interpreter builds, for closures with and without arguments

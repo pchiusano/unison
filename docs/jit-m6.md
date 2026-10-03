@@ -256,6 +256,9 @@ without statistics. Fixed in step 0.
   (written as `Rope2`, then renamed `Unison.Util.Rope` when it took over), and the text
   helpers were ported to it. Details and numbers are in the progress log ("The text
   representation").
+  *After M6* (2026-10-02): `Bytes` got the same helpers (the rope functions take a kind
+  of chunk), plus `at` and `flatten`, and universal `==` on texts and bytes; see the
+  progress log ("The bytes helpers").
 - [x] **6. Calls to ability handlers.** `App (Dyn i)` finds the handler in the dynamic
   environment, which lives in the interpreter's `HEnv`. **Measured first, and not built:**
   a handler's function begins with `RMatch` on the request, and then either `Capture`s the
