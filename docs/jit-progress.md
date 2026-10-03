@@ -717,7 +717,9 @@ history (commit 02fdeb7f2 is the last with both).
   of many shapes, and runs each helper against the Haskell operation (about 6 ms on the
   optimized build); `UNISON_JIT_STRESS=texts=N` is the random test, like `lists=N` (200,000
   steps take about 15 s). Two planted bugs (a seam not joined; a wrong size after a cut in
-  the middle) were caught by the ordinary startup check.
+  the middle) were caught by the ordinary startup check. The debug runtime (`-DS`) ran the
+  test transcript with `THRESHOLD=1`, with `eager` and 20,000 random text operations, and
+  the benchmark transcript, with no sanity failures.
 - `Rope.threshold` is handed to the C side at startup, so the two can't disagree on it.
 
 Time per operation against the old rope (below 1: the new one is faster), on chunks of
