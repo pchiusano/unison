@@ -201,6 +201,33 @@ than deleting it.
   Left as call-outs: the compression functions (`zlib`, `gzip`, `zstd`: library-bound; a C
   port would mean linking those libraries into the runtime's C side), and the exceptions and
   error messages, which the interpreter raises on the slow path.
+- **Bytes literals built directly, through a separate MCode rewrite pass.** (Paul,
+  2026-10-03.) The parser turns `0xsdeadbeef` into `Bytes.fromList [222, 173, 190, 239]`
+  (`TermParser.hs` and `Term.hs` do this, and the printer undoes it), so a bytes literal
+  compiles to a list literal of n boxed Nats followed by a `Bytes.fromList` call, both
+  native since 2026-10-03 but still n allocations, a finger tree and a conversion at every
+  evaluation. The desired code is the direct construction: a `Bytes` constant that the pool
+  holds like a text constant, so the literal costs one pool load. There is no literal form
+  for it yet: `ANF.Lit` and `MLit` have cases for numbers, chars, text and links but not
+  bytes (the `BLit (Bytes b)` constructor belongs to `ANF.Value`, the serialized value
+  form, not to code), so the rewrite needs either a new `Lit`/`MLit` case (which touches
+  the code serialization and its version) or a JIT-side pseudo-instruction that only the
+  native path understands, with the original list-and-call kept for the interpreter.
+  Recognize the pattern (a `Seq` literal whose
+  elements are all Nat literals in 0..255, consumed only by `Bytes.fromList`) and replace
+  it. Recognizing it at the MCode level may be awkward: by then the list is a `Pack`/list
+  literal over stack slots filled by earlier `Lit` instructions, and removing those
+  bindings means renumbering the variable indices of everything after them in the
+  section. Doing it on ANF, before `emitSection` assigns indices, avoids the renumbering,
+  and is where the information is still structural. Either way, Paul wants these rewrites
+  kept modular and separate from codegen: a pass (or a small framework of rewrite rules)
+  over ANF or MCode that the compiler runs before emitting, so that further
+  optimizations and rewrite rules can accumulate there without each one being threaded
+  through `Codegen.hs`. Candidates for the same pass later: constant folding of arithmetic
+  on literals, `Text` appends of literals, `List` literals of constants as pool values.
+  With a real `MLit` case the interpreter benefits too. `Decompile.hs` prints a bytes
+  value as `Bytes.fromList [...]` and the printer shows that as `0xs...`, so printing is
+  unaffected either way.
 - **More of `Text` natively.** Done 2026-10-03: every Text primitive and the pure foreign
   functions are native; see the progress log. Left as call-outs: the Text patterns
   (`Text.patterns.*` build pattern values that `Pattern.run`/`isMatch` interpret in Haskell;
