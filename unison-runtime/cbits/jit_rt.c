@@ -1438,16 +1438,6 @@ static StgClosure *rope_snoc(UnisonJitCtx *ctx, StgClosure *r, StgInt s, StgClos
   return rope_deep(ctx, v.t + (s << 8) - 0x70, v.ps, v.pr, m, scons(ctx, c, s_from(ctx, k, 2, LF.snil)));
 }
 
-// a Deep without its first chunk (uncons)
-static StgClosure *rope_tail(UnisonJitCtx *ctx, StgClosure *r) {
-  Lv v;
-  rope_read(r, &v);
-  StgInt s = chunk_size(HEAD(v.pr));
-  StgClosure *rest = TAIL(v.pr);
-  if (IS_CONS(rest)) return rope_deep(ctx, v.t - (s << 8) - 1, v.ps - s, rest, v.m, v.sf);
-  return rope_build(ctx, TSIZE(v.t) - s, 0, 0, LF.snil, v.m, TSC(v.t), v.sf);
-}
-
 // --- take and drop (takeR, dropR) ---
 //
 // The rope is cut between two chunks, by the list's code when the cut is in
@@ -1583,9 +1573,11 @@ static StgClosure *rope_drop(UnisonJitCtx *ctx, StgInt i, StgClosure *r) {
 
 // --- append ---
 
-// If the two chunks that meet are small they are joined; then the digits that
-// end up inside are packed into nodes and handed to the list's append of two
-// middles.
+// If the two chunks that meet are small they are joined, as the last chunk of
+// the left side. Then the digits that end up inside join the outer digit of a
+// side that has no middle, if they fit there (the shorter side's, if they fit
+// in either: that copies fewer cells), or are packed into nodes and handed to
+// the list's append of two middles.
 static StgClosure *rope_append(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) {
   for (;;) {
     if (LTAG(a) == 1) return b;
@@ -1595,26 +1587,38 @@ static StgClosure *rope_append(UnisonJitCtx *ctx, StgClosure *a, StgClosure *b) 
     Lv x, y;
     rope_read(a, &x);
     rope_read(b, &y);
+    StgInt pc1 = TPC(x.t), sc1 = TSC(x.t), pc2 = TPC(y.t), sc2 = TSC(y.t);
+    StgInt n = TSIZE(x.t) + TSIZE(y.t);
+    // isf: the left side's suffix; ipr: the ipc chunks of the right side's
+    // prefix that are still its own (d characters of it went to the left)
+    StgClosure *isf = x.sf, *ipr = y.pr;
+    StgInt ipc = pc2, d = 0;
     StgClosure *l = HEAD(x.sf), *f = HEAD(y.pr);
-    StgInt s = chunk_size(f);
-    if (chunk_size(l) + s <= ROPE_THRESHOLD) {
-      a = rope_deep(ctx, x.t + (s << 8), x.ps, x.pr, x.m, scons(ctx, chunk_join(ctx, l, f), TAIL(x.sf)));
-      b = rope_tail(ctx, b);
+    if (chunk_size(l) + chunk_size(f) <= ROPE_THRESHOLD) {
+      d = chunk_size(f);
+      isf = scons(ctx, chunk_join(ctx, l, f), TAIL(x.sf));
+      ipr = TAIL(y.pr), ipc = pc2 - 1;
+    }
+    StgInt c = sc1 + ipc;
+    int flat1 = LTAG(x.m) != 2, flat2 = LTAG(y.m) != 2;
+    if (flat1 && pc1 + c <= MAXD && !(flat2 && c + sc2 <= MAXD && sc2 + ipc < pc1 + sc1))
+      return rope_deep(ctx, MK(n, pc1 + c, sc2), TSIZE(x.t) + y.ps, s_append(ctx, x.pr, s_rev_onto(ctx, isf, ipr)),
+                       y.m, y.sf);
+    if (flat2 && c + sc2 <= MAXD)
+      return rope_deep(ctx, MK(n, pc1, c + sc2), x.ps, x.pr, x.m, s_append(ctx, y.sf, s_rev_onto(ctx, ipr, isf)));
+    if (c < 2) {
+      // a single chunk between two sides that can't take it: the right side
+      // gets a prefix again, from its middle or its suffix
+      a = rope_deep(ctx, x.t + (d << 8), x.ps, x.pr, x.m, isf);
+      b = rope_build(ctx, TSIZE(y.t) - d, 0, 0, LF.snil, y.m, sc2, y.sf);
       continue;
     }
-    StgInt pc1 = TPC(x.t), sc1 = TSC(x.t), pc2 = TPC(y.t), sc2 = TSC(y.t);
-    StgInt n = TSIZE(x.t) + TSIZE(y.t), c = sc1 + pc2;
-    if (LTAG(x.m) != 2 && pc1 + c <= MAXD)
-      return rope_deep(ctx, MK(n, pc1 + c, sc2), TSIZE(x.t) + y.ps, s_append(ctx, x.pr, s_rev_onto(ctx, x.sf, y.pr)),
-                       y.m, y.sf);
-    if (LTAG(y.m) != 2 && c + sc2 <= MAXD)
-      return rope_deep(ctx, MK(n, pc1, c + sc2), x.ps, x.pr, x.m, s_append(ctx, y.sf, s_rev_onto(ctx, y.pr, x.sf)));
     // the left suffix (back to front) and the right prefix, as nodes of eight
     // while that leaves none or at least two for the next (packChunks)
     StgClosure *items[2 * MAXD], *out[3];
     StgInt at = sc1, no = 0;
-    for (StgClosure *p = x.sf; IS_CONS(p); p = TAIL(p)) items[--at] = HEAD(p);
-    s_items(y.pr, items + sc1);
+    for (StgClosure *p = isf; IS_CONS(p); p = TAIL(p)) items[--at] = HEAD(p);
+    s_items(ipr, items + sc1);
     for (StgInt done = 0; done < c;) {
       StgInt left = c - done, k = left <= 8 ? left : left == 9 ? 5 : 8, sz = 0;
       for (StgInt j = 0; j < k; j++) sz += chunk_size(items[done + j]);

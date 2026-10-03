@@ -131,7 +131,8 @@ than deleting it.
 
 - **Native `Text` operations.** (Size, `++`, take, drop and equality were done in M6 step
   5b; what is left is in "More of `Text` natively" below. The rest of this entry is the
-  original note.) Text-heavy code bounces through the trampoline on every
+  original note, and the rope it describes was replaced by a finger tree on 2026-10-02:
+  see "The rope itself" below.) Text-heavy code bounces through the trampoline on every
   `Text.++`, `Text.size`, `Int.toText` and so on, and each bounce also unwinds every native
   caller above it, which makes their `let` re-entry points hot (`Duration.toText` has about 40
   call-out continuations, nearly all for `Int.toText` and `++`). A Unison `Text` is a
@@ -165,13 +166,52 @@ than deleting it.
   2026-09-30 after M4.
 
 - **`Bytes` operations.** `Bytes` is the same rope as `Text` (`Unison.Util.Rope`, chunks of
-  byte arrays), so the text helpers of M6 step 5b carry over almost unchanged: size, append,
-  take, drop, `at`, equality. Not done in M6 (Paul, 2026-10-01: note it for later).
+  byte arrays), so the text helpers carry over almost unchanged: size, append, take, drop,
+  `at`, equality. Not done in M6 (Paul, 2026-10-01: note it for later). It is the next
+  piece of work after the rope's replacement (Paul, 2026-10-02). The C functions for the
+  rope's top level read a chunk's size and cut and join chunks through a handful of small
+  functions (`chunk_size`, `chunk_take`, `chunk_drop`, `chunk_join`); a `Bytes` chunk is
+  `Chunk offset size array`, so the port is those four plus the wrapper (`WrapBytes`).
 - **More of `Text` natively.** Done in M6: size, `++`, take, drop, equality. Left as
   call-outs: `Nat.toText` and `Int.toText` (a C helper that formats into a fresh byte
   array), `uncons`/`unsnoc`, comparison (`<=`, `<`), `indexOf`, and everything that is a
   foreign function rather than a primitive. The exit counts of a text-heavy program say
-  which to do next.
+  which to do next. Since the rope became a finger tree the first and last chunks are the
+  heads of two lists at the top of the structure, so `uncons`, `unsnoc` and a character
+  lookup are a few loads and one small allocation, and `rope_chunk_at` (used by equality)
+  already finds the chunk holding a position.
+- **The rope itself** (`Unison.Util.Rope`, a finger tree of chunks since 2026-10-02;
+  numbers in the progress log):
+  - *`Json.toText` is 20% slower than on the old rope and the cause is not found* (the
+    progress log has what was tried). Worth one more look at the interpreter's `catt`
+    path: the same `"[" ++ x ++ "]"` is three times faster through the C helper.
+  - *Appending two large texts is slower than it was.* The size-balanced tree it replaced
+    made one node when the two sides were within a factor of two of each other (20 to 30
+    ns); the finger tree packs the inner digits into nodes at every level (150 to 290 ns
+    when both sides have a middle, which takes more than about 20 chunks each). It is the
+    Deque's append, so whatever makes that cheaper (see "The list structure itself") helps
+    here too. A text built by appending short pieces doesn't go through this path.
+  - *A chunk with room to grow.* Appending a short piece to a text copies the last chunk
+    into a new array each time (up to the threshold's worth of characters). A last chunk
+    with spare capacity that the next append writes into, as a string builder does, would
+    make it one small copy. A persistent structure needs to know that nobody else has
+    appended to the same array (an owner's fill mark, checked and advanced atomically), so
+    this is a design of its own.
+  - *Characters of one byte.* A chunk whose character count equals its byte length is
+    all ASCII, and indexing, taking and dropping in it need no scan. `Data.Text`'s
+    operations don't know that; the chunk instances in `Unison.Util.Text` and the C
+    helpers (`utf8_prefix`) could check it. Chunks loaded from a literal are up to 512
+    characters, and the scan is most of `Text.at`, `take` and `drop` on them.
+  - `take` and `drop` build the part of the rope before the cut and then `snoc` the cut
+    chunk's piece, which allocates the top level twice. Building it once would take the
+    10 to 20% they trail the old rope by on texts of short chunks.
+  - Equality and comparison in Haskell go through lazy lists of chunks (as before), and in
+    C find each next chunk by its position, which costs a walk down per chunk. A cursor
+    that remembers where it is would make both a single pass.
+  - The threshold (64) was chosen from 16, 32, 64 and 128 on the rope benchmark: 64 and
+    128 halve the cost of walking and comparing against 32 and cost nothing when building;
+    128 makes appending pieces of 40 characters and indexing short-chunk texts slower.
+  - Any change here has to be made in the C helpers too (see the progress log).
 - **What is left of lists.** Every list primitive is native since 2026-10-02 (the C
   helpers are ports of `Unison.Util.Deque`). What still leaves native code or costs more
   than it should:
@@ -204,6 +244,10 @@ than deleting it.
     `|>` no longer fusing with something. A profile of that one benchmark is the place to
     start. `List.range` per element (42 ns to 102 ns, a very large list built in one go)
     is in the same position.
+  - The rope's append chooses which side's digit to copy when both sides have no middle
+    (the shorter one); `Deque.append` always extends the left prefix, so `acc ++ [x, y]`
+    on a list of up to twenty elements copies `acc`'s cells. The same choice is a few
+    lines there and in `lv_append`.
   - *Where it trails `Data.Sequence`:* `append` of two large pieces (1.5 to 1.8 times),
     `drop` (1.1 to 1.3), `fromList` of a long list (3 times; it is a fold of `snoc`, and
     the bulk `fromListN` measured no faster for a reason not yet found). Append and drop

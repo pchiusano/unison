@@ -18,6 +18,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | M4: call-outs and function values | done 2026-09-30. Call-outs with native re-entry (also inside inline bindings), native closure calls, `Ref` and mutable arrays, universal comparison on unboxed values, combinators as constants. Whole suite faster than the interpreter (4× to 210×); debug-runtime checks pass. See [jit-m4.md](jit-m4.md) |
 | M6: real programs | done 2026-10-02 ([jit-m6.md](jit-m6.md) has every step with what was done). Part 1: no `suite` entry more than 10% slower in steady state. Workers: `fib 20` 41 µs. Lists are a strict structure now, with native list, text and partial-application operations: `List.map` 0.43×, `List.foldLeft` 0.30×, `List.at` 0.20× of the interpreter, the text benchmarks 2.7× and 3.3× faster. Left for later: `Bytes` |
 | After M6: lists on a strict finger tree (`Unison.Util.Deque`) | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
+| After M6: text on the same finger tree (`Unison.Util.Rope`) | done 2026-10-02. The rope of chunks behind `Text` and `Bytes` is the Deque's finger tree with chunks for elements (it shares the Deque's code below the top level); the C text helpers are ports of it. Building a text piece by piece 3 to 4× faster, walking it by character 2×; `jitSuite`'s text appends 556 µs to 311 µs with the JIT. See "The text representation" below |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -678,6 +679,95 @@ At 10,000 elements: snoc 7.5 ns, uncons 5.3 ns, lookup 32 ns, append 172 ns
 (`Data.Sequence`: 10.3, 11.5, 96, 95; the old Deque: 14.8, 10.2, 50, 384). Left for later:
 `append` of two large pieces, `drop`, and `fromList` of a long list (see the ideas).
 
+## The text representation: `Unison.Util.Rope` (2026-10-02)
+
+A Unison `Text` is a `Unison.Util.Rope` of chunks (`Unison.Util.Text.Chunk`: a character
+count and a `Data.Text`, so a UTF-8 byte array, offset and length), held as
+`Foreign (WrapText rope)`; `Bytes` is the same rope over chunks of byte arrays. Since
+2026-10-02 the rope is the Deque's finger tree with chunks for elements and sizes counted in
+characters: a top level of chunks (`Empty`, `One chunk`, or `Deep` with a prefix and a
+suffix of up to ten chunks) over the Deque's own middle, imported from
+`Unison.Util.Deque.Internal` (the Deque's implementation moved there, and the public
+`Unison.Util.Deque` re-exports it). It was written as `Rope2` beside the size-balanced
+binary tree it replaced, took over when the benchmark favoured it, and took the name when
+the old one was deleted (Paul's plan, 2026-10-02: "get it working as Rope2, do some
+benchmarks, and then assuming it works great, swap it in"). The old rope is in the branch's
+history (commit 02fdeb7f2 is the last with both).
+
+- The invariants: no chunk is empty; a rope of one chunk is `One`; both digits of a `Deep`
+  hold a chunk; two chunks next to each other hold more than `threshold` (64) characters
+  between them. The last one bounds the number of chunks by the text's length, whatever
+  the text went through: cutting a chunk joins the piece to its neighbour if the two are
+  small, and so does appending.
+- What it gives: O(1) size; amortized O(1) cons, snoc, uncons and unsnoc of a chunk, which
+  is what appending a short piece and `Text.uncons` do; O(log n) index, take, drop and
+  append, close to O(1) near either end. The old rope's cons and snoc walked a spine, and
+  its depth was logarithmic only by convention (the pattern matcher's `appendUnbalanced`
+  added a level per call; it is gone).
+- Tests: `stack build --fast --flag unison-runtime:jit --test unison-util-rope` runs the
+  rope's tests (against a string model, with `valid` checking the invariants after every
+  step, and a random-operation test) with the Deque's. The `Unison.Util.Text` tests in
+  `parser-typechecker` still pass, depth checks included.
+- Benchmark: `stack bench --work-dir .stack-work-opt --flag unison-runtime:jit unison-util-rope:bench:rope`
+  (about 4 minutes; `--ba "--csv FILE"`). It goes through a record of the operations so
+  that another implementation can be put beside it, as the old rope was.
+- The C text helpers (`unison_jit_text_*`) are ports of the top level and call the list
+  helpers' functions for the levels below (`lv_cons`, `mid_take`, `lv_append`, ... with
+  `top = 0`). The startup check learns the constructors from samples, checks a set of texts
+  of many shapes, and runs each helper against the Haskell operation (about 6 ms on the
+  optimized build); `UNISON_JIT_STRESS=texts=N` is the random test, like `lists=N` (200,000
+  steps take about 15 s). Two planted bugs (a seam not joined; a wrong size after a cut in
+  the middle) were caught by the ordinary startup check.
+- `Rope.threshold` is handed to the C side at startup, so the two can't disagree on it.
+
+Time per operation against the old rope (below 1: the new one is faster), on chunks of
+`Data.Text` like `Unison.Util.Text`'s, optimized build, threshold 64, 2026-10-02. "Loaded"
+texts are in chunks of 512 characters, as `Text.fromText` makes them; "built" ones were
+made by appending three characters at a time.
+
+| Operation | n = 20 | n = 1000 | n = 100,000 | n = 1,000,000 |
+| --- | --- | --- | --- | --- |
+| snoc one character at a time | 0.68 | 0.42 | 0.29 | 0.26 |
+| cons one character at a time | 0.68 | 0.43 | 0.29 | 0.26 |
+| append a 3-character text | 0.63 | 0.43 | 0.31 | 0.28 |
+| append a 40-character text | 0.96 | 0.33 | 0.24 | 0.15 |
+| `Text.uncons` to the end (loaded / built) | 0.64 | 0.59 / 0.46 | 0.48 / 0.42 | 0.46 / 0.39 |
+| `Text.unsnoc` to the end | 0.77 | 1.00 | 0.81 | 0.72 |
+| drop 10 to the end | 0.64 | 0.64 | 0.53 | 0.49 |
+| index (loaded / built) | 1.03 | 1.10 / 0.84 | 1.02 / 0.81 | 1.01 / 0.83 |
+| take (loaded / built) | 0.63 | 0.73 / 0.70 | 0.96 / 0.94 | 0.97 / 1.06 |
+| drop (loaded / built) | 0.53 | 0.67 / 0.76 | 0.99 / 1.01 | 1.09 / 1.14 |
+| take and drop near the ends | 0.56 | 0.63 | 0.57 | 0.46 |
+| append two halves (loaded / built) | 0.69 | 0.40 / 2.05 | 6.8 / 8.8 | 14 / 11 |
+| `==`, `compare` | 1.00 | 0.51 | 0.54 | 0.52 |
+| uncons a chunk at a time | 0.92 | 0.11 | 0.06 | 0.05 |
+| the list of chunks | 0.87 | 0.58 | 0.70 | 0.72 |
+
+The one loss is appending two large texts to each other (see the ideas: the finger tree
+packs the inner digits into nodes at every level, where the old rope made one node); it is
+150 to 290 ns against 20 to 30, and a text built by appending short pieces never takes
+that path. Thresholds 16, 32, 64 and 128 were tried: 16 doubles the cost of walking and
+comparing, 128 makes appending 40-character pieces and indexing short-chunk texts slower,
+and 64 is as fast as 32 at building and half the cost at walking and comparing.
+
+In the runtime (`jitSuite`, interpreter / JIT): appending `"hi"` 10000 times 1.51 ms /
+556 µs before, 1.06 ms / 311 µs after; `Text.drop 1` 100000 times 11.9 ms / 3.56 ms
+before, 9.50 ms / 2.82 ms after. In `suite`, `Text.split` 0.87×, and `Json.toText` 1.2×
+slower (6.1 µs to 7.4 µs per document, interpreter and JIT alike). Everything else within
+3%. The `Json.toText` loss was chased with the pre-swap commit built in a worktree and a
+transcript that times its parts: every part (`literalForm`, `Text.join`, wrapping a text
+in brackets, walking by `uncons`) is as fast or faster on the new rope, and the Core of
+`Unison.Util.Text` shows the rope operations specialised to `Chunk`, yet whole documents
+are 15 to 20% slower whatever their shape (20 numbers, 20 strings, nested objects), and
+the threshold (32 or 64) makes no difference. One oddity is left: `"[" ++ x ++ "]"` on a
+50-character `x` takes 144 ns in the interpreter against 48 ns on the old rope, while the
+JIT's C helpers do it in 51 ns and the Haskell benchmark in 26 + 26 ns. Paul's view
+(2026-10-02): `Json.toText` should build its result as a single chunk through a builder
+anyway, so this is the library's to fix, not the rope's. The append of two multi-chunk
+texts was rewritten on the way (the seam is joined without rebuilding either side, and
+the shorter side's digit is the one copied); it didn't move `Json.toText`, but made the
+rope benchmark's appends 10 to 40% faster.
+
 ## Baseline: interpreter only
 
 Measured 2026-09-29 on the optimized build of branch `jit` (commit c5bcd5ae7, no JIT code yet),
@@ -864,3 +954,21 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   it). A reading several times that means a major GC or a first use of something else
   landed inside it: on the fast build the check's own parts added up to 40 ms of a
   reported 85 ms.
+- 2026-10-02: the rope under `Text` and `Bytes` became the Deque's finger tree (Paul asked
+  for a design, then "get it working as Rope2, do some benchmarks, and then assuming it
+  works great, swap it in"; threshold choices 16/32/64/128 to try; keep `One`; `Bytes`
+  natively later). See "The text representation". Things worth remembering: (1) the
+  Deque's implementation moved to `Unison.Util.Deque.Internal` so the rope could share it,
+  and that alone turned the JIT off on the fast build: the C startup check compared the
+  empty list with the sample `Sq.empty` by address, and a constructor without fields has
+  one static closure per top-level binding that is just that constructor (`empty = Nil`),
+  so which one a piece of code refers to is up to the compiler. Field-less constructors
+  are now compared by tag and info pointer (`same_con0`). **A transcript whose output
+  matches says nothing about whether the JIT was on; the log does.** (2) In `UNISON_JIT=on`
+  mode the startup checks run on the compile thread, so a long `texts=N` or `lists=N` run
+  may not finish before a short transcript does, and prints nothing; use `eager` for the
+  long tests. (3) `stack` ignores `lib/unison-util-rope/package.yaml` (the checked-in
+  cabal file was generated by a newer hpack), so a new module or benchmark has to be added
+  to the `.cabal` file by hand. (4) The first `suite` run after the swap read
+  `Value.deserializeCompressed` 20% slower; a rerun of that benchmark alone read the old
+  number. One run of `suite` is not evidence for a 20% change in a 20 ms benchmark.

@@ -502,28 +502,42 @@ append Empty b = b
 append a Empty = a
 append (One a) b = cons' (size a) a b
 append a (One c) = snoc' a (size c) c
-append (Deep t1 ps1 pr1 m1 sf1) b@(Deep t2 ps2 pr2 m2 sf2) = case sf1 of
+append (Deep t1 ps1 pr1 m1 sf1) (Deep t2 ps2 pr2 m2 sf2) = case sf1 of
   SCons l sf1'
-    | SCons f _ <- pr2,
-      !s <- size f,
-      size l + s <= threshold,
-      Just (_, b') <- uncons b ->
-        append (Deep (t1 + (s `unsafeShiftL` 8)) ps1 pr1 m1 (SCons (l <> f) sf1')) b'
-  _
-    | MNil <- m1,
-      pc1 + c <= maxD ->
-        Deep (mk n (pc1 + c) sc2) (tsize t1 + ps2) (appendS' pr1 (revOnto sf1 pr2)) m2 sf2
-    | MNil <- m2,
-      c + sc2 <= maxD ->
-        Deep (mk n pc1 (c + sc2)) ps1 pr1 m1 (appendS' sf2 (revOnto pr2 sf1))
-    | otherwise ->
-        let !sns = (tsize t1 - ps1 - sizeM m1) + ps2
-         in Deep (mk n pc1 sc2) ps1 pr1 (appM m1 sns (packChunks c (revOnto sf1 pr2)) m2) sf2
+    | SCons f pr2' <- pr2,
+      size l + size f <= threshold ->
+        -- the two chunks that meet become one, the last of the left side
+        inner (SCons (l <> f) sf1') pr2' (tpc t2 - 1) (size f)
+  _ -> inner sf1 pr2 (tpc t2) 0
   where
     !n = tsize t1 + tsize t2
     !pc1 = tpc t1
+    !sc1 = tsc t1
     !sc2 = tsc t2
-    !c = tsc t1 + tpc t2
+    flat MNil = True
+    flat _ = False
+    -- isf: the left side's suffix; ipr: the ipc chunks of the right side's
+    -- prefix that are still its own (d characters of it went to the left).
+    -- The digits that end up inside join the outer digit of a side that has
+    -- no middle, if they fit there (the shorter side's, if they fit in
+    -- either: that copies fewer cells), or are packed into nodes and handed
+    -- down between the two middles.
+    inner isf ipr !ipc !d
+      | flat m1, pc1 + c <= maxD, not (flat m2 && c + sc2 <= maxD && sc2 + ipc < pc1 + sc1) =
+          Deep (mk n (pc1 + c) sc2) (tsize t1 + ps2) (appendS' pr1 (revOnto isf ipr)) m2 sf2
+      | flat m2, c + sc2 <= maxD =
+          Deep (mk n pc1 (c + sc2)) ps1 pr1 m1 (appendS' sf2 (revOnto ipr isf))
+      | c >= 2 =
+          let !sns = (tsize t1 - ps1 - sizeM m1) + ps2
+           in Deep (mk n pc1 sc2) ps1 pr1 (appM m1 sns (packChunks c (revOnto isf ipr)) m2) sf2
+      | otherwise =
+          -- a single chunk between two sides that can't take it: the right
+          -- side gets a prefix again, from its middle or its suffix
+          append
+            (Deep (t1 + (d `unsafeShiftL` 8)) ps1 pr1 m1 isf)
+            (build (tsize t2 - d) 0 0 SNil m2 sc2 sf2)
+      where
+        !c = sc1 + ipc
 {-# INLINEABLE append #-}
 
 appendS' :: SList a -> SList a -> SList a

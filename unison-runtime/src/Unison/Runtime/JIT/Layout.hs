@@ -409,7 +409,7 @@ probeTexts ls steps = do
             put arr 0 (wrap t)
             shape <- textCheck arr
             size <- textTest arr 3 0
-            cuts <- forM ([-1 .. min n 70] ++ [(n * j) `div` 23 | j <- [1 .. 22], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
+            cuts <- forM ([-1 .. min n (if n > 600 then 12 else 70)] ++ [(n * j) `div` 13 | j <- [1 .. 12], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
               put arr 0 (wrap t)
               h1 <- textTest arr 1 k
               r1 <- result
@@ -498,17 +498,20 @@ probeTexts ls steps = do
                         b <- same t e
                         c <- if n > 0 then same t (UText.take (n - 1) t <> piece 9) else pure True
                         pure (if a && b && c then Just t else Nothing)
-                    | op == 10 -> times (r 6 `mod` 100) (\x -> cat (n <= 300) x (piece 9)) t
-                    | op == 11 -> times (r 6 `mod` 100) (\x -> cat (n <= 300) (piece 9) x) t
-                    | op == 12 -> times (r 6 `mod` 100) (cut (n <= 300) False 1) t
-                    | otherwise -> times (r 6 `mod` 100) (\x -> cut (n <= 300) True (UText.size x - 1) x) t
+                    | op == 10 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) x (piece 9)) t
+                    | op == 11 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) (piece 9) x) t
+                    | op == 12 -> times (r 6 `mod` 40) (cut (n <= 300) False 1) t
+                    | otherwise -> times (r 6 `mod` 40) (\x -> cut (n <= 300) True (UText.size x - 1) x) t
                 case res of
                   Nothing -> pure (Left ("the text helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a text of " ++ show n ++ " characters)"))
                   Just t' -> stress (step + 1) (take i pool ++ [t'] ++ drop (i + 1) pool)
       e1 <- concat <$> mapM one samples
       -- equal texts cut into chunks differently must compare equal
       let recut t = UText.take 3 t <> UText.drop 3 t
-      e2 <- concat <$> sequence ([two a b | a <- samples, b <- samples] ++ [two t (recut t) | t <- samples])
+          -- (sized to cost little at every startup, like the list checks;
+          -- the thorough test is the longer one)
+          some = [t | (j, t) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
+      e2 <- concat <$> sequence ([two a b | a <- some, b <- some] ++ [two t (recut t) | t <- samples])
       case e1 ++ e2 of
         e : _ -> pure (Left e)
         [] -> if steps > 0 then stress 0 (replicate 8 UText.empty) else pure (Right ())

@@ -252,6 +252,10 @@ without statistics. Fixed in step 0.
   interpreted, 1.08 ms with the JIT before, 548 µs now. `Text.drop 1` 100000 times:
   11.7 ms, 9.19 ms, 3.54 ms. `Nat.toText`, `uncons`, comparison and the foreign functions
   are still call-outs (ideas).
+  *After M6* (2026-10-02): the rope became a finger tree of chunks built on the Deque's
+  (written as `Rope2`, then renamed `Unison.Util.Rope` when it took over), and the text
+  helpers were ported to it. Details and numbers are in the progress log ("The text
+  representation").
 - [x] **6. Calls to ability handlers.** `App (Dyn i)` finds the handler in the dynamic
   environment, which lives in the interpreter's `HEnv`. **Measured first, and not built:**
   a handler's function begins with `RMatch` on the request, and then either `Capture`s the
