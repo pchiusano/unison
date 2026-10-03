@@ -839,6 +839,17 @@ run).
   false -p true`) and `PAGER=cat`, else it stalls. The worktree `/Users/pchiusano/unison-old`
   holds commit 45cabf81b with an optimized build (`.stack-work-opt`) for bisecting. The Bytes
   tests print `Bytes.at` through a `match` (`byteAt`) to stay clear of it.
+  It is not GC timing (2026-10-03): the outcome is deterministic, and stays the same with
+  nursery sizes of 64k, 100k, 337k, 1m and 16m (`+RTS -A...`), which move every collection
+  point: the `None` watch crashes under all of them and the `Some 255` watch passes under
+  all of them. What separates the values: the passing `Some 255` is built entirely during
+  the call-out from a fresh Nat, while each failing value is, or contains, a closure that
+  existed before the call-out (`noneClo` is a static constant in `Foreign/Function.hs`; the
+  list element and the literal's text were made earlier). Next places to look: what the
+  yield path does with the slot the interpreter wrote with `bpoke` (which leaves the
+  unboxed half of the slot untouched), and how the decompiler ends up holding a null
+  closure pointer for exactly those shapes. Matching on the `Optional` natively is fine;
+  only handing it back to the interpreter as the result fails.
 
 ## Baseline: interpreter only
 
