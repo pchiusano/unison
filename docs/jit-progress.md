@@ -845,10 +845,11 @@ run).
   all of them. What separates the values: the passing `Some 255` is built entirely during
   the call-out from a fresh Nat, while each failing value is, or contains, a closure that
   existed before the call-out (`noneClo` is a static constant in `Foreign/Function.hs`; the
-  list element and the literal's text were made earlier). Next places to look: what the
-  yield path does with the slot the interpreter wrote with `bpoke` (which leaves the
-  unboxed half of the slot untouched), and how the decompiler ends up holding a null
-  closure pointer for exactly those shapes. Matching on the `Optional` natively is fine;
+  list element and the literal's text were made earlier). Next place to look: how the
+  decompiler ends up holding a null closure pointer for exactly those shapes. (The
+  interpreter's `bpoke` leaves the unboxed half of a slot stale; Paul, 2026-10-03: that is
+  fine and expected, stale unboxed words get overwritten, it is only stale boxed values
+  that must not be left behind, since they retain garbage. Not a lead.) Matching on the `Optional` natively is fine;
   only handing it back to the interpreter as the result fails.
   A correction and a clue (2026-10-03, from IR dumps): in this program no compiled code
   packs a `None`, so the pool has no `None` constant and the native `List.at`/`Bytes.at`
