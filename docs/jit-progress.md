@@ -850,6 +850,15 @@ run).
   unboxed half of the slot untouched), and how the decompiler ends up holding a null
   closure pointer for exactly those shapes. Matching on the `Optional` natively is fine;
   only handing it back to the interpreter as the result fails.
+  A correction and a clue (2026-10-03, from IR dumps): in this program no compiled code
+  packs a `None`, so the pool has no `None` constant and the native `List.at`/`Bytes.at`
+  cases (which need one) fall back to the call-out. The `(List.at 6 [1, 2, 3], 1)` watch
+  therefore takes the interpreter's `None` whether the list helpers are on or off, yet it
+  passes with them on and crashes with them off: the one difference is whether the
+  `[1, 2, 3]` literal before the index was built natively or by an interpreter call-out.
+  So the trigger isn't the `None` alone; the call-outs that came before it in the frame
+  matter. `> Bytes.at 0 0xs` (the literal is a call-out, then the index) crashes;
+  `> Bytes.at 0 0xsdeadbeef` prints `Some 222`.
 
 ## Baseline: interpreter only
 
