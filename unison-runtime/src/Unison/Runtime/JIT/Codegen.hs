@@ -2820,9 +2820,10 @@ packFields fe d args = case args of
   _ -> Just (argSources fe d args)
 
 -- | Branches to @slow@ if any of the boxed values is an untagged pointer.
--- The interpreter can leave one in a stack slot: a CAF such as @noneClo@
--- (GHC drops the force in @bpoke@ for a constructor application) or a
--- lazily built result, both unevaluated thunks. Native code must not copy
+-- The interpreter can leave one in a stack slot: a top-level constant such
+-- as @noneClo@ stored as itself puts the static closure's address there,
+-- which is untagged whether or not the CAF has been forced (the bang in
+-- @bpoke@ evaluates it but stores the same pointer). Native code must not copy
 -- such a pointer into a strict field (a @Val@'s, a constructor's), because
 -- GHC's optimized code reads a strict field without evaluating it and
 -- would take the thunk's words for the constructor's fields. Reads through

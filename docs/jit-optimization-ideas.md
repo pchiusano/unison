@@ -169,12 +169,25 @@ than deleting it.
   (2026-10-03; see the progress log, "A fixed crash: untagged pointers in strict fields"):
   make the interpreter guarantee that a boxed stack slot only ever holds an evaluated, tagged
   pointer, instead of (or as well as) native code checking the tag on every store into a
-  strict field. The hazard funnels through `bpoke`, `bpokeOff` and `poke` in `Stack.hs`; the
-  two sources seen were a CAF constant stored as itself (`noneClo`: `bpoke`'s bang doesn't
-  help, GHC treats a constructor application's CAF as already in WHNF and drops the `seq`)
-  and a lazily built value (`someClo (encodeVal v)` in `writeBack`). The force has to be one
-  GHC can't reason away, `evaluate` (`seq#`) in `bpoke`, or constants that are genuinely
-  static. Cost: a tag test and an untaken branch per boxed store, to be measured on the
+  strict field. The hazard funnels through `bpoke`, `bpokeOff` and `poke` in `Stack.hs`. The
+  one source found is a top-level constant poked as itself: `writeBack stk Nothing = bpoke
+  stk noneClo`. The bang on `bpoke`'s argument can't help there, because what the slot
+  receives is the address of the static closure (`THUNK_STATIC`, then `IND_STATIC` once the
+  CAF has been forced), and that address is untagged forever, whether or not the CAF has
+  been evaluated. So the untagged pointer appears on *every* store of such a constant, not
+  just the first; `requireTagged` is cheap because native code rarely stores one, not
+  because it happens once. (An earlier write-up also blamed a lazily built `Some`,
+  `someClo (encodeVal v)`; that was an inference, not observed, and it is wrong: the bang
+  forces the application to WHNF and the slot gets the evaluated, tagged `Data1`, or, if
+  GHC inlines `someClo`, a fresh constructor, which is always tagged, with its strict `Val`
+  field evaluated too. The log agrees: `Bytes.at 0 0xsdeadbeef`, a `Some`, never crashed.)
+  The fix is correspondingly narrow: `evaluate` (`seq#`) in `bpoke` and friends, storing
+  its *result* rather than the pointer handed in (for a CAF that is the indirectee, a tagged
+  constructor), or constants that are genuinely static, which would need `Ty.optionalRef`
+  and the other references they mention to be literals rather than computed `Reference`s.
+  Either way, grep the `bpoke`, `bpokeOff` and `poke` call sites for other top-level
+  `Closure` constants stored directly; `noneClo` is only the one that was hit. Cost of the
+  `evaluate` route: a tag test and an untaken branch per boxed store, to be measured on the
   suite; it may even help the interpreter, since nothing downstream enters a thunk on read.
   What it buys: a real invariant that is simpler than "every native write checks", covers
   places not instrumented, and makes the read-side guard in `genDMatchClosure` stop costing

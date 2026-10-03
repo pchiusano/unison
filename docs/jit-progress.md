@@ -901,10 +901,16 @@ from an interpreter call-out segfaulted in the GC. Minimal reproductions were
 was matching on the `Optional` natively. The fast build, the `-O0` debug build and
 `UNISON_JIT=on` never crashed, and nursery sizes from 64k to 16m changed nothing.
 
-- **Cause.** The interpreter can leave an *unevaluated, untagged* pointer in a boxed stack
-  slot: `writeBack stk Nothing = bpoke stk noneClo` stores the `noneClo` CAF itself (GHC
-  drops `bpoke`'s force because the CAF's unfolding is a constructor application), and a
-  `Some` built by `writeBack` is a lazy thunk. The interpreter is fine with that, since
+- **Cause.** The interpreter can leave an *untagged* pointer in a boxed stack slot:
+  `writeBack stk Nothing = bpoke stk noneClo` stores the address of the `noneClo` CAF
+  itself. The bang on `bpoke`'s argument forces the CAF but doesn't change what is stored:
+  the slot receives the static closure's address (`THUNK_STATIC`, `IND_STATIC` after the
+  first force), which is untagged whether or not the CAF has been evaluated, so this happens
+  on every store of such a constant, not only the first. (A `Some` from `writeBack` is
+  *not* a source, contrary to an earlier version of this note, which inferred it rather than
+  observing it: `someClo (encodeVal v)` is forced to WHNF by the bang and the slot gets the
+  tagged `Data1`, with its strict `Val` field evaluated; `Bytes.at 0 0xsdeadbeef` was
+  fine throughout.) The interpreter is fine with the untagged pointer, since
   Haskell evaluates what it reads from the array. Native code isn't: the transcript's watch
   wrapper packs the result into a pair with `Pack`, which copied the raw pointer into the
   pair's strict `Val` field. GHC's optimized code assumes a strict field holds an evaluated,
