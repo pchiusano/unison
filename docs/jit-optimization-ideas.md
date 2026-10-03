@@ -183,23 +183,18 @@ than deleting it.
   `bpoke` change, confirm they pass, re-enable the checks as a cheap safety net (a violation
   is silent heap corruption found two GCs later), and measure both the interpreter and
   `jitSuite`.
-- **`Bytes` operations.** Done 2026-10-02: the C rope functions take a `RopeKind`, and
-  `Bytes.size`, `++`, `take`, `drop`, `at` and `flatten` are native, as is universal `==`
-  on two texts or two bytes (see the progress log, "The bytes helpers"). Left as
-  call-outs: `indexOf` (a search over the chunks, with the needle usually one chunk),
-  `fromList`/`toList` (a walk of a list of Nats into a fresh array, and back), the
-  `encodeNat*`/`decodeNat*`/`index*` foreign functions (a few bytes read at a position:
-  `rope_chunk_at` finds them, with a copy only when they straddle two chunks), and
-  comparison. The exit counts of a bytes-heavy program (a parser, a hash) say which first.
-- **More of `Text` natively.** Done in M6: size, `++`, take, drop, equality. Left as
-  call-outs: `Nat.toText` and `Int.toText` (a C helper that formats into a fresh byte
-  array), `uncons`/`unsnoc`, comparison (`<=`, `<`), `indexOf`, and everything that is a
-  foreign function rather than a primitive. Universal `==` on two texts is native since
-  2026-10-02 (with the bytes work); universal `<`, `<=` and `compare` on texts aren't. The
-  exit counts of a text-heavy program say which to do next. Since the rope became a finger tree the first and last chunks are the
-  heads of two lists at the top of the structure, so `uncons`, `unsnoc` and a character
-  lookup are a few loads and one small allocation, and `rope_chunk_at` (used by equality)
-  already finds the chunk holding a position.
+- **`Bytes` operations.** Done 2026-10-02 and 2026-10-03: every Bytes primitive and the
+  pure foreign functions are native (see the progress log, "The rest of Text and Bytes").
+  Left as call-outs: the compression functions (`zlib`, `gzip`, `zstd`: library-bound; a C
+  port would mean linking those libraries into the runtime's C side), and the exceptions and
+  error messages, which the interpreter raises on the slow path.
+- **More of `Text` natively.** Done 2026-10-03: every Text primitive and the pure foreign
+  functions are native; see the progress log. Left as call-outs: the Text patterns
+  (`Text.patterns.*` build pattern values that `Pattern.run`/`isMatch` interpret in Haskell;
+  Paul, 2026-10-03: skip for now), `Link.toText` (hashing), `toUppercase`/`toLowercase` of
+  non-ASCII text (Unicode case mapping tables), and the forms of `Int.fromText` and friends
+  that the Haskell lexer reads beyond sign and digits (hex, spaces, "NaN"). The ASCII-only
+  case mapping could be widened with a table for the common scripts if a program needs it.
 - **The rope itself** (`Unison.Util.Rope`, a finger tree of chunks since 2026-10-02;
   numbers in the progress log):
   - *`Json.toText` is 20% slower than on the old rope and the cause is not found* (the

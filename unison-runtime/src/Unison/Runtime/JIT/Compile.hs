@@ -41,7 +41,7 @@ import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Reference (Reference)
 import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..))
 import Unison.Runtime.TypeTags qualified as TT
-import Unison.Builtin.Decls qualified as Ty (optionalRef, seqViewRef, unitRef)
+import Unison.Builtin.Decls qualified as Ty (eitherRef, optionalRef, pairRef, seqViewRef, unitRef)
 import Unison.Runtime.MCode
 import Unison.Runtime.Machine.Types (MCombs, MSection)
 import Unison.Runtime.Stack (Val (..))
@@ -89,6 +89,10 @@ poolKeysOf s =
            n < arity
        ]
   where
+    -- the constructors the text and bytes helpers build results from
+    none = KeyEnum Ty.optionalRef TT.noneTag
+    pair = KeyEnum Ty.pairRef (PackedTag 0)
+    unit = KeyEnum Ty.unitRef TT.unitTag
     -- a known combinator used as a value, or a top-level value
     combKey = \case
       Env cix comb
@@ -115,7 +119,18 @@ poolKeysOf s =
       -- the list helpers are handed the result type's field-less constructor
       Prim1 VWLS _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       Prim1 VWRS _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
-      Prim2 IDXS _ _ -> [KeyEnum Ty.optionalRef TT.noneTag]
+      Prim2 IDXS _ _ -> [none]
+      Prim2 IDXB _ _ -> [none]
+      Prim2 IXOT _ _ -> [none]
+      Prim2 IXOB _ _ -> [none]
+      Prim1 UCNS _ -> [none, pair, unit]
+      Prim1 USNC _ -> [none, pair, unit]
+      Prim1 TTOI _ -> [none]
+      Prim1 TTON _ -> [none]
+      Prim1 TTOF _ -> [none]
+      ForeignCall _ f _
+        | f `elem` [Bytes_decodeNat16be, Bytes_decodeNat16le, Bytes_decodeNat32be, Bytes_decodeNat32le, Bytes_decodeNat64be, Bytes_decodeNat64le] -> [none, pair, unit]
+        | f `elem` [Text_fromUtf8_impl_v3, Bytes_fromBase16, Bytes_fromBase32, Bytes_fromBase64, Bytes_fromBase64UrlUnpadded] -> [KeyEnum Ty.eitherRef (PackedTag 0)]
       Prim2 SPLL _ _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       Prim2 SPLR _ _ -> [KeyEnum Ty.seqViewRef TT.seqViewEmptyTag]
       -- a partial application of a known function starts from its closure

@@ -212,7 +212,7 @@ foreign import ccall unsafe "unison_jit_text_init" c_textInit :: MutableArray# R
 
 foreign import ccall unsafe "unison_jit_text_check" c_textCheck :: MutableArray# RealWorld Any -> IO Int64
 
-foreign import ccall unsafe "unison_jit_text_test" c_textTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> IO Int64
+foreign import ccall unsafe "unison_jit_text_test" c_textTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> Int64 -> IO Int64
 
 -- | The same three for the text helpers (see unison_jit_text_init and
 -- unison_jit_text_test). 'textTest' returns what the C function does.
@@ -224,14 +224,14 @@ textInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
 textCheck :: MutableArray RealWorld Any -> IO Bool
 textCheck (MutableArray arr#) = (== 1) <$> c_textCheck arr#
 
-textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
-textTest (MutableArray arr#) op a = fromIntegral <$> c_textTest arr# (fromIntegral op) (fromIntegral a)
+textTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+textTest (MutableArray arr#) op a b c = fromIntegral <$> c_textTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b) (fromIntegral c)
 
 foreign import ccall unsafe "unison_jit_bytes_init" c_bytesInit :: MutableArray# RealWorld Any -> Ptr Int64 -> IO Int64
 
 foreign import ccall unsafe "unison_jit_bytes_check" c_bytesCheck :: MutableArray# RealWorld Any -> IO Int64
 
-foreign import ccall unsafe "unison_jit_bytes_test" c_bytesTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> IO Int64
+foreign import ccall unsafe "unison_jit_bytes_test" c_bytesTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> Int64 -> IO Int64
 
 -- | And for the bytes helpers (see unison_jit_bytes_init and
 -- unison_jit_bytes_test).
@@ -243,8 +243,8 @@ bytesInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
 bytesCheck :: MutableArray RealWorld Any -> IO Bool
 bytesCheck (MutableArray arr#) = (== 1) <$> c_bytesCheck arr#
 
-bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> IO Int
-bytesTest (MutableArray arr#) op a b = fromIntegral <$> c_bytesTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b)
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+bytesTest (MutableArray arr#) op a b c = fromIntegral <$> c_bytesTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b) (fromIntegral c)
 
 foreign import ccall unsafe "unison_jit_closure_init" c_closureInit :: Ptr Int64 -> IO ()
 
@@ -305,8 +305,8 @@ textInit _ _ = pure 0
 textCheck :: MutableArray RealWorld Any -> IO Bool
 textCheck _ = pure False
 
-textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
-textTest _ _ _ = pure 0
+textTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+textTest _ _ _ _ _ = pure 0
 
 bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
 bytesInit _ _ = pure 0
@@ -314,8 +314,8 @@ bytesInit _ _ = pure 0
 bytesCheck :: MutableArray RealWorld Any -> IO Bool
 bytesCheck _ = pure False
 
-bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> IO Int
-bytesTest _ _ _ _ = pure 0
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+bytesTest _ _ _ _ _ = pure 0
 
 closureInit :: [Int] -> IO ()
 closureInit _ = pure ()

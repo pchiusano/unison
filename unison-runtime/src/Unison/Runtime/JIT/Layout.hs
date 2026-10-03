@@ -19,6 +19,9 @@ where
 import Control.Exception (evaluate)
 import Control.Monad (foldM, forM)
 import Data.Maybe (catMaybes, isJust)
+import Data.Word (Word64)
+import GHC.Float (castDoubleToWord64)
+import Text.Read (readMaybe)
 import Data.Bits (shiftR, xor, (.&.), (.|.))
 import Data.Primitive.Array (MutableArray, arrayFromList, newArray, readArray, writeArray)
 import Data.IORef (newIORef)
@@ -26,12 +29,13 @@ import Data.Primitive.ByteArray (byteArrayFromList)
 import Foreign.Ptr (IntPtr (..), ptrToIntPtr)
 import GHC.Exts (Any, RealWorld)
 import Unison.Runtime.ANF (PackedTag (..))
-import Unison.Builtin.Decls qualified as Ty (optionalRef, seqViewRef)
+import Unison.Builtin.Decls qualified as Ty (eitherRef, optionalRef, pairRef, seqViewRef, unitRef)
 import Unison.Runtime.JIT.Native (bytesCheck, bytesInit, bytesTest, closureInit, listCheck, listInit, listTest, nameTest, probeClosure, textCheck, textInit, textTest)
 import Unison.Runtime.MCode (CombIx (..), GCombInfo (..), GSection (..), noNativeCell)
 import Unison.Runtime.Stack
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
+import Data.Text qualified as Text
 import Unison.Util.Bytes qualified as By
 import Unison.Util.Deque qualified as Sq
 import Unison.Util.Rope qualified as Rope
@@ -377,6 +381,24 @@ probeTexts ls steps = do
       put a i v = evaluate v >>= writeArray a i
       !abc = UText.pack "abc"
       !first = wrap abc
+      same a b = BoxedVal a == BoxedVal b
+      PackedTag someTag = TT.someTag
+      PackedTag pairTag = TT.pairTag
+      PackedTag rightTag = TT.rightTag
+      !none = Enum Ty.optionalRef TT.noneTag
+      unitVal = BoxedVal (Enum Ty.unitRef TT.unitTag)
+      -- the pair (x, y) as the interpreter builds it
+      tup2 x y = Data2 Ty.pairRef TT.pairTag x (BoxedVal (Data2 Ty.pairRef TT.pairTag y unitVal))
+      some = Data1 Ty.optionalRef TT.someTag
+      textC = Foreign . WrapText
+      chars t = UText.toString t
+      -- readIntegral and readi of Machine/Primops.hs
+      readClamped :: forall n. (Bounded n, Integral n) => String -> Maybe n
+      readClamped str = case readMaybe str :: Maybe Integer of
+        Just i | i >= fromIntegral (minBound :: n), i <= fromIntegral (maxBound :: n) -> Just (fromInteger i)
+        _ -> Nothing
+      readI ('+' : str) = readClamped str :: Maybe Int
+      readI str = readClamped str
       -- two chunks with more characters than this between them stay two
       th = Rope.threshold
       pieces = ["", "a", "abc", "h\233llo w\246rld", "\8364\128512x\128512", "0123456789abcdef", replicate (th - 1) 'x', replicate th 'y', replicate (th + 1) 'z', concat (replicate 40 "\955x"), replicate 600 'q']
@@ -389,54 +411,158 @@ probeTexts ls steps = do
       big = UText.replicate 2000 (UText.pack "a\233")
       chunky = foldl (\acc i -> acc <> UText.pack (take (th `div` 2 + 1) (drop (i `mod` 7) (cycle "0123456789\955abcdefghij")))) mempty [1 .. 260 :: Int]
       samples = base ++ grown ++ grownL ++ [big, UText.drop 7 big, UText.take 1500 big, UText.drop 100 (grown !! 2), UText.take 400 (grownL !! 1), chunky, UText.drop 1000 chunky]
-  arr <- newArray 4 first :: IO (MutableArray RealWorld Any)
+  arr <- newArray 12 first :: IO (MutableArray RealWorld Any)
   put arr 1 (wrap (UText.pack (replicate (th + 1) 'a') <> UText.pack (replicate (th + 1) 'b')))
   put arr 2 (wrap UText.empty)
+  -- the constructors the helpers build results from (see rope_test)
+  put arr 4 (any' none)
+  put arr 5 (any' (Enum Ty.pairRef (PackedTag 0)))
+  put arr 6 (any' (Enum Ty.unitRef TT.unitTag))
+  put arr 7 (any' (Enum Ty.eitherRef (PackedTag 0)))
+  put arr 8 (any' charTypeTag)
+  put arr 9 (any' natTypeTag)
+  put arr 10 (any' intTypeTag)
+  put arr 11 (any' floatTypeTag)
   ok <- textInit arr [lForeignInfo ls, th, 0]
   if ok /= 1
     then pure (Left ("the text constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
     else do
-      let result :: IO (Maybe UText.Text)
+      let slot3 :: IO Closure
+          slot3 = unsafeCoerce <$> readArray arr 3
+          result :: IO (Maybe UText.Text)
           result = do
-            c <- unsafeCoerce <$> readArray arr 3 :: IO Closure
+            c <- slot3
             good <- do
               put arr 0 (any' c)
               textCheck arr
             pure $ case c of
               Foreign (WrapText t) | good -> Just t
               _ -> Nothing
+          -- a text inside a result: laid out right and the expected one
+          textIn :: Closure -> UText.Text -> IO Bool
+          textIn c expected = case c of
+            Foreign (WrapText t) | t == expected -> put arr 0 (any' c) >> textCheck arr
+            _ -> pure False
           one :: UText.Text -> IO [String]
           one t = do
             let n = UText.size t
             put arr 0 (wrap t)
             shape <- textCheck arr
-            size <- textTest arr 3 0
+            size <- textTest arr 3 0 0 0
             cuts <- forM ([-1 .. min n (if n > 600 then 12 else 70)] ++ [(n * j) `div` 13 | j <- [1 .. 12], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
               put arr 0 (wrap t)
-              h1 <- textTest arr 1 k
+              h1 <- textTest arr 1 k 0 0
               r1 <- result
               put arr 0 (wrap t)
-              h2 <- textTest arr 2 k
+              h2 <- textTest arr 2 k 0 0
               r2 <- result
               -- a negative count is a Nat too large to be a size
               let tk = if k < 0 then t else UText.take k t
                   dr = if k < 0 then UText.empty else UText.drop k t
               pure (h1 == 1 && r1 == Just tk && h2 == 1 && r2 == Just dr)
+            -- uncons and unsnoc: Some (c, rest) / Some (rest, c), the rest laid out right
+            uns <- forM [True, False] $ \front -> do
+              put arr 0 (wrap t)
+              h <- textTest arr (if front then 5 else 6) (fromIntegral someTag) (fromIntegral pairTag) 0
+              c <- slot3
+              let expected
+                    | front = maybe none (\(ch, rest) -> some (BoxedVal (tup2 (CharVal ch) (BoxedVal (textC rest))))) (UText.uncons t)
+                    | otherwise = maybe none (\(rest, ch) -> some (BoxedVal (tup2 (BoxedVal (textC rest)) (CharVal ch)))) (UText.unsnoc t)
+              restOk <- case c of
+                Data1 _ _ (BoxedVal (Data2 _ _ a (BoxedVal (Data2 _ _ b _))))
+                  | BoxedVal r <- if front then b else a -> put arr 0 (any' r) >> textCheck arr
+                _ -> pure (n == 0)
+              pure (h == 1 && same c expected && restOk)
+            -- the rest only on the smaller texts, to keep every startup cheap (the
+            -- random test covers the big ones): toCharList then fromCharList of
+            -- that, reverse, the case mappings (ASCII only), repeat
+            let small = n <= 1500
+            (hu, cu, charList) <-
+              if small
+                then do
+                  put arr 0 (wrap t)
+                  h <- textTest arr 14 0 0 0
+                  c <- slot3
+                  pure (h, c, Foreign (WrapSeq (Sq.fromList (map CharVal (chars t)))))
+                else pure (1, none, none)
+            (hp, rp) <-
+              if small
+                then do
+                  put arr 0 (any' charList)
+                  h <- textTest arr 13 0 0 0
+                  r <- result
+                  pure (h, r)
+                else pure (1, Just t)
+            (hr, rr) <-
+              if small
+                then do
+                  put arr 0 (wrap t)
+                  h <- textTest arr 18 0 0 0
+                  r <- result
+                  pure (h, r)
+                else pure (1, Just (UText.reverse t))
+            cases <- forM [(19, UText.toUppercase), (20, UText.toLowercase)] $ \(op, f) ->
+              if not small
+                then pure True
+                else do
+                  put arr 0 (wrap t)
+                  h <- textTest arr op 0 0 0
+                  r <- result
+                  pure (if h == 1 then r == Just (f t) else any (>= '\128') (chars t))
+            reps <- forM (if small then [0, 1, 2, 3, 7, 50] else [0, 1, 2]) $ \j -> do
+              put arr 0 (wrap t)
+              h <- textTest arr 17 j 0 0
+              r <- result
+              pure (h == 1 && r == Just (UText.replicate j t))
+            -- toUtf8, then fromUtf8 of that
+            put arr 0 (wrap t)
+            h8 <- textTest arr 21 0 0 0
+            c8 <- slot3
+            utf <- case c8 of
+              Foreign (WrapBytes bs) | h8 == 1, bs == UText.toUtf8 t -> do
+                put arr 0 (any' c8)
+                okB <- bytesCheck arr
+                put arr 0 (any' c8)
+                h9 <- textTest arr 22 (fromIntegral rightTag) 0 0
+                c9 <- slot3
+                okT <- case c9 of
+                  Data1 rf tg (BoxedVal inner) | rf == Ty.eitherRef, tg == TT.rightTag -> textIn inner t
+                  _ -> pure False
+                pure (okB && h9 == 1 && okT)
+              _ -> pure False
             pure . catMaybes $
               [ if shape then Nothing else Just "a text isn't laid out as expected",
                 if size == n then Nothing else Just "Text.size differs from the interpreter's",
-                if and cuts then Nothing else Just ("Text.take or Text.drop differs from the interpreter's on a text of " ++ show n ++ " characters")
+                if and cuts then Nothing else Just ("Text.take or Text.drop differs from the interpreter's on a text of " ++ show n ++ " characters"),
+                if and uns then Nothing else Just ("Text.uncons or Text.unsnoc differs from the interpreter's on a text of " ++ show n),
+                if hu == 1 && same cu charList then Nothing else Just ("Text.toCharList differs from the interpreter's on a text of " ++ show n),
+                if hp == 1 && rp == Just t then Nothing else Just ("Text.fromCharList differs from the interpreter's on a text of " ++ show n),
+                if hr == 1 && rr == Just (UText.reverse t) then Nothing else Just ("Text.reverse differs from the interpreter's on a text of " ++ show n),
+                if and cases then Nothing else Just ("Text.toUppercase or toLowercase differs from the interpreter's on a text of " ++ show n),
+                if and reps then Nothing else Just ("Text.repeat differs from the interpreter's on a text of " ++ show n),
+                if utf then Nothing else Just ("Text.toUtf8 or Text.fromUtf8 differs from the interpreter's on a text of " ++ show n)
               ]
           two :: UText.Text -> UText.Text -> IO [String]
           two a b = do
             put arr 0 (wrap a)
             put arr 1 (wrap b)
-            eq <- textTest arr 4 0
-            h <- textTest arr 0 0
+            eq <- textTest arr 4 0 0 0
+            h <- textTest arr 0 0 0 0
             r <- result
+            put arr 0 (wrap a)
+            put arr 1 (wrap b)
+            hi <- textTest arr 15 (fromIntegral someTag) 0 0
+            ci <- slot3
+            put arr 0 (wrap a)
+            put arr 1 (wrap b)
+            cm <- textTest arr 16 0 0 0
+            let expI = maybe none (some . NatVal) (UText.indexOf a b)
+                expC = case compare a b of LT -> -1; EQ -> 0; GT -> 1
             pure . catMaybes $
               [ if eq == (if a == b then 1 else 0) then Nothing else Just "Text equality differs from the interpreter's",
-                if h == 1 && r == Just (a <> b) then Nothing else Just ("Text.++ differs from the interpreter's on texts of " ++ show (UText.size a) ++ " and " ++ show (UText.size b) ++ " characters")
+                if h == 1 && r == Just (a <> b) then Nothing else Just ("Text.++ differs from the interpreter's on texts of " ++ show (UText.size a) ++ " and " ++ show (UText.size b) ++ " characters"),
+                if hi == 1 && same ci expI then Nothing else Just "Text.indexOf differs from the interpreter's",
+                if cm == expC then Nothing else Just "Text comparison differs from the interpreter's"
               ]
           -- the longer test: random operations on eight texts
           mix :: Int -> Int
@@ -459,7 +585,7 @@ probeTexts ls steps = do
                       0 -> r 4 `mod` 12
                       1 -> n - r 4 `mod` 12
                       _ -> r 4 `mod` (n + 2) - 1
-                    op = r 5 `mod` 14
+                    op = r 5 `mod` 18
                     piece k = UText.pack (take (r k `mod` (if even (r (k + 1)) then 7 else 90)) (drop (r (k + 2) `mod` 40) letters))
                     -- what a helper built, if it is laid out right and is the expected text
                     -- (the characters are compared when `whole`; the size always)
@@ -472,16 +598,16 @@ probeTexts ls steps = do
                     cat whole a b = do
                       put arr 0 (wrap a)
                       put arr 1 (wrap b)
-                      h <- textTest arr 0 0
+                      h <- textTest arr 0 0 0 0
                       verdict whole h (a <> b)
                     cut whole tk k x = do
                       put arr 0 (wrap x)
-                      h <- textTest arr (if tk then 1 else 2) k
+                      h <- textTest arr (if tk then 1 else 2) k 0 0
                       verdict whole h (if tk then (if k < 0 then x else UText.take k x) else (if k < 0 then UText.empty else UText.drop k x))
                     same a b = do
                       put arr 0 (wrap a)
                       put arr 1 (wrap b)
-                      eq <- textTest arr 4 0
+                      eq <- textTest arr 4 0 0 0
                       pure (eq == (if a == b then 1 else 0))
                     times :: Int -> (UText.Text -> IO (Maybe UText.Text)) -> UText.Text -> IO (Maybe UText.Text)
                     times 0 _ x = pure (Just x)
@@ -503,7 +629,47 @@ probeTexts ls steps = do
                     | op == 10 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) x (piece 9)) t
                     | op == 11 -> times (r 6 `mod` 40) (\x -> cat (n <= 300) (piece 9) x) t
                     | op == 12 -> times (r 6 `mod` 40) (cut (n <= 300) False 1) t
-                    | otherwise -> times (r 6 `mod` 40) (\x -> cut (n <= 300) True (UText.size x - 1) x) t
+                    | op == 13 -> times (r 6 `mod` 40) (\x -> cut (n <= 300) True (UText.size x - 1) x) t
+                    | op == 14 -> do
+                        put arr 0 (wrap t)
+                        h <- textTest arr 18 0 0 0
+                        verdict full h (UText.reverse t)
+                    | op == 15 -> do
+                        -- toCharList, then fromCharList
+                        put arr 0 (wrap t)
+                        h <- textTest arr 14 0 0 0
+                        c <- slot3
+                        case c of
+                          Foreign (WrapSeq _) | h == 1 -> do
+                            put arr 0 (any' c)
+                            h2 <- textTest arr 13 0 0 0
+                            verdict full h2 t
+                          _ -> pure Nothing
+                    | op == 16 -> do
+                        -- toUtf8, then fromUtf8
+                        put arr 0 (wrap t)
+                        h <- textTest arr 21 0 0 0
+                        c <- slot3
+                        case c of
+                          Foreign (WrapBytes _) | h == 1 -> do
+                            put arr 0 (any' c)
+                            h2 <- textTest arr 22 (fromIntegral rightTag) 0 0
+                            c2 <- slot3
+                            case c2 of
+                              Data1 _ _ (BoxedVal inner) | h2 == 1 -> put arr 3 (any' inner) >> verdict full 1 t
+                              _ -> pure Nothing
+                          _ -> pure Nothing
+                    | otherwise -> do
+                        -- uncons or unsnoc: the rest goes on
+                        let front = even (r 6)
+                        put arr 0 (wrap t)
+                        h <- textTest arr (if front then 5 else 6) (fromIntegral someTag) (fromIntegral pairTag) 0
+                        c <- slot3
+                        case c of
+                          Data1 _ _ (BoxedVal (Data2 _ _ a (BoxedVal (Data2 _ _ b _))))
+                            | h == 1, BoxedVal rest <- if front then b else a ->
+                                put arr 3 (any' rest) >> verdict full 1 (if front then UText.drop 1 t else UText.take (n - 1) t)
+                          _ -> pure (if n == 0 && h == 1 then Just t else Nothing)
                 case res of
                   Nothing -> pure (Left ("the text helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a text of " ++ show n ++ " characters)"))
                   Just t' -> stress (step + 1) (take i pool ++ [t'] ++ drop (i + 1) pool)
@@ -512,9 +678,53 @@ probeTexts ls steps = do
       let recut t = UText.take 3 t <> UText.drop 3 t
           -- (sized to cost little at every startup, like the list checks;
           -- the thorough test is the longer one)
-          some = [t | (j, t) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
-      e2 <- concat <$> sequence ([two a b | a <- some, b <- some] ++ [two t (recut t) | t <- samples])
-      case e1 ++ e2 of
+          some3 = [t | (j, t) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
+      e2 <- concat <$> sequence ([two a b | a <- some3, b <- some3] ++ [two t (recut t) | t <- samples])
+      -- numbers to text and back, and Char.toText
+      let ints = [0, 1, -1, 42, -42, 1000000007, minBound, maxBound, 2 ^ (62 :: Int), negate (2 ^ (62 :: Int))] :: [Int]
+          nats = [0, 1, 255, 256, 2 ^ (32 :: Int), maxBound, maxBound - 1, 2 ^ (63 :: Int)] :: [Word64]
+          floats =
+            [0, -0.0, 1, -1, 0.1, 0.5, 1.5, 100, 1234567, 9999999, 10000000, 12345678.9, 0.01, 123456.789, 1 / 3, pi, 1e22, 1e21, 1e-10, 2 ** (-30), 5e-324, 1.7976931348623157e308, 2.2250738585072014e-308, 0.3, 2.5e-5, 123e300, 1 / 0, -1 / 0, 0 / 0, 4.35, 0.1 + 0.2, 1e7, 9007199254740993, 65536 * 65536 * 65536, 0.09999999999999999, 1e-7, 123456789.123, 2 ** 70, 2 ** (-70), 1.0e-45] ::
+              [Double]
+          parses = ["12", "-12", "+12", "0", "-0", "9223372036854775807", "9223372036854775808", "-9223372036854775808", "-9223372036854775809", "18446744073709551615", "18446744073709551616", "1.5", "-1.5", "1e3", "1.", ".5", "abc", "", "12a", " 12", "0x1F", "1_000", "007", "1E5", "1e", "+", "-", "Infinity", "NaN", "1.0e-2", "+1.5", "00", "1e400", "-1e-400", "123456789012345678901234567890", "3.14159", "1.5e+3", "1e-3", "0.000001", "1.0e7", "-", "--1", "1-"]
+          -- the plain forms the helper must decide itself (the rest may go to the interpreter)
+          mustParseInt = ["12", "-12", "+12", "0", "9223372036854775808", "007"]
+          mustParseFloat = ["12", "-12", "0", "1.5", "-1.5", "1e3", "1.0e-2", "3.14159", "007"]
+          numText h r expected = h == 1 && r == Just expected
+      i2t <- forM ints $ \v -> do
+        h <- textTest arr 7 v 0 0
+        r <- result
+        pure (numText h r (UText.pack (show v)))
+      n2t <- forM nats $ \v -> do
+        h <- textTest arr 8 (fromIntegral v) 0 0
+        r <- result
+        pure (numText h r (UText.pack (show v)))
+      f2t <- forM floats $ \v -> do
+        h <- textTest arr 9 (fromIntegral (castDoubleToWord64 v)) 0 0
+        r <- result
+        pure (numText h r (UText.pack (show v)))
+      c2t <- forM ("a\233\8364\128512\0z" :: String) $ \ch -> do
+        h <- textTest arr 23 (fromEnum ch) 0 0
+        r <- result
+        pure (numText h r (UText.pack [ch]))
+      t2n <- forM parses $ \sx -> do
+        let t = UText.pack sx
+            run op = put arr 0 (wrap t) >> textTest arr op (fromIntegral someTag) 0 0 >>= \h -> (,) h <$> slot3
+        (hi, ci) <- run 10
+        (hn, cn) <- run 11
+        (hf, cf) <- run 12
+        let expI = maybe none (some . IntVal) (readI sx)
+            expN = maybe none (some . NatVal) (readClamped sx :: Maybe Word64)
+            expF = maybe none (some . DoubleVal) (readMaybe sx :: Maybe Double)
+            handled = (sx `notElem` mustParseInt || (hi == 1 && hn == 1)) && (sx `notElem` mustParseFloat || hf == 1)
+        pure (handled && (hi /= 1 || same ci expI) && (hn /= 1 || same cn expN) && (hf /= 1 || same cf expF))
+      let e3 =
+            [ "Int.toText differs from the interpreter's" | not (and i2t) ]
+              ++ [ "Nat.toText differs from the interpreter's" | not (and n2t) ]
+              ++ [ "Float.toText differs from the interpreter's on " ++ show [v | (v, ok) <- zip floats f2t, not ok] | not (and f2t) ]
+              ++ [ "Char.toText differs from the interpreter's" | not (and c2t) ]
+              ++ [ "Text.toInt, toNat or toFloat differs from the interpreter's on " ++ show [sx | (sx, ok) <- zip parses t2n, not ok] | not (and t2n) ]
+      case e1 ++ e2 ++ e3 of
         e : _ -> pure (Left e)
         [] -> if steps > 0 then stress 0 (replicate 8 UText.empty) else pure (Right ())
 
@@ -531,7 +741,30 @@ probeBytes ls steps = do
       bytes = By.fromWord8s . map fromIntegral
       same a b = BoxedVal a == BoxedVal b
       PackedTag someTag = TT.someTag
+      PackedTag pairTag = TT.pairTag
+      PackedTag rightTag = TT.rightTag
       !none = Enum Ty.optionalRef TT.noneTag
+      unitVal = BoxedVal (Enum Ty.unitRef TT.unitTag)
+      tup2 x y = Data2 Ty.pairRef TT.pairTag x (BoxedVal (Data2 Ty.pairRef TT.pairTag y unitVal))
+      some = Data1 Ty.optionalRef TT.someTag
+      bytesC = Foreign . WrapBytes
+      -- the number functions: width, big-endian, and the Haskell operations
+      numKinds =
+        [ (2, True, By.decodeNat16be, By.encodeNat16be, \i bs -> fromIntegral <$> By.index16be i bs),
+          (2, False, By.decodeNat16le, By.encodeNat16le, \i bs -> fromIntegral <$> By.index16le i bs),
+          (4, True, By.decodeNat32be, By.encodeNat32be, \i bs -> fromIntegral <$> By.index32be i bs),
+          (4, False, By.decodeNat32le, By.encodeNat32le, \i bs -> fromIntegral <$> By.index32le i bs),
+          (8, True, By.decodeNat64be, By.encodeNat64be, By.index64be),
+          (8, False, By.decodeNat64le, By.encodeNat64le, By.index64le)
+        ] ::
+          [(Int, Bool, By.Bytes -> Maybe (Word64, By.Bytes), Word64 -> By.Bytes, Int -> By.Bytes -> Maybe Word64)]
+      baseKinds =
+        [ (16, By.toBase16, By.fromBase16),
+          (32, By.toBase32, By.fromBase32),
+          (64, By.toBase64, By.fromBase64),
+          (65, By.toBase64UrlUnpadded, By.fromBase64UrlUnpadded)
+        ] ::
+          [(Int, By.Bytes -> By.Bytes, By.Bytes -> Either Text.Text By.Bytes)]
       -- "abc", cut from a longer chunk so that its offset and its size differ
       first = wrap (By.drop 1 (bytes [120, 97, 98, 99]))
       th = Rope.threshold
@@ -544,37 +777,51 @@ probeBytes ls steps = do
       chunky = foldl (\acc i -> acc <> bytes (take (th `div` 2 + 1) (drop (i `mod` 7) (cycle [0 .. 255])))) mempty [1 .. 260 :: Int]
       samples = base ++ grown ++ grownL ++ [big, By.drop 7 big, By.take 1500 big, By.drop 100 (grown !! 2), By.take 400 (grownL !! 1), chunky, By.drop 1000 chunky]
   -- (every sample goes through `put`: see probeLists on `evaluate`)
-  arr <- newArray 4 (wrap By.empty) :: IO (MutableArray RealWorld Any)
+  arr <- newArray 12 (wrap By.empty) :: IO (MutableArray RealWorld Any)
   put arr 0 first
   put arr 1 (wrap (bytes (replicate (th + 1) 97) <> bytes (replicate (th + 1) 98)))
   put arr 2 (wrap By.empty)
+  put arr 4 (any' none)
+  put arr 5 (any' (Enum Ty.pairRef (PackedTag 0)))
+  put arr 6 (any' (Enum Ty.unitRef TT.unitTag))
+  put arr 7 (any' (Enum Ty.eitherRef (PackedTag 0)))
+  put arr 8 (any' charTypeTag)
+  put arr 9 (any' natTypeTag)
+  put arr 10 (any' intTypeTag)
+  put arr 11 (any' floatTypeTag)
   ok <- bytesInit arr [lForeignInfo ls, th, 1]
   if ok /= 1
     then pure (Left ("the bytes constructors are not laid out as the JIT's helpers expect (check " ++ show ok ++ ")"))
     else do
-      let result :: IO (Maybe By.Bytes)
+      let slot3 :: IO Closure
+          slot3 = unsafeCoerce <$> readArray arr 3
+          result :: IO (Maybe By.Bytes)
           result = do
-            c <- unsafeCoerce <$> readArray arr 3 :: IO Closure
+            c <- slot3
             good <- do
               put arr 0 (any' c)
               bytesCheck arr
             pure $ case c of
               Foreign (WrapBytes b) | good -> Just b
               _ -> Nothing
+          bytesIn :: Closure -> By.Bytes -> IO Bool
+          bytesIn c expected = case c of
+            Foreign (WrapBytes b) | b == expected -> put arr 0 (any' c) >> bytesCheck arr
+            _ -> pure False
           -- Bytes.at through the helper, against the interpreter's answer
           at :: By.Bytes -> Int -> IO Bool
           at b i = do
             put arr 0 (wrap b)
             put arr 1 (any' none)
             put arr 2 (any' natTypeTag)
-            h <- bytesTest arr 5 i (fromIntegral someTag)
+            h <- bytesTest arr 5 i (fromIntegral someTag) 0
             c <- unsafeCoerce <$> readArray arr 3 :: IO Closure
             pure (h == 1 && same c (maybe none (Data1 Ty.optionalRef TT.someTag . NatVal . fromIntegral) (By.at i b)))
           -- Bytes.flatten: the same bytes, in one chunk
           flat :: By.Bytes -> IO (Maybe By.Bytes)
           flat b = do
             put arr 0 (wrap b)
-            h <- bytesTest arr 6 0 0
+            h <- bytesTest arr 6 0 0 0
             r <- result
             pure $ case r of
               Just f | h == 1, f == b, length (By.chunks f) <= 1 -> Just f
@@ -584,13 +831,13 @@ probeBytes ls steps = do
             let n = By.size b
             put arr 0 (wrap b)
             shape <- bytesCheck arr
-            size <- bytesTest arr 3 0 0
+            size <- bytesTest arr 3 0 0 0
             cuts <- forM ([-1 .. min n (if n > 600 then 12 else 70)] ++ [(n * j) `div` 13 | j <- [1 .. 12], n > 600] ++ [n - 3 .. n + 1]) $ \k -> do
               put arr 0 (wrap b)
-              h1 <- bytesTest arr 1 k 0
+              h1 <- bytesTest arr 1 k 0 0
               r1 <- result
               put arr 0 (wrap b)
-              h2 <- bytesTest arr 2 k 0
+              h2 <- bytesTest arr 2 k 0 0
               r2 <- result
               -- a negative count is a Nat too large to be a size
               let tk = if k < 0 then b else By.take k b
@@ -598,23 +845,78 @@ probeBytes ls steps = do
               pure (h1 == 1 && r1 == Just tk && h2 == 1 && r2 == Just dr)
             ats <- mapM (at b) ([-1, 0, 1, n - 1, n] ++ [(n * j) `div` 7 | j <- [1 .. 6]])
             fl <- flat b
+            -- toList, then fromList of that
+            put arr 0 (wrap b)
+            hu <- bytesTest arr 8 0 0 0
+            cu <- slot3
+            let natList = Foreign (WrapSeq (Sq.fromList (map (NatVal . fromIntegral) (By.toWord8s b))))
+            put arr 0 (any' natList)
+            hp <- bytesTest arr 7 0 0 0
+            rp <- result
+            -- the number functions
+            nums <- forM numKinds $ \(w, be, dec, enc, rd) -> do
+              let be' = if be then 1 else 0
+              put arr 0 (wrap b)
+              hd <- bytesTest arr 11 (w * 2 + be') (fromIntegral someTag) (fromIntegral pairTag)
+              cd <- slot3
+              let expD = maybe none (\(v, rest) -> some (BoxedVal (tup2 (NatVal v) (BoxedVal (bytesC rest))))) (dec b)
+              restOk <- case cd of
+                Data1 _ _ (BoxedVal (Data2 _ _ _ (BoxedVal (Data2 _ _ (BoxedVal rest) _)))) -> put arr 0 (any' rest) >> bytesCheck arr
+                _ -> pure (n < w)
+              encs <- forM [0, 1, 255, 256, 65535, 65536, 2 ^ (32 :: Int) - 1, 2 ^ (32 :: Int), maxBound] $ \v -> do
+                h <- bytesTest arr 12 (fromIntegral v) (w * 2 + be') 0
+                r <- result
+                pure (h == 1 && r == Just (enc v))
+              rds <- forM [-1, 0, 1, n - w, n - w + 1, n, n `div` 2] $ \i -> do
+                put arr 0 (wrap b)
+                v <- bytesTest arr 13 i (w * 2 + be') 0
+                pure (v == maybe (-1) fromIntegral (if i < 0 then Nothing else rd i b))
+              pure (hd == 1 && same cd expD && restOk && and encs && and rds)
+            -- the encodings: to, then from (the smaller bytes only; the random test covers the rest)
+            bases <- forM (if n <= 1500 then baseKinds else []) $ \(base, enc, dec) -> do
+              put arr 0 (wrap b)
+              h <- bytesTest arr 14 base 0 0
+              r <- result
+              let e = enc b
+              put arr 0 (wrap e)
+              h2 <- bytesTest arr 15 base (fromIntegral rightTag) 0
+              c2 <- slot3
+              back <- case (c2, dec e) of
+                (Data1 rf tg (BoxedVal inner), Right d) | rf == Ty.eitherRef, tg == TT.rightTag -> bytesIn inner d
+                _ -> pure False
+              pure (h == 1 && r == Just e && h2 == 1 && back)
             pure . catMaybes $
               [ if shape then Nothing else Just "a bytes isn't laid out as expected",
                 if size == n then Nothing else Just "Bytes.size differs from the interpreter's",
                 if and cuts then Nothing else Just ("Bytes.take or Bytes.drop differs from the interpreter's on a bytes of " ++ show n),
                 if and ats then Nothing else Just ("Bytes.at differs from the interpreter's on a bytes of " ++ show n),
-                if isJust fl then Nothing else Just ("Bytes.flatten differs from the interpreter's on a bytes of " ++ show n)
+                if isJust fl then Nothing else Just ("Bytes.flatten differs from the interpreter's on a bytes of " ++ show n),
+                if hu == 1 && same cu natList then Nothing else Just ("Bytes.toList differs from the interpreter's on a bytes of " ++ show n),
+                if hp == 1 && rp == Just b then Nothing else Just ("Bytes.fromList differs from the interpreter's on a bytes of " ++ show n),
+                if and nums then Nothing else Just ("a Bytes number function differs from the interpreter's on a bytes of " ++ show n),
+                if and bases then Nothing else Just ("a Bytes encoding differs from the interpreter's on a bytes of " ++ show n)
               ]
           two :: By.Bytes -> By.Bytes -> IO [String]
           two a b = do
             put arr 0 (wrap a)
             put arr 1 (wrap b)
-            eq <- bytesTest arr 4 0 0
-            h <- bytesTest arr 0 0 0
+            eq <- bytesTest arr 4 0 0 0
+            h <- bytesTest arr 0 0 0 0
             r <- result
+            put arr 0 (wrap a)
+            put arr 1 (wrap b)
+            hi <- bytesTest arr 9 (fromIntegral someTag) 0 0
+            ci <- slot3
+            put arr 0 (wrap a)
+            put arr 1 (wrap b)
+            cm <- bytesTest arr 10 0 0 0
+            let expI = maybe none (some . NatVal) (By.indexOf a b)
+                expC = case compare a b of LT -> -1; EQ -> 0; GT -> 1
             pure . catMaybes $
               [ if eq == (if a == b then 1 else 0) then Nothing else Just "Bytes equality differs from the interpreter's",
-                if h == 1 && r == Just (a <> b) then Nothing else Just ("Bytes.++ differs from the interpreter's on bytes of " ++ show (By.size a) ++ " and " ++ show (By.size b))
+                if h == 1 && r == Just (a <> b) then Nothing else Just ("Bytes.++ differs from the interpreter's on bytes of " ++ show (By.size a) ++ " and " ++ show (By.size b)),
+                if By.size a == 0 || (hi == 1 && same ci expI) then Nothing else Just "Bytes.indexOf differs from the interpreter's",
+                if cm == expC then Nothing else Just "Bytes comparison differs from the interpreter's"
               ]
           -- the longer test: random operations on eight bytes
           mix :: Int -> Int
@@ -637,7 +939,7 @@ probeBytes ls steps = do
                       0 -> r 4 `mod` 12
                       1 -> n - r 4 `mod` 12
                       _ -> r 4 `mod` (n + 2) - 1
-                    op = r 5 `mod` 16
+                    op = r 5 `mod` 20
                     piece k = bytes (take (r k `mod` (if even (r (k + 1)) then 7 else 90)) (drop (r (k + 2) `mod` 40) values))
                     -- what a helper built, if it is laid out right and is the expected bytes
                     -- (the bytes are compared when `whole`; the size always)
@@ -650,16 +952,16 @@ probeBytes ls steps = do
                     cat whole a b = do
                       put arr 0 (wrap a)
                       put arr 1 (wrap b)
-                      h <- bytesTest arr 0 0 0
+                      h <- bytesTest arr 0 0 0 0
                       verdict whole h (a <> b)
                     cut whole tk k x = do
                       put arr 0 (wrap x)
-                      h <- bytesTest arr (if tk then 1 else 2) k 0
+                      h <- bytesTest arr (if tk then 1 else 2) k 0 0
                       verdict whole h (if tk then (if k < 0 then x else By.take k x) else (if k < 0 then By.empty else By.drop k x))
                     sameAs a b = do
                       put arr 0 (wrap a)
                       put arr 1 (wrap b)
-                      eq <- bytesTest arr 4 0 0
+                      eq <- bytesTest arr 4 0 0 0
                       pure (eq == (if a == b then 1 else 0))
                     times :: Int -> (By.Bytes -> IO (Maybe By.Bytes)) -> By.Bytes -> IO (Maybe By.Bytes)
                     times 0 _ x = pure (Just x)
@@ -685,16 +987,65 @@ probeBytes ls steps = do
                     | op == 14 -> do
                         oks <- mapM (at t) [pos, 0, n - 1, r 6 `mod` (n + 1)]
                         pure (if and oks then Just t else Nothing)
-                    | otherwise -> flat t
+                    | op == 15 -> flat t
+                    | op == 16 -> do
+                        -- toList, then fromList
+                        put arr 0 (wrap t)
+                        h <- bytesTest arr 8 0 0 0
+                        c <- slot3
+                        case c of
+                          Foreign (WrapSeq _) | h == 1 -> do
+                            put arr 0 (any' c)
+                            h2 <- bytesTest arr 7 0 0 0
+                            verdict full h2 t
+                          _ -> pure Nothing
+                    | op == 17 || op == 18 -> do
+                        -- an encoding and back
+                        let base = if op == 17 then 16 else [32, 64, 65] !! (r 6 `mod` 3)
+                        put arr 0 (wrap t)
+                        h <- bytesTest arr 14 base 0 0
+                        c <- slot3
+                        case c of
+                          Foreign (WrapBytes _) | h == 1 -> do
+                            put arr 0 (any' c)
+                            h2 <- bytesTest arr 15 base (fromIntegral rightTag) 0
+                            c2 <- slot3
+                            case c2 of
+                              Data1 _ _ (BoxedVal inner) | h2 == 1 -> put arr 3 (any' inner) >> verdict full 1 t
+                              _ -> pure Nothing
+                          _ -> pure Nothing
+                    | otherwise -> do
+                        -- decode a number off the front: the rest goes on
+                        let (w, be, dec, _, _) = numKinds !! (r 6 `mod` 6)
+                        put arr 0 (wrap t)
+                        h <- bytesTest arr 11 (w * 2 + (if be then 1 else 0)) (fromIntegral someTag) (fromIntegral pairTag)
+                        c <- slot3
+                        case (c, dec t) of
+                          (Data1 _ _ (BoxedVal (Data2 _ _ _ (BoxedVal (Data2 _ _ (BoxedVal rest) _)))), Just (_, expected)) | h == 1 -> put arr 3 (any' rest) >> verdict full 1 expected
+                          (_, Nothing) | h == 1 -> pure (Just t)
+                          _ -> pure Nothing
                 case res of
                   Nothing -> pure (Left ("the bytes helpers' test failed at step " ++ show step ++ " (operation " ++ show op ++ " on a bytes of " ++ show n ++ ")"))
                   Just t' -> stress (step + 1) (take i pool ++ [t'] ++ drop (i + 1) pool)
       e1 <- concat <$> mapM one samples
       -- equal bytes cut into chunks differently must compare equal
       let recut b = By.take 3 b <> By.drop 3 b
-          some = [b | (j, b) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
-      e2 <- concat <$> sequence ([two a b | a <- some, b <- some] ++ [two b (recut b) | b <- samples])
-      case e1 ++ e2 of
+          some3 = [b | (j, b) <- zip [0 :: Int ..] samples, j `mod` 3 == 0]
+      e2 <- concat <$> sequence ([two a b | a <- some3, b <- some3] ++ [two b (recut b) | b <- samples])
+      -- decoding inputs that aren't canonical: whatever the helper decides must be the interpreter's answer
+      odd <- forM [(base, dec, inp) | (base, _, dec) <- baseKinds, inp <- ["", "00ff", "00FF", "0", "zz", "AA==", "AA", "AAA=", "QUJD", "QUJDRA==", "QUJDRA", "MFRGG===", "MFRGG", "-_-_", "QUI=", "QUJ=", "ME======", "MF======", "====", "ab", "AB"]] $ \(base, dec, inp) -> do
+        let e = bytes (map fromEnum inp)
+        put arr 0 (wrap e)
+        h <- bytesTest arr 15 base (fromIntegral rightTag) 0
+        c <- slot3
+        case (h, dec e) of
+          (1, Right d) -> case c of
+            Data1 rf tg (BoxedVal inner) | rf == Ty.eitherRef, tg == TT.rightTag -> bytesIn inner d
+            _ -> pure False
+          (1, Left _) -> pure False
+          _ -> pure True
+      let e3 = ["Bytes.fromBase decodes something the interpreter doesn't" | not (and odd)]
+      case e1 ++ e2 ++ e3 of
         e : _ -> pure (Left e)
         [] -> if steps > 0 then stress 0 (replicate 8 By.empty) else pure (Right ())
 

@@ -123,6 +123,29 @@ bytesDrain n b =
   go rem i = if i == n then rem else go (Bytes.drop 1 rem) (i + 1)
   go b 0
 
+-- the characters one at a time, with uncons
+textWalk : Text -> Nat
+textWalk t =
+  go acc t = match Text.uncons t with
+    None -> acc
+    Some (c, rest) -> go (acc + 1) rest
+  go 0 t
+
+-- numbers to text and back
+natRound : Nat -> Nat
+natRound n =
+  go acc i = if i == n then acc else
+    go (acc + Optional.getOrElse 0 (Nat.fromText (Nat.toText i))) (i + 1)
+  go 0 0
+
+-- 8-byte numbers off the front
+bytesDecode : Bytes -> Nat
+bytesDecode b =
+  go acc b = match Bytes.decodeNat64be b with
+    None -> acc
+    Some (n, rest) -> go (acc + n) rest
+  go 0 b
+
 -- every byte, by position
 bytesSum : Bytes -> Nat
 bytesSum b =
@@ -161,6 +184,13 @@ jitSuite = do
   printTime "Bytes: at, 100000 times" 1 let
     b = bytesAppend 50000 (Bytes.fromList [104, 105])
     n -> repeat n do bytesSum b
+  printTime "Text: uncons walk over 100000 characters" 1 let
+    t = Text.repeat 100000 "a"
+    n -> repeat n do textWalk t
+  printTime "Nat.toText and Nat.fromText, 10000 times" 1 (n -> repeat n do natRound 10000)
+  printTime "Bytes: decodeNat64be walk over 80000 bytes" 1 let
+    b = bytesAppend 40000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesDecode b
 ```
 
 ``` ucm

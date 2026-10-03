@@ -20,6 +20,7 @@ Update it whenever a step finishes or something non-obvious is learned.
 | After M6: lists on a strict finger tree (`Unison.Util.Deque`) | done 2026-10-02. The list is a strict finger tree, and every list primitive is native with no fallback (the C helpers are ports of the Haskell operations). `List.map increment` 0.23×, `List.foldLeft` 0.19× of the interpreter. See "The list representation" below |
 | After M6: text on the same finger tree (`Unison.Util.Rope`) | done 2026-10-02. The rope of chunks behind `Text` and `Bytes` is the Deque's finger tree with chunks for elements (it shares the Deque's code below the top level); the C text helpers are ports of it. Building a text piece by piece 3 to 4× faster, walking it by character 2×; `jitSuite`'s text appends 556 µs to 311 µs with the JIT. See "The text representation" below |
 | After M6: `Bytes` natively | done 2026-10-02. The C rope helpers take a kind (text or bytes) that says what a chunk is, and `Bytes.size`, `++`, `take`, `drop`, `at` and `flatten` are native, as is universal `==` on two texts or two bytes. `jitSuite`: appending two bytes 10000 times 1.03 ms interpreted, 310 µs with the JIT; `Bytes.drop 1` 100000 times 8.69 ms to 2.77 ms; `Bytes.at` over 100000 bytes 10.1 ms to 7.4 ms. See "The bytes helpers" below |
+| After M6: the rest of Text and Bytes natively | done 2026-10-03. Every Text and Bytes primitive is native (uncons/unsnoc, numbers to and from text, pack/unpack, indexOf, the orderings, universal `<`/`<=`/`compare` on texts and bytes), and the pure foreign functions too (`Text.repeat`, `reverse`, the case mappings for ASCII, `toUtf8`/`fromUtf8`, `Char.toText`, the Bytes number encodings and reads, base 16/32/64). Bytes literals are native through `Bytes.fromList`. Left as call-outs: the Text patterns, the compression functions, `Link.toText`. `jitSuite` (interpreter / JIT): a `Text.uncons` walk over 100000 characters 10.9 ms / 4.46 ms, `Nat.toText` then `Nat.fromText` 10000 times 7.95 ms / 0.80 ms, a `Bytes.decodeNat64be` walk over 80000 bytes 1.49 ms / 0.60 ms; `Bytes.at` 100000 times 7.4 ms to 2.5 ms with the JIT, since the pooled `None` the native index needs now exists. See "The rest of Text and Bytes" below |
 | M5: compilation policy | done 2026-09-30. `UNISON_JIT=on` compiles what gets hot on a background thread, generates re-entry functions on demand, and matches eager mode's speed on the whole suite with 1/35 of the IR; the interpreter with the JIT off is unchanged. See [jit-m5.md](jit-m5.md) |
 | M0 spike 1: LLVM | done on macOS arm64. Linux skipped for now. |
 | M0 spike 2: GHC runtime from C | done on macOS arm64 |
@@ -821,6 +822,75 @@ to the chunk (the 100000-byte sample was built two bytes at a time, so it is 160
 checks and the rest of `jitSuite` are unchanged (every other row within 2% of the previous
 run).
 
+## The rest of Text and Bytes (2026-10-03)
+
+Paul: "finish converting all Text and Bytes builtins to use native code; text and bytes
+literals should also compile to native code" (the Text patterns skipped for now). The new
+section of `cbits/jit_rt.c`, "The rest of Text and Bytes", holds the helpers; each is a port
+of the interpreter's primitive (`Machine/Primops.hs`) or foreign function
+(`Foreign/Function.hs`) over the Haskell operations, builds its results as the interpreter
+builds them (`Some v` is `Data1 ref tag v`, a pair is `Tuple a (Tuple b ())`, `Right v` is
+`Data1`, with the references taken from pooled field-less constructors that generated code
+hands in, as `List.at`'s `None` already was), and answers "not handled" for anything it
+can't decide exactly, which the call-out then does.
+
+- **Primitives**: `Text.uncons`/`unsnoc` (the character from the first or last chunk, the
+  rest by `rope_drop`/`rope_take`), `Int.toText`/`Nat.toText` (`%lld`/`%llu`), `Float.toText`
+  (Haskell's `show`: the shortest digits that read back, the nearest of them when several
+  do, in `d.ddd` form for 0.1 <= |x| < 10^7 and `d.ddde<n>` otherwise), `Int.fromText`,
+  `Nat.fromText`, `Float.fromText` (only the plain forms, an optional sign and digits, a
+  point and an exponent for floats; anything else, spaces, hex, "NaN", parentheses, is left
+  to the interpreter whose lexer takes them), `Text.fromCharList`/`toCharList`,
+  `Bytes.fromList`/`toList` (an element that isn't a Char, or a Nat above 255, is left to the
+  interpreter to raise the error), `Text.indexOf`/`Bytes.indexOf` (`memmem` over the bytes,
+  the position converted to characters), `Text.<`/`<=` and universal `<`, `<=` and `compare`
+  on two texts or two bytes (`rope_cmp`: UTF-8's byte order is the code point order).
+- **Foreign functions**: `Text.repeat` (as `Util.Text.replicate`: one chunk under the
+  threshold, else the halves appended), `Text.reverse` (each chunk reversed and consed, as
+  the rope's), `Text.toUppercase`/`toLowercase` for ASCII texts only (Data.Text's mapping of
+  anything else is Unicode's and can change the length), `Text.toUtf8` (the same arrays as
+  byte chunks), `Text.fromUtf8` (validated as `decodeUtf8'` would, then chunks of the
+  threshold over a copy, as `fromText` cuts them; invalid input goes to the interpreter for
+  the Failure), `Char.toText`, `Bytes.decodeNat*`/`encodeNat*`/`read*` (out of range goes to
+  the interpreter, which raises), `Bytes.toBase16/32/64/64UrlUnpadded` and `fromBase*` (only
+  canonical input is decoded natively: the alphabet exactly, full padding where the encoding
+  has it, no stray bits; the rest is the interpreter's, with its error message).
+- **Literals**: text literals were already pool constants; a bytes literal `0xs...` is a
+  list literal followed by `Bytes.fromList`, both native now.
+- **Checks**: `probeTexts` and `probeBytes` run every helper against the Haskell operation on
+  the sample texts and bytes (uncons/unsnoc with the rest's layout checked, pack after
+  unpack, reverse, the case mappings, repeat, toUtf8 then fromUtf8, indexOf and compare
+  between pairs, ten Ints, eight Nats and forty Doubles through `toText`, forty-odd strings
+  through the three `fromText`s, the six number encodings at several widths and positions,
+  the four bases to and back, and a list of odd encodings that must decode as the
+  interpreter does or not at all). The random tests (`texts=N`, `bytes=N`) gained reverse,
+  pack after unpack, the UTF-8 round trip, uncons/unsnoc, the encodings and decodeNat.
+  The checks take 17.7 ms (text) and 9.4 ms (bytes) at startup on the optimized build (6.5 and 2.6 before; the heavier per-sample checks run only on texts and bytes up to 1500 elements, the random test covers the big ones). Trimming them further is easy if startup time matters: the number conversions and the `two`-sample pairs are most of it. `UNISON_JIT_TRACE_TEST=1` prints each self-test operation as it runs, for
+  finding one that crashes.
+- **Numbers** (`jitSuite`, optimized build, 2026-10-03; interpreter / JIT): three rows were
+  added, and one older row moved because `Compile.hs` now puts the `None` constant in the
+  pool for `Bytes.at` too (it had been falling back to the call-out for want of it).
+
+  | Benchmark | Interpreter | JIT |
+  | --- | --- | --- |
+  | Text: uncons walk over 100000 characters | 10.9 ms | 4.46 ms |
+  | Nat.toText and Nat.fromText, 10000 times | 7.95 ms | 803 µs |
+  | Bytes: decodeNat64be walk over 80000 bytes | 1.49 ms | 596 µs |
+  | Bytes: at, 100000 times (was 7.4 ms with the JIT) | 10.1 ms | 2.47 ms |
+
+  Every other row is within noise of the previous run. The uncons walk is bounded by what
+  each step allocates (a `Some`, two pairs, a `()` reference, the rest of the text) and the
+  `match` on it; the number round trip saves two call-outs and two `String`s per step.
+- **Things learned**: (1) `long double` is 64 bits on Apple arm64, so the "nearest shortest
+  digits" choice for `Float.toText` can't use it; the side of the correctly rounded digits
+  the number lies on is read off its exact decimal expansion (`%.30e`) instead. (2) The
+  bytes probe must run before the text probe, since `toUtf8` builds bytes. (3) The test
+  transcript runs in an empty codebase after `builtins.mergeio`, where the builtins keep
+  their own names (`Nat.fromText`, not `Text.toNat`); `jit_codebase` has base, whose
+  wrappers of the same names raise exceptions, so a stanza checked there alone behaves
+  differently from the same stanza in the transcript. A quick checker now prepends the
+  transcript's setup stanzas.
+
 ## A fixed crash: untagged pointers in strict fields (2026-10-03)
 
 Found while adding the Bytes tests, and older than them (the commit before reproduced it):
@@ -1080,6 +1150,11 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   (4) A watch expression whose value is an `Optional` from a call-out crashed eager mode on
   the optimized build; older than the Bytes work, and fixed the next day (see "A fixed
   crash: untagged pointers in strict fields").
+- 2026-10-03: the rest of Text and Bytes went native (Paul: "finish converting all Text and
+  Bytes builtins"; patterns skipped). See "The rest of Text and Bytes". Lessons: `long
+  double` is 64-bit on arm64 Macs; the probe order matters when one kind's checks build the
+  other kind; the test transcript's empty codebase and `jit_codebase` resolve the same
+  builtin names differently.
 - 2026-10-03: the crash above was an untagged (unevaluated) pointer copied by native code
   into a strict field. Lesson: **GHC's optimized code trusts strict fields to hold tagged,
   evaluated pointers, and the interpreter can leave untagged ones on the stack**, so native

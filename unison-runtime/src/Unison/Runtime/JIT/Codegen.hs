@@ -47,7 +47,7 @@ import Unison.Reference (Reference)
 import Unison.Runtime.ANF (PackedTag (..))
 import Unison.Runtime.Foreign.Function.Type (ForeignFunc (..))
 import Unison.Runtime.TypeTags qualified as TT
-import Unison.Builtin.Decls qualified as Ty (optionalRef, seqViewRef, unitRef)
+import Unison.Builtin.Decls qualified as Ty (eitherRef, optionalRef, pairRef, seqViewRef, unitRef)
 import Data.Map.Strict qualified as Map
 import Data.IntMap.Strict qualified as IM
 import Unison.Runtime.MCode hiding (Env)
@@ -183,6 +183,30 @@ modulePrelude =
       "declare i64 @unison_jit_foreign_eq(ptr, ptr, i64)",
       "declare ptr @unison_jit_bytes_index(ptr, ptr, i64, ptr, i64, ptr)",
       "declare ptr @unison_jit_bytes_flatten(ptr, ptr)",
+      "declare ptr @unison_jit_text_uncons(ptr, ptr, ptr, i64, ptr, i64, ptr, ptr, i64)",
+      "declare ptr @unison_jit_int_to_text(ptr, i64, i64)",
+      "declare ptr @unison_jit_float_to_text(ptr, i64)",
+      "declare ptr @unison_jit_text_to_num(ptr, ptr, ptr, i64, ptr, i64)",
+      "declare ptr @unison_jit_text_pack(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_bytes_pack(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_text_unpack(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_bytes_unpack(ptr, ptr, ptr)",
+      "declare ptr @unison_jit_text_index_of(ptr, ptr, ptr, ptr, i64, ptr)",
+      "declare ptr @unison_jit_bytes_index_of(ptr, ptr, ptr, ptr, i64, ptr)",
+      "declare i64 @unison_jit_text_cmp(ptr, ptr)",
+      "declare i64 @unison_jit_foreign_cmp(ptr, ptr, i64)",
+      "declare ptr @unison_jit_char_to_text(ptr, i64)",
+      "declare ptr @unison_jit_text_repeat(ptr, i64, ptr)",
+      "declare ptr @unison_jit_text_reverse(ptr, ptr)",
+      "declare ptr @unison_jit_text_case(ptr, ptr, i64)",
+      "declare ptr @unison_jit_text_to_utf8(ptr, ptr)",
+      "declare ptr @unison_jit_text_from_utf8(ptr, ptr, ptr, i64)",
+      "declare ptr @unison_jit_bytes_decode_nat(ptr, ptr, i64, i64, ptr, i64, ptr, i64, ptr, ptr)",
+      "declare ptr @unison_jit_bytes_encode_nat(ptr, i64, i64, i64)",
+      "declare i64 @unison_jit_bytes_read_ok(ptr, i64, i64)",
+      "declare i64 @unison_jit_bytes_read_at(ptr, i64, i64, i64)",
+      "declare ptr @unison_jit_bytes_to_base(ptr, ptr, i64)",
+      "declare ptr @unison_jit_bytes_from_base(ptr, ptr, i64, ptr, i64)",
       "declare ptr @unison_jit_name(ptr, ptr, i64, i64, ptr, i64, ptr, i64, ptr, i64, ptr)",
       "declare i64 @llvm.ctlz.i64(i64, i1)",
       "declare i64 @llvm.cttz.i64(i64, i1)",
@@ -701,8 +725,9 @@ allocates = anyInstr $ \case
   Prim2 REFW _ _ -> True
   ForeignCall _ MutableArray_write _ -> True
   -- the list helpers allocate, and charge the budget themselves
-  Prim1 op _ -> op `elem` [VWLS, VWRS, FLTB]
-  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, CATB, TAKB, DRPB, IDXB]
+  Prim1 op _ -> op `elem` [VWLS, VWRS, FLTB, UCNS, USNC, ITOT, NTOT, FTOT, TTOI, TTON, TTOF, PAKT, UPKT, PAKB, UPKB]
+  Prim2 op _ _ -> op `elem` [CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, CATB, TAKB, DRPB, IDXB, IXOT, IXOB]
+  ForeignCall _ f _ -> f `elem` (textForeign ++ bytesForeign)
   Seq _ -> True
   Name {} -> True
   _ -> False
@@ -2190,14 +2215,70 @@ prim2Supported op =
 -- path), as opposed to calling out for it every time. Must agree with the
 -- cases of 'genInstr'; the estimate of what compiling a function saves
 -- relies on it (see JIT.Estimate).
+-- | The Text and Bytes foreign functions with native versions (see "The
+-- rest of Text and Bytes" in jit_rt.c).
+textForeign, bytesForeign :: [ForeignFunc]
+textForeign = [Text_repeat, Text_reverse, Text_toUppercase, Text_toLowercase, Text_toUtf8, Text_fromUtf8_impl_v3, Char_toText]
+bytesForeign =
+  [ Bytes_decodeNat16be, Bytes_decodeNat16le, Bytes_decodeNat32be, Bytes_decodeNat32le, Bytes_decodeNat64be, Bytes_decodeNat64le,
+    Bytes_encodeNat16be, Bytes_encodeNat16le, Bytes_encodeNat32be, Bytes_encodeNat32le, Bytes_encodeNat64be, Bytes_encodeNat64le,
+    Bytes_read, Bytes_read16be, Bytes_read16le, Bytes_read32be, Bytes_read32le, Bytes_read64be, Bytes_read64le,
+    Bytes_toBase16, Bytes_toBase32, Bytes_toBase64, Bytes_toBase64UrlUnpadded,
+    Bytes_fromBase16, Bytes_fromBase32, Bytes_fromBase64, Bytes_fromBase64UrlUnpadded
+  ]
+
+-- | The width in bytes and endianness (1 for big) of the Bytes number functions.
+decodeNatKind, encodeNatKind, readKind :: ForeignFunc -> Maybe (Int, Int)
+decodeNatKind = \case
+  Bytes_decodeNat16be -> Just (2, 1)
+  Bytes_decodeNat16le -> Just (2, 0)
+  Bytes_decodeNat32be -> Just (4, 1)
+  Bytes_decodeNat32le -> Just (4, 0)
+  Bytes_decodeNat64be -> Just (8, 1)
+  Bytes_decodeNat64le -> Just (8, 0)
+  _ -> Nothing
+encodeNatKind = \case
+  Bytes_encodeNat16be -> Just (2, 1)
+  Bytes_encodeNat16le -> Just (2, 0)
+  Bytes_encodeNat32be -> Just (4, 1)
+  Bytes_encodeNat32le -> Just (4, 0)
+  Bytes_encodeNat64be -> Just (8, 1)
+  Bytes_encodeNat64le -> Just (8, 0)
+  _ -> Nothing
+readKind = \case
+  Bytes_read -> Just (1, 1)
+  Bytes_read16be -> Just (2, 1)
+  Bytes_read16le -> Just (2, 0)
+  Bytes_read32be -> Just (4, 1)
+  Bytes_read32le -> Just (4, 0)
+  Bytes_read64be -> Just (8, 1)
+  Bytes_read64le -> Just (8, 0)
+  _ -> Nothing
+
+-- | The base of the Bytes encoding functions: 16, 32, 64, or 65 for base 64
+-- with the URL alphabet and no padding.
+toBaseKind, fromBaseKind :: ForeignFunc -> Maybe Int
+toBaseKind = \case
+  Bytes_toBase16 -> Just 16
+  Bytes_toBase32 -> Just 32
+  Bytes_toBase64 -> Just 64
+  Bytes_toBase64UrlUnpadded -> Just 65
+  _ -> Nothing
+fromBaseKind = \case
+  Bytes_fromBase16 -> Just 16
+  Bytes_fromBase32 -> Just 32
+  Bytes_fromBase64 -> Just 64
+  Bytes_fromBase64UrlUnpadded -> Just 65
+  _ -> Nothing
+
 instrNative :: GInstr comb -> Bool
 instrNative = \case
   Lit _ -> True
   Pack {} -> True
-  Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT, SIZB, FLTB]
-  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, EQLT, CATB, TAKB, DRPB, IDXB]
+  Prim1 op _ -> prim1Supported op || op `elem` [REFR, NOTB, SIZS, VWLS, VWRS, SIZT, SIZB, FLTB, UCNS, USNC, ITOT, NTOT, FTOT, TTOI, TTON, TTOF, PAKT, UPKT, PAKB, UPKB]
+  Prim2 op _ _ -> prim2Supported op || op `elem` [REFW, EQLU, LEQU, LESU, CMPU, ANDB, IORB, CONS, SNOC, IDXS, CATS, TAKS, DRPS, SPLL, SPLR, CATT, TAKT, DRPT, EQLT, CATB, TAKB, DRPB, IDXB, IXOT, IXOB, LEQT, LEST]
   Seq _ -> True
-  ForeignCall _ f _ -> f `elem` [MutableArray_size, MutableArray_read, MutableArray_write]
+  ForeignCall _ f _ -> f `elem` ([MutableArray_size, MutableArray_read, MutableArray_write] ++ textForeign ++ bytesForeign)
   -- (up to four arguments; more is rare, and then it is a call-out)
   Name r _ -> case r of Dyn _ -> False; _ -> True
   _ -> False
@@ -2416,6 +2497,194 @@ genInstr fe d instr sect k = case instr of
         b <- loadB (d - j)
         none <- poolValue noneIx
         listHelper d slow ("@unison_jit_bytes_index(ptr %ctx, ptr " ++ b ++ ", i64 " ++ ix ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ feTagNat fe ++ ")")
+        k (d + 1)
+  -- The rest of Text and Bytes (see that section of jit_rt.c): uncons and
+  -- unsnoc, numbers to and from text, pack and unpack, indexOf, the
+  -- orderings, and the foreign functions. A helper answers "not handled"
+  -- for a form it doesn't decide, and the call-out does it.
+  Prim1 op i
+    | enabled fe "text",
+      op == UCNS || op == USNC,
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)),
+      Just pairIx <- Map.lookup (KeyEnum Ty.pairRef (PackedTag 0)) (envPool (feEnv fe)),
+      Just unitIx <- Map.lookup (KeyEnum Ty.unitRef TT.unitTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+            PackedTag pairTag = TT.pairTag
+        slow <- callOutExit True fe d instr sect
+        t <- loadB (d - i)
+        none <- poolValue noneIx
+        pair <- poolValue pairIx
+        unit <- poolValue unitIx
+        listHelper d slow ("@unison_jit_text_uncons(ptr %ctx, ptr " ++ t ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ pair ++ ", i64 " ++ show pairTag ++ ", ptr " ++ unit ++ ", ptr " ++ feTagChar fe ++ ", i64 " ++ (if op == UCNS then "1" else "0") ++ ")")
+        k (d + 1)
+  Prim1 op i | enabled fe "text", op == ITOT || op == NTOT -> do
+    n <- loadU (d - i)
+    r <- fresh "text"
+    emit (r ++ " = call ptr @unison_jit_int_to_text(ptr %ctx, i64 " ++ n ++ ", i64 " ++ (if op == ITOT then "1" else "0") ++ ")")
+    storeU (d + 1) "-1"
+    storeB (d + 1) r
+    k (d + 1)
+  Prim1 FTOT i | enabled fe "text" -> do
+    bits <- loadU (d - i)
+    r <- fresh "text"
+    emit (r ++ " = call ptr @unison_jit_float_to_text(ptr %ctx, i64 " ++ bits ++ ")")
+    storeU (d + 1) "-1"
+    storeB (d + 1) r
+    k (d + 1)
+  Prim1 op i
+    | enabled fe "text",
+      op `elem` [TTOI, TTON, TTOF],
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+            (tag, kind) = case op of
+              TTOI -> (feTagInt fe, "0")
+              TTON -> (feTagNat fe, "1")
+              _ -> (feTagFloat fe, "2")
+        slow <- callOutExit True fe d instr sect
+        t <- loadB (d - i)
+        none <- poolValue noneIx
+        listHelper d slow ("@unison_jit_text_to_num(ptr %ctx, ptr " ++ t ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ tag ++ ", i64 " ++ kind ++ ")")
+        k (d + 1)
+  Prim1 PAKT i | enabled fe "text" -> do
+    slow <- callOutExit True fe d instr sect
+    l <- loadB (d - i)
+    listHelper d slow ("@unison_jit_text_pack(ptr %ctx, ptr " ++ l ++ ", ptr " ++ feTagChar fe ++ ")")
+    k (d + 1)
+  Prim1 UPKT i | enabled fe "text" -> do
+    slow <- callOutExit True fe d instr sect
+    t <- loadB (d - i)
+    listHelper d slow ("@unison_jit_text_unpack(ptr %ctx, ptr " ++ t ++ ", ptr " ++ feTagChar fe ++ ")")
+    k (d + 1)
+  Prim2 IXOT i j
+    | enabled fe "text",
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+        slow <- callOutExit True fe d instr sect
+        x <- loadB (d - i)
+        y <- loadB (d - j)
+        none <- poolValue noneIx
+        listHelper d slow ("@unison_jit_text_index_of(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ feTagNat fe ++ ")")
+        k (d + 1)
+  Prim2 op i j | enabled fe "text", op == LEQT || op == LEST -> do
+    slow <- callOutExit True fe d instr sect
+    x <- loadB (d - i)
+    y <- loadB (d - j)
+    r <- fresh "cmp"
+    emit (r ++ " = call i64 @unison_jit_text_cmp(ptr " ++ x ++ ", ptr " ++ y ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp eq i64 " ++ r ++ ", 2")
+    branchIf "text" miss slow
+    c <- fresh "bool"
+    emit (c ++ " = icmp " ++ (if op == LEQT then "sle" else "slt") ++ " i64 " ++ r ++ ", 0")
+    resultBool fe d c
+    k (d + 1)
+  Prim1 PAKB i | enabled fe "bytes" -> do
+    slow <- callOutExit True fe d instr sect
+    l <- loadB (d - i)
+    listHelper d slow ("@unison_jit_bytes_pack(ptr %ctx, ptr " ++ l ++ ", ptr " ++ feTagNat fe ++ ")")
+    k (d + 1)
+  Prim1 UPKB i | enabled fe "bytes" -> do
+    slow <- callOutExit True fe d instr sect
+    b <- loadB (d - i)
+    listHelper d slow ("@unison_jit_bytes_unpack(ptr %ctx, ptr " ++ b ++ ", ptr " ++ feTagNat fe ++ ")")
+    k (d + 1)
+  Prim2 IXOB i j
+    | enabled fe "bytes",
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+        slow <- callOutExit True fe d instr sect
+        x <- loadB (d - i)
+        y <- loadB (d - j)
+        none <- poolValue noneIx
+        listHelper d slow ("@unison_jit_bytes_index_of(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ feTagNat fe ++ ")")
+        k (d + 1)
+  ForeignCall _ Text_repeat args | enabled fe "text", [kn, kt] <- argSources fe d args -> do
+    slow <- callOutExit True fe d instr sect
+    n <- loadU kn
+    t <- loadB kt
+    listHelper d slow ("@unison_jit_text_repeat(ptr %ctx, i64 " ++ n ++ ", ptr " ++ t ++ ")")
+    k (d + 1)
+  ForeignCall _ f args
+    | enabled fe "text",
+      f `elem` [Text_reverse, Text_toUppercase, Text_toLowercase, Text_toUtf8],
+      [kt] <- argSources fe d args -> do
+        slow <- callOutExit True fe d instr sect
+        t <- loadB kt
+        let call = case f of
+              Text_reverse -> "@unison_jit_text_reverse(ptr %ctx, ptr " ++ t ++ ")"
+              Text_toUppercase -> "@unison_jit_text_case(ptr %ctx, ptr " ++ t ++ ", i64 1)"
+              Text_toLowercase -> "@unison_jit_text_case(ptr %ctx, ptr " ++ t ++ ", i64 0)"
+              _ -> "@unison_jit_text_to_utf8(ptr %ctx, ptr " ++ t ++ ")"
+        listHelper d slow call
+        k (d + 1)
+  ForeignCall _ Text_fromUtf8_impl_v3 args
+    | enabled fe "text",
+      [kb] <- argSources fe d args,
+      Just eitherIx <- Map.lookup (KeyEnum Ty.eitherRef (PackedTag 0)) (envPool (feEnv fe)) -> do
+        let PackedTag rightTag = TT.rightTag
+        slow <- callOutExit True fe d instr sect
+        b <- loadB kb
+        eith <- poolValue eitherIx
+        listHelper d slow ("@unison_jit_text_from_utf8(ptr %ctx, ptr " ++ b ++ ", ptr " ++ eith ++ ", i64 " ++ show rightTag ++ ")")
+        k (d + 1)
+  ForeignCall _ Char_toText args | enabled fe "text", [kc] <- argSources fe d args -> do
+    c <- loadU kc
+    r <- fresh "text"
+    emit (r ++ " = call ptr @unison_jit_char_to_text(ptr %ctx, i64 " ++ c ++ ")")
+    storeU (d + 1) "-1"
+    storeB (d + 1) r
+    k (d + 1)
+  ForeignCall _ f args
+    | enabled fe "bytes",
+      Just (width, be) <- decodeNatKind f,
+      [kb] <- argSources fe d args,
+      Just noneIx <- Map.lookup (KeyEnum Ty.optionalRef TT.noneTag) (envPool (feEnv fe)),
+      Just pairIx <- Map.lookup (KeyEnum Ty.pairRef (PackedTag 0)) (envPool (feEnv fe)),
+      Just unitIx <- Map.lookup (KeyEnum Ty.unitRef TT.unitTag) (envPool (feEnv fe)) -> do
+        let PackedTag someTag = TT.someTag
+            PackedTag pairTag = TT.pairTag
+        slow <- callOutExit True fe d instr sect
+        b <- loadB kb
+        none <- poolValue noneIx
+        pair <- poolValue pairIx
+        unit <- poolValue unitIx
+        listHelper d slow ("@unison_jit_bytes_decode_nat(ptr %ctx, ptr " ++ b ++ ", i64 " ++ show width ++ ", i64 " ++ show be ++ ", ptr " ++ none ++ ", i64 " ++ show someTag ++ ", ptr " ++ pair ++ ", i64 " ++ show pairTag ++ ", ptr " ++ unit ++ ", ptr " ++ feTagNat fe ++ ")")
+        k (d + 1)
+  ForeignCall _ f args | enabled fe "bytes", Just (width, be) <- encodeNatKind f, [kn] <- argSources fe d args -> do
+    n <- loadU kn
+    r <- fresh "bytes"
+    emit (r ++ " = call ptr @unison_jit_bytes_encode_nat(ptr %ctx, i64 " ++ n ++ ", i64 " ++ show width ++ ", i64 " ++ show be ++ ")")
+    storeU (d + 1) "-1"
+    storeB (d + 1) r
+    k (d + 1)
+  ForeignCall _ f args | enabled fe "bytes", Just (width, be) <- readKind f, [ki, kb] <- argSources fe d args -> do
+    slow <- callOutExit True fe d instr sect
+    ix <- loadU ki
+    b <- loadB kb
+    ok <- fresh "ok"
+    emit (ok ++ " = call i64 @unison_jit_bytes_read_ok(ptr " ++ b ++ ", i64 " ++ ix ++ ", i64 " ++ show width ++ ")")
+    miss <- fresh "miss"
+    emit (miss ++ " = icmp ne i64 " ++ ok ++ ", 1")
+    branchIf "bytes" miss slow
+    v <- fresh "read"
+    emit (v ++ " = call i64 @unison_jit_bytes_read_at(ptr " ++ b ++ ", i64 " ++ ix ++ ", i64 " ++ show width ++ ", i64 " ++ show be ++ ")")
+    result fe d (feTagNat fe) v
+    k (d + 1)
+  ForeignCall _ f args | enabled fe "bytes", Just base <- toBaseKind f, [kb] <- argSources fe d args -> do
+    slow <- callOutExit True fe d instr sect
+    b <- loadB kb
+    listHelper d slow ("@unison_jit_bytes_to_base(ptr %ctx, ptr " ++ b ++ ", i64 " ++ show base ++ ")")
+    k (d + 1)
+  ForeignCall _ f args
+    | enabled fe "bytes",
+      Just base <- fromBaseKind f,
+      [kb] <- argSources fe d args,
+      Just eitherIx <- Map.lookup (KeyEnum Ty.eitherRef (PackedTag 0)) (envPool (feEnv fe)) -> do
+        let PackedTag rightTag = TT.rightTag
+        slow <- callOutExit True fe d instr sect
+        b <- loadB kb
+        eith <- poolValue eitherIx
+        listHelper d slow ("@unison_jit_bytes_from_base(ptr %ctx, ptr " ++ b ++ ", i64 " ++ show base ++ ", ptr " ++ eith ++ ", i64 " ++ show rightTag ++ ")")
         k (d + 1)
   Prim2 IDXS i j
     | enabled fe "list",
@@ -2840,42 +3109,48 @@ genUniversal fe d op ki kj instr sect = do
   fast <- fresh "fast"
   emit (fast ++ " = and i1 " ++ same ++ ", " ++ known)
   go <- freshLabel "univ"
-  -- which kinds of rope the equality helper is to take: texts, bytes
+  -- which kinds of rope the helpers are to take: texts, bytes
   let kinds = (if enabled fe "text" then 1 else 0) + (if enabled fe "bytes" then 2 else 0) :: Int
-  if op == EQLU && kinds /= 0
+      isCmp = op == CMPU
+      deliver c = if isCmp then result fe d (feTagInt fe) c else resultBool fe d c
+  if kinds /= 0
     then do
-      -- two texts or two bytes are compared by the helper; anything else
+      -- two texts or two bytes are compared by a helper; anything else
       -- that isn't a pair of numbers goes to the interpreter
       feq <- freshLabel "feq"
       emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ feq ++ likely)
       startBlock feq
-      r <- fresh "eq"
-      emit (r ++ " = call i64 @unison_jit_foreign_eq(ptr " ++ bi ++ ", ptr " ++ bj ++ ", i64 " ++ show kinds ++ ")")
+      r <- fresh "cmp"
+      let (helper, missVal) = if op == EQLU then ("unison_jit_foreign_eq", "-1") else ("unison_jit_foreign_cmp", "2")
+      emit (r ++ " = call i64 @" ++ helper ++ "(ptr " ++ bi ++ ", ptr " ++ bj ++ ", i64 " ++ show kinds ++ ")")
       miss <- fresh "miss"
-      emit (miss ++ " = icmp slt i64 " ++ r ++ ", 0")
+      emit (miss ++ " = icmp eq i64 " ++ r ++ ", " ++ missVal)
       ok <- freshLabel "feq.ok"
       emit ("br i1 " ++ miss ++ ", label %" ++ slow ++ ", label %" ++ ok ++ unlikely)
       startBlock ok
-      c2 <- fresh "c"
-      emit (c2 ++ " = icmp ne i64 " ++ r ++ ", 0")
+      c2 <- case op of
+        EQLU -> cmp "ne" r "0"
+        LEQU -> cmp "sle" r "0"
+        LESU -> cmp "slt" r "0"
+        _ -> pure r
       join <- freshLabel "univ.join"
       emit ("br label %" ++ join)
       startBlock go
-      c1 <- cmp "eq" ui uj
+      c1 <- genUniversalValue op isInt ui uj
       emit ("br label %" ++ join)
       startBlock join
       c <- fresh "c"
-      emit (c ++ " = phi i1 [ " ++ c1 ++ ", %" ++ go ++ " ], [ " ++ c2 ++ ", %" ++ ok ++ " ]")
-      resultBool fe d c
+      emit (c ++ " = phi " ++ (if isCmp then "i64" else "i1") ++ " [ " ++ c1 ++ ", %" ++ go ++ " ], [ " ++ c2 ++ ", %" ++ ok ++ " ]")
+      deliver c
     else do
       emit ("br i1 " ++ fast ++ ", label %" ++ go ++ ", label %" ++ slow ++ likely)
       startBlock go
-      genUniversalFast fe d op isInt ui uj
+      genUniversalValue op isInt ui uj >>= deliver
 
--- | The rest of 'genUniversal': the comparison of two words of the same
--- numeric type.
-genUniversalFast :: FnEnv -> Int -> Prim2 -> String -> String -> String -> Gen ()
-genUniversalFast fe d op isInt ui uj = do
+-- | The comparison of two words of the same numeric type: an i1 for the
+-- boolean operations, the Int -1, 0 or 1 for compare.
+genUniversalValue :: Prim2 -> String -> String -> String -> Gen String
+genUniversalValue op isInt ui uj = do
   let signedUnsigned s u = do
         cs <- cmp s ui uj
         cu <- cmp u ui uj
@@ -2883,18 +3158,17 @@ genUniversalFast fe d op isInt ui uj = do
         emit (r ++ " = select i1 " ++ isInt ++ ", i1 " ++ cs ++ ", i1 " ++ cu)
         pure r
   case op of
-    EQLU -> cmp "eq" ui uj >>= resultBool fe d
-    LEQU -> signedUnsigned "sle" "ule" >>= resultBool fe d
-    LESU -> signedUnsigned "slt" "ult" >>= resultBool fe d
+    EQLU -> cmp "eq" ui uj
+    LEQU -> signedUnsigned "sle" "ule"
+    LESU -> signedUnsigned "slt" "ult"
     _ -> do
-      -- compare: -1, 0 or 1 as an Int
       lt <- signedUnsigned "slt" "ult"
       eq <- cmp "eq" ui uj
       a <- fresh "r"
       emit (a ++ " = select i1 " ++ eq ++ ", i64 0, i64 1")
       r <- fresh "r"
       emit (r ++ " = select i1 " ++ lt ++ ", i64 -1, i64 " ++ a)
-      result fe d (feTagInt fe) r
+      pure r
 
 -- | An object with pointer tag 7 and the given info pointer, else branch
 -- to @slow@; gives the untagged address.

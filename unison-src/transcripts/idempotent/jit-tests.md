@@ -1309,6 +1309,22 @@ weave n =
       go (acc + Text.size mid + (if same then 1 else 0)) (if Text.size u > 100000 then mid else u) (i + 1)
   go 0 (grow 100) 0
 
+-- for printing the results of the operations that return structures
+restSize : Optional (Char, Text) -> Nat
+restSize = cases
+  None -> 0
+  Some (c, rest) -> Text.size rest
+
+floatOpt : Optional Float -> Text
+floatOpt = cases
+  None -> "none"
+  Some f -> Float.toText f
+
+decodedSize : Either Failure Text -> Int
+decodedSize = cases
+  Left _ -> -1
+  Right t -> Nat.toInt (Text.size t)
+
 > Text.size (grow 20000)
 > Text.size (growFront 3000)
 > weave 60
@@ -1317,52 +1333,119 @@ weave n =
 > recut (grow 3000)
 > wide 5000
 > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+> (Text.uncons "", Text.uncons "héllo", Text.unsnoc "héllo", restSize (Text.uncons (grow 100)))
+> (Text.toCharList "a€😀", Text.fromCharList (List.cons ?a (Text.toCharList (grow 40))), Text.size (Text.fromCharList (Text.toCharList (grow 1000))))
+> (Nat.toText 0, Nat.toText 18446744073709551615, Int.toText -9223372036854775808, Int.toText +42, Float.toText 0.1, Float.toText 1.0e7, Float.toText 123456.789, Float.toText -0.0, Float.toText (Float.fromRepresentation 9218868437227405312))
+> (Nat.fromText "42", Nat.fromText "-1", Nat.fromText "x", Int.fromText "-42", Int.fromText "+7", Int.fromText "9223372036854775808", Float.fromText "1.5e3", Float.fromText "1.", floatOpt (Float.fromText "NaN"))
+> (Text.indexOf "lo" "héllo", Text.indexOf "z" "héllo", Text.indexOf "" "abc", Text.indexOf "ba" (grow 2000), "abc" Universal.< "abd", "b" Universal.<= "abc", Universal.compare "abc" "abd", Universal.compare (grow 3) (grow 3))
+> (Text.repeat 3 "ab", Text.size (Text.repeat 1000 "héllo"), Text.reverse "héllo", Text.eq (Text.reverse (Text.drop 1 (grow 100))) (Text.take 198 (grow 100)), Text.toUppercase "héllo wörld", Text.toUppercase "hello", Text.toLowercase "HELLO", Char.toText ?€)
+> (Text.toUtf8 "héllo", decodedSize (Text.fromUtf8.impl (Text.toUtf8 (grow 100))), decodedSize (Text.fromUtf8.impl 0xsff))
 ```
 
 ``` ucm :added-by-ucm
   Loading changes detected in scratch.u.
 
-  + chop      : Text -> Nat
-  + eat       : Text -> Nat
-  + grow      : Nat -> Text
-  + growFront : Nat -> Text
-  + recut     : Text -> Nat
-  + weave     : Nat -> Nat
-  + wide      : Nat -> Nat
+  + chop        : Text -> Nat
+  + decodedSize : Either Failure Text -> Int
+  + eat         : Text -> Nat
+  + floatOpt    : Optional Float -> Text
+  + grow        : Nat -> Text
+  + growFront   : Nat -> Text
+  + recut       : Text -> Nat
+  + restSize    : Optional (Char, Text) -> Nat
+  + weave       : Nat -> Nat
+  + wide        : Nat -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    58 | > Text.size (grow 20000)
+    74 | > Text.size (grow 20000)
            ⧩
            40000
 
-    59 | > Text.size (growFront 3000)
+    75 | > Text.size (growFront 3000)
            ⧩
            10890
 
-    60 | > weave 60
+    76 | > weave 60
            ⧩
            2142964
 
-    61 | > eat (grow 2000)
+    77 | > eat (grow 2000)
            ⧩
            8002000
 
-    62 | > chop (growFront 500)
+    78 | > chop (growFront 500)
            ⧩
            1390
 
-    63 | > recut (grow 3000)
+    79 | > recut (grow 3000)
            ⧩
            858
 
-    64 | > wide 5000
+    80 | > wide 5000
            ⧩
            25001
 
-    65 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+    81 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
            ⧩
            (true, false, "ab", "bab", "", 0)
+
+    82 | > (Text.uncons "", Text.uncons "héllo", Text.unsnoc "héllo", restSize (Text.uncons (grow 100)))
+           ⧩
+           (None, Some (?h, "éllo"), Some ("héll", ?o), 199)
+
+    83 | > (Text.toCharList "a€😀", Text.fromCharList (List.cons ?a (Text.toCharList (grow 40))), Text.size (Text.fromCharList (Text.toCharList (grow 1000))))
+           ⧩
+           ( [?a, ?€, ?😀]
+           , "aabababababababababababababababababababababababababababababababababababababababab"
+           , 2000
+           )
+
+    84 | > (Nat.toText 0, Nat.toText 18446744073709551615, Int.toText -9223372036854775808, Int.toText +42, Float.toText 0.1, Float.toText 1.0e7, Float.toText 123456.789, Float.toText -0.0, Float.toText (Float.fromRepresentation 9218868437227405312))
+           ⧩
+           ( "0"
+           , "18446744073709551615"
+           , "-9223372036854775808"
+           , "42"
+           , "0.1"
+           , "1.0e7"
+           , "123456.789"
+           , "-0.0"
+           , "Infinity"
+           )
+
+    85 | > (Nat.fromText "42", Nat.fromText "-1", Nat.fromText "x", Int.fromText "-42", Int.fromText "+7", Int.fromText "9223372036854775808", Float.fromText "1.5e3", Float.fromText "1.", floatOpt (Float.fromText "NaN"))
+           ⧩
+           ( Some 42
+           , None
+           , None
+           , Some -42
+           , Some +7
+           , None
+           , Some 1500.0
+           , None
+           , "NaN"
+           )
+
+    86 | > (Text.indexOf "lo" "héllo", Text.indexOf "z" "héllo", Text.indexOf "" "abc", Text.indexOf "ba" (grow 2000), "abc" Universal.< "abd", "b" Universal.<= "abc", Universal.compare "abc" "abd", Universal.compare (grow 3) (grow 3))
+           ⧩
+           (Some 3, None, Some 0, Some 1, true, false, -1, +0)
+
+    87 | > (Text.repeat 3 "ab", Text.size (Text.repeat 1000 "héllo"), Text.reverse "héllo", Text.eq (Text.reverse (Text.drop 1 (grow 100))) (Text.take 198 (grow 100)), Text.toUppercase "héllo wörld", Text.toUppercase "hello", Text.toLowercase "HELLO", Char.toText ?€)
+           ⧩
+           ( "ababab"
+           , 5000
+           , "olléh"
+           , false
+           , "HÉLLO WÖRLD"
+           , "HELLO"
+           , "hello"
+           , "€"
+           )
+
+    88 | > (Text.toUtf8 "héllo", decodedSize (Text.fromUtf8.impl (Text.toUtf8 (grow 100))), decodedSize (Text.fromUtf8.impl 0xsff))
+           ⧩
+           (0xs68c3a96c6c6f, +200, -1)
 ```
 
 ## Bytes
@@ -1433,6 +1516,11 @@ bsum b =
   go acc i = if i == Bytes.size f then acc else go (acc + byte i * (i + 1)) (i + 1)
   go 0 0
 
+decodedBytes : Either Text Bytes -> Int
+decodedBytes = cases
+  Left _ -> -1
+  Right b -> Nat.toInt (Bytes.size b)
+
 > Bytes.size (bgrow 20000)
 > Bytes.size (bgrowFront 3000)
 > bweave 60
@@ -1443,60 +1531,98 @@ bsum b =
 > bsum (bgrowFront 1000)
 > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
 > (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+> (##Bytes.toList (bgrow 3), ##Bytes.fromList (##Bytes.toList (bgrow 300)) Universal.== bgrow 300, ##Bytes.indexOf 0xs01ff (bgrow 3), ##Bytes.indexOf 0xsffff (bgrow 3), Universal.compare 0xs0102 0xs0103, Universal.compare (bgrow 5) (bgrow 5), 0xs01 Universal.< 0xs0100)
+> (##Bytes.decodeNat16be 0xs0102ff, ##Bytes.decodeNat32le 0xs01020304, ##Bytes.decodeNat64be (bgrow 2), ##Bytes.decodeNat64be 0xs01, ##Bytes.encodeNat16be 258, ##Bytes.encodeNat64le 1, ##Bytes.encodeNat32be 4294967295)
+> (##Bytes.toBase16 0xs00ff10, ##Bytes.toBase32 0xs68656c6c6f, ##Bytes.toBase64 0xs68656c6c6f, ##Bytes.toBase64UrlUnpadded 0xsfbff, ##Bytes.fromBase16 0xs30306666, ##Bytes.fromBase16 0xs303066, decodedBytes (##Bytes.fromBase64 (##Bytes.toBase64 (bgrow 50))), decodedBytes (##Bytes.fromBase32 (##Bytes.toBase32 (bgrow 7))))
 ```
 
 ``` ucm :added-by-ucm
   Loading changes detected in scratch.u.
 
-  + bchop      : Bytes -> Nat
-  + beat       : Bytes -> Nat
-  + bgrow      : Nat -> Bytes
-  + bgrowFront : Nat -> Bytes
-  + brecut     : Bytes -> Nat
-  + bsum       : Bytes -> Nat
-  + bweave     : Nat -> Nat
+  + bchop        : Bytes -> Nat
+  + beat         : Bytes -> Nat
+  + bgrow        : Nat -> Bytes
+  + bgrowFront   : Nat -> Bytes
+  + brecut       : Bytes -> Nat
+  + bsum         : Bytes -> Nat
+  + bweave       : Nat -> Nat
+  + decodedBytes : Either Text Bytes -> Int
 
   Run `update` to apply these changes to your codebase.
 
-    62 | > Bytes.size (bgrow 20000)
+    67 | > Bytes.size (bgrow 20000)
            ⧩
            40000
 
-    63 | > Bytes.size (bgrowFront 3000)
+    68 | > Bytes.size (bgrowFront 3000)
            ⧩
            9000
 
-    64 | > bweave 60
+    69 | > bweave 60
            ⧩
            2142485
 
-    65 | > beat (bgrow 2000)
+    70 | > beat (bgrow 2000)
            ⧩
            759028
 
-    66 | > bchop (bgrowFront 500)
+    71 | > bchop (bgrowFront 500)
            ⧩
            1125750
 
-    67 | > brecut (bgrow 3000)
+    72 | > brecut (bgrow 3000)
            ⧩
            858
 
-    68 | > bsum (bgrow 1000)
+    73 | > bsum (bgrow 1000)
            ⧩
            389807014
 
-    69 | > bsum (bgrowFront 1000)
+    74 | > bsum (bgrowFront 1000)
            ⧩
            516376967
 
-    70 | > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
+    75 | > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
            ⧩
            (true, false, [0, 255, 1], [255, 39, 255])
 
-    71 | > (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+    76 | > (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
            ⧩
            (Some 255, None, 800, true, true, false, true)
+
+    77 | > (##Bytes.toList (bgrow 3), ##Bytes.fromList (##Bytes.toList (bgrow 300)) Universal.== bgrow 300, ##Bytes.indexOf 0xs01ff (bgrow 3), ##Bytes.indexOf 0xsffff (bgrow 3), Universal.compare 0xs0102 0xs0103, Universal.compare (bgrow 5) (bgrow 5), 0xs01 Universal.< 0xs0100)
+           ⧩
+           ( [0, 255, 1, 255, 2, 255]
+           , true
+           , Some 2
+           , None
+           , -1
+           , +0
+           , true
+           )
+
+    78 | > (##Bytes.decodeNat16be 0xs0102ff, ##Bytes.decodeNat32le 0xs01020304, ##Bytes.decodeNat64be (bgrow 2), ##Bytes.decodeNat64be 0xs01, ##Bytes.encodeNat16be 258, ##Bytes.encodeNat64le 1, ##Bytes.encodeNat32be 4294967295)
+           ⧩
+           ( Some (258, 0xsff)
+           , Some (67305985, 0xs)
+           , None
+           , None
+           , 0xs0102
+           , 0xs0100000000000000
+           , 0xsffffffff
+           )
+
+    79 | > (##Bytes.toBase16 0xs00ff10, ##Bytes.toBase32 0xs68656c6c6f, ##Bytes.toBase64 0xs68656c6c6f, ##Bytes.toBase64UrlUnpadded 0xsfbff, ##Bytes.fromBase16 0xs30306666, ##Bytes.fromBase16 0xs303066, decodedBytes (##Bytes.fromBase64 (##Bytes.toBase64 (bgrow 50))), decodedBytes (##Bytes.fromBase32 (##Bytes.toBase32 (bgrow 7))))
+           ⧩
+           ( 0xs303066663130
+           , 0xs4e42535759334450
+           , 0xs614756736247383d
+           , 0xs2d5f38
+           , Right 0xs00ff
+           , Left "base16: input: invalid length"
+           , +100
+           , +14
+           )
 ```
 
 ## Partial applications
