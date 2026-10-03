@@ -165,6 +165,24 @@ than deleting it.
   removes a call-out continuation and cools the re-entry points of its callers. Noted
   2026-09-30 after M4.
 
+- **No thunks on the boxed stack.** Paul's preferred fix for the untagged-pointer crash
+  (2026-10-03; see the progress log, "A fixed crash: untagged pointers in strict fields"):
+  make the interpreter guarantee that a boxed stack slot only ever holds an evaluated, tagged
+  pointer, instead of (or as well as) native code checking the tag on every store into a
+  strict field. The hazard funnels through `bpoke`, `bpokeOff` and `poke` in `Stack.hs`; the
+  two sources seen were a CAF constant stored as itself (`noneClo`: `bpoke`'s bang doesn't
+  help, GHC treats a constructor application's CAF as already in WHNF and drops the `seq`)
+  and a lazily built value (`someClo (encodeVal v)` in `writeBack`). The force has to be one
+  GHC can't reason away, `evaluate` (`seq#`) in `bpoke`, or constants that are genuinely
+  static. Cost: a tag test and an untaken branch per boxed store, to be measured on the
+  suite; it may even help the interpreter, since nothing downstream enters a thunk on read.
+  What it buys: a real invariant that is simpler than "every native write checks", covers
+  places not instrumented, and makes the read-side guard in `genDMatchClosure` stop costing
+  a resume for a `None` from a call-out. Plan: temporarily disable `requireTagged`, confirm
+  the old reproducers (`> Bytes.at 0 0xs`, `> Text.uncons "abc"`) crash again, land the
+  `bpoke` change, confirm they pass, re-enable the checks as a cheap safety net (a violation
+  is silent heap corruption found two GCs later), and measure both the interpreter and
+  `jitSuite`.
 - **`Bytes` operations.** Done 2026-10-02: the C rope functions take a `RopeKind`, and
   `Bytes.size`, `++`, `take`, `drop`, `at` and `flatten` are native, as is universal `==`
   on two texts or two bytes (see the progress log, "The bytes helpers"). Left as
