@@ -259,6 +259,8 @@ without statistics. Fixed in step 0.
   *After M6* (2026-10-02): `Bytes` got the same helpers (the rope functions take a kind
   of chunk), plus `at` and `flatten`, and universal `==` on texts and bytes; see the
   progress log ("The bytes helpers").
+  The Bytes tests also exposed an older crash (an untagged pointer copied into a strict
+  field by `Pack`), fixed 2026-10-03; see the progress log.
 - [x] **6. Calls to ability handlers.** `App (Dyn i)` finds the handler in the dynamic
   environment, which lives in the interpreter's `HEnv`. **Measured first, and not built:**
   a handler's function begins with `RMatch` on the request, and then either `Capture`s the

@@ -63,6 +63,8 @@ Update it whenever a step finishes or something non-obvious is learned.
   (compile log, including why a combinator or part of one was left to the interpreter),
   `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell sides; unusable
   on programs that load base, it exhausts memory during the load), `UNISON_JIT_DUMP_MCODE=1`,
+  `UNISON_JIT_TRACE_YIELD=1` prints each value native code yields: its pointer tag and closure
+  type, and its fields two levels down (cheap; it found the untagged-pointer crash).
   `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS=each` (the
   exits taken since the program last wrote output, printed after each write: per-benchmark
   exits for a suite that prints a line per benchmark), `UNISON_JIT_STATS_EVERY=N` (with
@@ -819,47 +821,48 @@ to the chunk (the 100000-byte sample was built two bytes at a time, so it is 160
 checks and the rest of `jitSuite` are unchanged (every other row within 2% of the previous
 run).
 
-## Open bugs
+## A fixed crash: untagged pointers in strict fields (2026-10-03)
 
-- **Eager mode on the optimized build crashes on an `Optional` returned to a watch
-  expression from a call-out** (found 2026-10-02 while adding the Bytes tests; it is in the
-  commit before the Bytes work too, so it isn't theirs). Minimal reproduction on the
-  optimized build: a transcript with the watch `> (List.at 6 [1, 2, 3], 1)` run with
-  `UNISON_JIT=eager UNISON_JIT_DISABLE=list` segfaults; so does `> Text.uncons "abc"` with
-  nothing disabled, and `> List.at 1 [1, 2, 3]` with the list helpers off. `> Bytes.at 5
-  (bgrow 3)` (a `Some` of a fresh Nat) and `> Nat.toText 5` are fine, and so is consuming
-  the `Optional` natively (`match ... with None -> 1; Some _ -> 2`). The fast build, the
-  debug build (`-O0`) and `UNISON_JIT=on` never crash. The debug RTS (an optimized build
-  with `--ghc-options=-debug`, work dir `.stack-work-optdebug`) shows the GC's `evacuate`
-  faulting on a NULL pointer field of a thunk allocated by `Unison.Runtime.Decompile`, so
-  the decompiler was handed a value with a null closure in it; `+RTS -DS` doesn't assert
-  first. Marking every card of the boxed stack dirty on exit made no difference, and the
-  generated IR is the same as for the passing `Some`. lldb needs `--source-on-crash` with
-  the RTS's timer signals passed (`process handle SIGALRM SIGVTALRM SIGUSR2 -s false -n
-  false -p true`) and `PAGER=cat`, else it stalls. The worktree `/Users/pchiusano/unison-old`
-  holds commit 45cabf81b with an optimized build (`.stack-work-opt`) for bisecting. The Bytes
-  tests print `Bytes.at` through a `match` (`byteAt`) to stay clear of it.
-  It is not GC timing (2026-10-03): the outcome is deterministic, and stays the same with
-  nursery sizes of 64k, 100k, 337k, 1m and 16m (`+RTS -A...`), which move every collection
-  point: the `None` watch crashes under all of them and the `Some 255` watch passes under
-  all of them. What separates the values: the passing `Some 255` is built entirely during
-  the call-out from a fresh Nat, while each failing value is, or contains, a closure that
-  existed before the call-out (`noneClo` is a static constant in `Foreign/Function.hs`; the
-  list element and the literal's text were made earlier). Next place to look: how the
-  decompiler ends up holding a null closure pointer for exactly those shapes. (The
-  interpreter's `bpoke` leaves the unboxed half of a slot stale; Paul, 2026-10-03: that is
-  fine and expected, stale unboxed words get overwritten, it is only stale boxed values
-  that must not be left behind, since they retain garbage. Not a lead.) Matching on the `Optional` natively is fine;
-  only handing it back to the interpreter as the result fails.
-  A correction and a clue (2026-10-03, from IR dumps): in this program no compiled code
-  packs a `None`, so the pool has no `None` constant and the native `List.at`/`Bytes.at`
-  cases (which need one) fall back to the call-out. The `(List.at 6 [1, 2, 3], 1)` watch
-  therefore takes the interpreter's `None` whether the list helpers are on or off, yet it
-  passes with them on and crashes with them off: the one difference is whether the
-  `[1, 2, 3]` literal before the index was built natively or by an interpreter call-out.
-  So the trigger isn't the `None` alone; the call-outs that came before it in the frame
-  matter. `> Bytes.at 0 0xs` (the literal is a call-out, then the index) crashes;
-  `> Bytes.at 0 0xsdeadbeef` prints `Some 222`.
+Found while adding the Bytes tests, and older than them (the commit before reproduced it):
+in eager mode on the optimized build, a watch expression whose value was an `Optional`
+from an interpreter call-out segfaulted in the GC. Minimal reproductions were
+`> Bytes.at 0 0xs`, `> Text.uncons "abc"`, and `> (List.at 6 [1, 2, 3], 1)` with
+`UNISON_JIT_DISABLE=list`; `> Bytes.at 0 0xsdeadbeef` and `> Nat.toText 5` were fine, as
+was matching on the `Optional` natively. The fast build, the `-O0` debug build and
+`UNISON_JIT=on` never crashed, and nursery sizes from 64k to 16m changed nothing.
+
+- **Cause.** The interpreter can leave an *unevaluated, untagged* pointer in a boxed stack
+  slot: `writeBack stk Nothing = bpoke stk noneClo` stores the `noneClo` CAF itself (GHC
+  drops `bpoke`'s force because the CAF's unfolding is a constructor application), and a
+  `Some` built by `writeBack` is a lazy thunk. The interpreter is fine with that, since
+  Haskell evaluates what it reads from the array. Native code isn't: the transcript's watch
+  wrapper packs the result into a pair with `Pack`, which copied the raw pointer into the
+  pair's strict `Val` field. GHC's optimized code assumes a strict field holds an evaluated,
+  tagged pointer and reads through it without a check, so the decompiler took the thunk's
+  words for `GEnum`'s fields and captured a null `Reference` in a thunk, which the next GC
+  tripped over. At `-O0` GHC checks the tag and enters the thunk, hence no crash there;
+  `Some 255` was a fresh, tagged heap constructor, hence fine. The native *read* side was
+  already guarded (`genDMatchClosure` switches on the pointer tag and sends tag 0 to the
+  interpreter, from M4's segment-box lesson); the *write* side wasn't.
+- **Fix.** `requireTagged` in `Codegen.hs`: wherever native code copies a boxed stack value
+  into a strict field (`Pack`, list literals, `Ref` writes, mutable-array writes) it checks
+  the pointer tag first and takes the slow path for tag 0; `unison_jit_list_push` returns
+  "not handled" for an untagged element. The cost is an `and`, a compare and a branch per
+  field; `jitSuite` is unchanged (every row within noise). The Bytes tests print `Bytes.at`
+  results directly again.
+- **How it was found.** The debug RTS (an optimized build with `--ghc-options=-debug` in
+  `.stack-work-optdebug`; the `-O0` debug build doesn't reproduce it) put the fault in
+  `evacuate` on a null field of a `Decompile` thunk. `UNISON_JIT_TRACE_YIELD=1` (new; prints
+  each yielded value's pointer tag and closure type, with its fields two levels down) then
+  showed the pair's field as `tag 0 type THUNK_STATIC` in the crashing run and a tagged
+  constructor in the passing one. lldb needs `--source-on-crash` with the RTS's timer signals
+  passed (`process handle SIGALRM SIGVTALRM SIGUSR2 -s false -n false -p true`), `PAGER=cat`
+  and stdin closed, else it stalls on a prompt. The worktree `/Users/pchiusano/unison-old`
+  (commit 45cabf81b, optimized build) can go.
+- **The rule, for the design doc too:** a pointer native code took from a stack slot may be
+  untagged, so it must be checked both before native code reads through it and before
+  native code stores it into a strict field. Arrays and the stack itself are fine either
+  way.
 
 ## Baseline: interpreter only
 
@@ -1074,6 +1077,15 @@ The existing suite (`suite`), run once by hand for reference. The benchmark tran
   Text, Bytes). (2) The `jit_codebase` has no `Optional.getOrElse`; test code uses a
   `match`. (3) With `use Nat ==` in a stanza, `==` on anything but Nats won't resolve;
   write `Universal.==` for the universal one.
-  (4) A watch expression whose value is an `Optional` from a call-out crashes eager mode on
-  the optimized build; this is older than the Bytes work (see "Open bugs"), and cost most
-  of the session to pin down that far.
+  (4) A watch expression whose value is an `Optional` from a call-out crashed eager mode on
+  the optimized build; older than the Bytes work, and fixed the next day (see "A fixed
+  crash: untagged pointers in strict fields").
+- 2026-10-03: the crash above was an untagged (unevaluated) pointer copied by native code
+  into a strict field. Lesson: **GHC's optimized code trusts strict fields to hold tagged,
+  evaluated pointers, and the interpreter can leave untagged ones on the stack**, so native
+  code checks the tag on every write into a strict field, as it already did on reads.
+  Things that got in the way: the `-O0` debug build can't show an `-O2`-only bug (build the
+  debug RTS over the optimized build instead); lldb in batch mode needs the on-crash
+  command file and the RTS signals passed through; and the first theories (GC timing, card
+  marking, the stale unboxed word) all had to be ruled out by experiment before the trace
+  of the yielded value's tag settled it in one run.

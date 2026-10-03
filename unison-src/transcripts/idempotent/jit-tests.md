@@ -1423,15 +1423,6 @@ bweave n =
       go (acc + Bytes.size mid + (if same then 1 else 0)) (if Bytes.size u > 100000 then mid else u) (i + 1)
   go 0 (bgrow 100) 0
 
--- Bytes.at as a Nat (256 for None). A watch expression whose value is an
--- Optional straight from a call-out trips an older bug of eager mode on the
--- optimized build (see "Open bugs" in docs/jit-progress.md), so the tests
--- match on the Optional instead of printing it.
-byteAt : Nat -> Bytes -> Nat
-byteAt i b = match Bytes.at i b with
-  None -> 256
-  Some x -> x
-
 -- every byte of a flattened bytes, weighted by its position
 bsum : Bytes -> Nat
 bsum b =
@@ -1451,7 +1442,7 @@ bsum b =
 > bsum (bgrow 1000)
 > bsum (bgrowFront 1000)
 > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
-> (byteAt 5 (bgrow 3), byteAt 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+> (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
 ```
 
 ``` ucm :added-by-ucm
@@ -1464,49 +1455,48 @@ bsum b =
   + brecut     : Bytes -> Nat
   + bsum       : Bytes -> Nat
   + bweave     : Nat -> Nat
-  + byteAt     : Nat -> Bytes -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    71 | > Bytes.size (bgrow 20000)
+    62 | > Bytes.size (bgrow 20000)
            ⧩
            40000
 
-    72 | > Bytes.size (bgrowFront 3000)
+    63 | > Bytes.size (bgrowFront 3000)
            ⧩
            9000
 
-    73 | > bweave 60
+    64 | > bweave 60
            ⧩
            2142485
 
-    74 | > beat (bgrow 2000)
+    65 | > beat (bgrow 2000)
            ⧩
            759028
 
-    75 | > bchop (bgrowFront 500)
+    66 | > bchop (bgrowFront 500)
            ⧩
            1125750
 
-    76 | > brecut (bgrow 3000)
+    67 | > brecut (bgrow 3000)
            ⧩
            858
 
-    77 | > bsum (bgrow 1000)
+    68 | > bsum (bgrow 1000)
            ⧩
            389807014
 
-    78 | > bsum (bgrowFront 1000)
+    69 | > bsum (bgrowFront 1000)
            ⧩
            516376967
 
-    79 | > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
+    70 | > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
            ⧩
            (true, false, [0, 255, 1], [255, 39, 255])
 
-    80 | > (byteAt 5 (bgrow 3), byteAt 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+    71 | > (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
            ⧩
-           (255, 256, 800, true, true, false, true)
+           (Some 255, None, 800, true, true, false, true)
 ```
 
 ## Partial applications

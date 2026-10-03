@@ -2225,7 +2225,8 @@ genInstr fe d instr sect k = case instr of
   Pack r t args
     | Just refIx <- Map.lookup (KeyEnum r (PackedTag 0)) (envPool (feEnv fe)),
       Just fields <- packFields fe d args -> do
-        genPack fe d refIx t fields
+        slow <- exitBlock fe d (Resume (feCix fe) sect)
+        genPack fe d refIx t fields slow
         k (d + 1)
   Prim1 op i | prim1Supported op -> do
     x <- loadU (d - i)
@@ -2325,9 +2326,11 @@ genInstr fe d instr sect k = case instr of
     listHelper d slow ("@unison_jit_list_append(ptr %ctx, ptr " ++ x ++ ", ptr " ++ y ++ ")")
     k (d + 1)
   -- A list literal: the elements are added one at a time to a deque that
-  -- is wrapped at the end. Nothing can go wrong, so there is no slow path.
+  -- is wrapped at the end. The only slow path is an untagged element.
   Seq args | enabled fe "list" -> do
     vals <- loadSources (argSources fe d args)
+    slow <- exitBlock fe d (Resume (feCix fe) sect)
+    requireTagged slow (map snd vals)
     let add acc (u, b) = do
           r <- fresh "lit"
           emit (r ++ " = call ptr @unison_jit_list_lit(ptr %ctx, ptr " ++ acc ++ ", i64 " ++ u ++ ", ptr " ++ b ++ ")")
@@ -2547,12 +2550,38 @@ packFields fe d args = case args of
   ZArgs -> Nothing
   _ -> Just (argSources fe d args)
 
+-- | Branches to @slow@ if any of the boxed values is an untagged pointer.
+-- The interpreter can leave one in a stack slot: a CAF such as @noneClo@
+-- (GHC drops the force in @bpoke@ for a constructor application) or a
+-- lazily built result, both unevaluated thunks. Native code must not copy
+-- such a pointer into a strict field (a @Val@'s, a constructor's), because
+-- GHC's optimized code reads a strict field without evaluating it and
+-- would take the thunk's words for the constructor's fields. Reads through
+-- a pointer are guarded by the tag switch in 'genDMatchClosure'; this
+-- guards the writes. (Found 2026-10-03: a @None@ from a call-out packed into
+-- a pair crashed the GC in eager mode on the optimized build.)
+requireTagged :: String -> [String] -> Gen ()
+requireTagged slow bs = do
+  zs <- forM bs $ \b -> do
+    raw <- fresh "raw"
+    emit (raw ++ " = ptrtoint ptr " ++ b ++ " to i64")
+    t <- fresh "ptrtag"
+    emit (t ++ " = and i64 " ++ raw ++ ", 7")
+    z <- fresh "untagged"
+    emit (z ++ " = icmp eq i64 " ++ t ++ ", 0")
+    pure z
+  case zs of
+    [] -> pure ()
+    z0 : rest -> do
+      anyZ <- foldM (\acc z -> do r <- fresh "untagged"; emit (r ++ " = or i1 " ++ acc ++ ", " ++ z); pure r) z0 rest
+      branchIf "tagged" anyZ slow
+
 -- | Allocates a constructor with the given fields and pushes it. The
 -- reference comes from the pool entry for the type's enumeration
 -- constructor 0 (its first field). See docs/jit-m3.md for why each Pack
--- allocates separately.
-genPack :: FnEnv -> Int -> Int -> PackedTag -> [Int] -> Gen ()
-genPack fe d refIx (PackedTag t) fields = do
+-- allocates separately. An untagged field value goes to @slow@.
+genPack :: FnEnv -> Int -> Int -> PackedTag -> [Int] -> String -> Gen ()
+genPack fe d refIx (PackedTag t) fields slow = do
   let env = feEnv fe
       ls = envLayouts env
       rts = envRts env
@@ -2573,6 +2602,7 @@ genPack fe d refIx (PackedTag t) fields = do
         | otherwise = conWords + 2 * boxWords + bytesWords + ptrsWords
   -- the fields, before the allocation call so nothing is held across it
   vals <- forM fields $ \k -> (,) <$> loadU k <*> loadB k
+  requireTagged slow (map snd vals)
   -- the Reference: first field of the pool's Enum for this type
   usePool refIx
   ea <- fresh "enum.a"
@@ -2745,6 +2775,7 @@ genRefWrite fe d k kv unitIx instr sect = do
   -- point only for what is on the Unison stack, not for registers
   u <- loadU kv
   b <- loadB kv
+  requireTagged slow [b]
   (mv, _, _) <- refFields fe k slow
   leftA <- ctxField env oAllocLeft
   left <- fresh "alloc.left"
@@ -2919,14 +2950,16 @@ valFields fe valp slow = do
   pure (u, b)
 
 -- | Allocates a @Val@ holding the value in slot @kv@; gives its tagged
--- address. The value is read before the allocation call.
-allocVal :: FnEnv -> Int -> Gen String
-allocVal fe kv = do
+-- address. The value is read before the allocation call; an untagged
+-- boxed value goes to @slow@.
+allocVal :: FnEnv -> Int -> String -> Gen String
+allocVal fe kv slow = do
   let env = feEnv fe
       layout = lVal (envLayouts env)
       words = 1 + lPtrs layout + lNptrs layout
   u <- loadU kv
   b <- loadB kv
+  requireTagged slow [b]
   leftA <- ctxField env oAllocLeft
   left <- fresh "alloc.left"
   emit (left ++ " = load i64, ptr " ++ leftA)
@@ -2964,7 +2997,7 @@ genArrayOp fe d ka mki mwrite instr sect = do
       rts = envRts (feEnv fe)
   slow <- callOutExit True fe d instr sect
   -- a value to write is boxed up front, before anything is loaded from the heap
-  newVal <- traverse (allocVal fe . fst) mwrite
+  newVal <- traverse (\(kv, _) -> allocVal fe kv slow) mwrite
   p <- loadB ka
   raw <- fresh "raw"
   emit (raw ++ " = ptrtoint ptr " ++ p ++ " to i64")

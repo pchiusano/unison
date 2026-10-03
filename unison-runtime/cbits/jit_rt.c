@@ -29,6 +29,28 @@ int64_t unison_jit_ctx_layout(int64_t *out, int64_t n) {
   return sizeof(UnisonJitCtx);
 }
 
+// For UNISON_JIT_TRACE_YIELD: a constructor's pointer fields, with tags and closure types, two levels down.
+static void trace_fields(StgClosure *c, int depth) {
+  if (c == NULL || GET_CLOSURE_TAG(c) == 0) {
+    if (c != NULL) {
+      const StgInfoTable *it = get_itbl(c);
+      fprintf(stderr, "%*s untagged %p type %d%s\n", depth * 2, "", (void *)c, (int)it->type,
+              it->type == IND_STATIC ? " (IND_STATIC)" : it->type == THUNK_STATIC ? " (THUNK_STATIC)" : "");
+    }
+    return;
+  }
+  StgClosure *u = UNTAG_CLOSURE(c);
+  const StgInfoTable *it = get_itbl(u);
+  if (!(it->type >= CONSTR && it->type <= CONSTR_NOCAF) || depth > 2) return;
+  for (StgWord i = 0; i < it->layout.payload.ptrs; i++) {
+    StgClosure *f = u->payload[i];
+    const StgInfoTable *fi = (f != NULL) ? get_itbl(UNTAG_CLOSURE(f)) : NULL;
+    fprintf(stderr, "%*s field %lu: %p tag %d type %d\n", depth * 2, "", (unsigned long)i, (void *)f,
+            (int)GET_CLOSURE_TAG(f), fi ? (int)fi->type : -1);
+    trace_fields(f, depth + 1);
+  }
+}
+
 // Marks a boxed array as changed in slots lo..hi, as writeArray# would have.
 static void unison_jit_mark_bstk(void **elems, int64_t lo, int64_t hi) {
   StgMutArrPtrs *arr = (StgMutArrPtrs *)((StgWord *)elems - sizeofW(StgMutArrPtrs));
@@ -874,7 +896,9 @@ void *unison_jit_list_view(UnisonJitCtx *ctx, void *list, void *empty, int64_t e
 // cons (front) or snoc of the value (u, b).
 void *unison_jit_list_push(UnisonJitCtx *ctx, void *list, int64_t u, void *b, int64_t front) {
   StgClosure *dq = deque_of(list);
-  if (dq == NULL) return NULL;
+  // an untagged b is an unevaluated thunk, which must not go into Val's
+  // strict field (see requireTagged in Codegen.hs)
+  if (dq == NULL || LTAG(b) == 0) return NULL;
   if (LTAG(dq) == 2) {
     StgInt t = LW(dq, 3);
     if ((front ? TPC(t) : TSC(t)) < MAXD) {
@@ -2188,6 +2212,16 @@ int64_t unison_jit_enter(UnisonNativeFn fn, int64_t *ustk, void **bstk, void **p
       last_status = status;
       repeats = 0;
     }
+  }
+  static int trace_yield = -1;
+  if (trace_yield < 0) trace_yield = getenv("UNISON_JIT_TRACE_YIELD") != NULL;
+  if (__builtin_expect(trace_yield, 0) && status == 0 && ctx->sp >= 0 && ctx->sp < stack_size) {
+    // the yielded value: its boxed pointer's tag and closure type
+    StgClosure *b = (StgClosure *)bstk[ctx->sp];
+    const StgInfoTable *it = GET_CLOSURE_TAG(b) || b ? get_itbl(UNTAG_CLOSURE(b)) : NULL;
+    fprintf(stderr, "[jit] yield at sp %lld: b %p tag %d type %d u %lld\n", (long long)ctx->sp, (void *)b,
+            (int)GET_CLOSURE_TAG(b), it ? (int)it->type : -1, (long long)ustk[ctx->sp]);
+    trace_fields(b, 1);
   }
   int64_t n = ctx->n_frames;
   out[0] = ctx->ap;
