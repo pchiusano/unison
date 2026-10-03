@@ -63,8 +63,8 @@ Update it whenever a step finishes or something non-obvious is learned.
   (compile log, including why a combinator or part of one was left to the interpreter),
   `UNISON_JIT_TRACE=1` (every native entry and exit, on both the C and Haskell sides; unusable
   on programs that load base, it exhausts memory during the load), `UNISON_JIT_DUMP_MCODE=1`,
-  `UNISON_JIT_TRACE_YIELD=1` prints each value native code yields: its pointer tag and closure
-  type, and its fields two levels down (cheap; it found the untagged-pointer crash).
+  `UNISON_JIT_TRACE_YIELD=1` (each value native code yields: its pointer tag and closure
+  type, with its fields two levels down; cheap, and what found the untagged-pointer crash),
   `UNISON_JIT_STATS=1` (exit counts after each evaluation), `UNISON_JIT_STATS=each` (the
   exits taken since the program last wrote output, printed after each write: per-benchmark
   exits for a suite that prints a line per benchmark), `UNISON_JIT_STATS_EVERY=N` (with
