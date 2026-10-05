@@ -1,4 +1,4 @@
-// Shared state between the interpreter and JIT-compiled code. See docs/jit-design.md.
+// Shared state between the interpreter and JIT-compiled code. See docs/jit/design.md.
 // The Haskell side (Unison.Runtime.JIT.Codegen, CtxOffsets) mirrors this layout and checks
 // it at startup with unison_jit_ctx_layout.
 #ifndef UNISON_JIT_RT_H
@@ -40,13 +40,29 @@ typedef struct UnisonJitCtx {
 
   // The capability running this thread, for allocate(). Set at entry.
   void *cap;
-  // Allocation budget in words; native code charges it and the entry poll
-  // fires when it is exhausted. Refilled by the trampoline.
-  int64_t alloc_left;
+  // The allocation budget, as an address: hp plus the words the budget still
+  // allows. The entry poll fires once hp has passed it. Set by the trampoline
+  // from the budget and moved by the slow path when it changes block.
+  void *budget_end;
+  // Inline bump allocation: the free pointer of the capability's current
+  // allocation block (the register table's rCurrentAlloc), copied here by
+  // the trampoline at entry, and the limit native code bumps it against: the
+  // nearer of the block's end and budget_end. Native code calls
+  // unison_jit_alloc_words when the object doesn't fit; the trampoline
+  // writes hp back to the block on return. hp and hp_lim are NULL when
+  // there is no block to bump in (before the first allocation, in a test
+  // context, or with UNISON_JIT_BUMP=0), so that every allocation takes the
+  // call.
+  void *hp;
+  void *hp_lim;
 
   // Not read by generated code (and so not in the layout the Haskell side
   // checks): the lowest address of this thread's C stack, plus the reserve.
   int64_t stack_floor;
+  // Whether hp/hp_lim are in use in this context, and the words the slow
+  // path handed out (which allocate() has already accounted for).
+  int64_t bump;
+  int64_t slow_words;
 } UnisonJitCtx;
 
 // unison_jit_enter hands its results back in spare words past the last slot

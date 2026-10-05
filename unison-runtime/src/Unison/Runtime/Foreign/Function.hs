@@ -1124,7 +1124,7 @@ foreignCallHelper = \case
   Multimap_fromList -> mkForeign $ \(l :: [(Val, Val)]) -> do
     let listVals = l <&> \(k, v) -> (k, Sq.singleton v)
     -- Haskell Map.fromList calls the semigroup in reverse order, so we correct for it by flipping.
-    let result :: Map Val Val = fmap encodeVal $ Map.fromListWith (flip (<>)) listVals
+    let result :: Map Val Val = Map.map encodeVal $ Map.fromListWith (flip (<>)) listVals
     evaluate result
   Set_fromList -> mkForeign $ \(l :: [Val]) -> do
     m <- evaluate $ Map.fromList $ zip l (repeat unitValue)

@@ -178,7 +178,7 @@ data CCache prof = CCache
     refTm :: TVar (M.Map Reference Word64),
     refTy :: TVar (M.Map Reference Word64),
     sandbox :: TVar (M.Map Reference (Set Reference)),
-    -- native code cells for combinators loaded through this cache (see docs/jit-design.md)
+    -- native code cells for combinators loaded through this cache (see docs/jit/design.md)
     nativeCells :: TVar NativeCellPool
   }
 
@@ -202,7 +202,7 @@ baseCCache :: Bool -> IO (CCache ())
 baseCCache sandboxed = do
   -- The builtin combinators get native code cells like any loaded code, so
   -- that the JIT can compile the ones that are worth it and native code
-  -- can call them (docs/jit-m6.md, step 4).
+  -- can call them (docs/jit/m6.md, step 4).
   let uncelled =
         srcCombs
           & sanitizeCombsOfForeignFuncs sandboxed sandboxedForeignFuncs

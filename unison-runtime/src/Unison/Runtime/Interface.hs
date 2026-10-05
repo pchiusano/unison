@@ -887,7 +887,7 @@ startRuntime sandboxed runtimeHost version = do
   -- everything else is when it is loaded
   builtinCombs <- readTVarIO (combs (ccache ctx))
   for_ (EC.mapToList builtinCombs) \(w, cmbs) ->
-    for_ (EC.lookup w builtinTermBackref) \r -> jitCompileGroup r w cmbs
+    for_ (EC.lookup w builtinTermBackref) \r -> jitCompileGroup sandboxed r w cmbs
   ctxVar <- newIORef ctx
   (activeThreads, cleanupThreads) <- case runtimeHost of
     -- Don't bother tracking open threads when running standalone, they'll all be cleaned up

@@ -11,7 +11,7 @@ UNISON_JIT=on  stack exec --work-dir .stack-work-opt unison -- -C jit_codebase t
 
 The timings are printed to the console as the transcript runs. With `UNISON_JIT_STATS=each`
 the exits native code took are listed after each benchmark's line (the busiest sites), which
-says why a benchmark is slow with the JIT on. See docs/jit-m6.md.
+says why a benchmark is slow with the JIT on. See docs/jit/m6.md.
 
 ``` ucm
 jit-tests/main> run suite

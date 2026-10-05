@@ -1,5 +1,5 @@
 -- | Settings for the JIT, read once from the environment.
--- See docs/jit-implementation-plan.md, D18.
+-- See docs/jit/implementation-plan.md, D18.
 module Unison.Runtime.JIT.Config
   ( Mode (..),
     Config (..),
@@ -38,6 +38,16 @@ data Config = Config
     -- | with 'On': the most definitions compiled together as one module
     -- (@UNISON_JIT_BATCH@)
     batch :: Int,
+    -- | with 'On': a compiled callee of a definition being compiled is
+    -- compiled again as a private copy in the new module, so that calls to
+    -- it are direct and LLVM can inline it, when the callee's estimated
+    -- work per call (JIT.Estimate's saving) is at most this
+    -- (@UNISON_JIT_COPY@; 0 turns copies off)
+    copyBound :: Double,
+    -- | with 'On': milliseconds the compile thread waits for more re-entry
+    -- function requests before compiling the ones it holds as one module
+    -- (@UNISON_JIT_REENTRY_WAIT@; 0 compiles each at once)
+    reentryWait :: Int,
     -- | what leaving native code and coming back costs, in units of the
     -- interpreter's overhead for one simple instruction: a function is
     -- left interpreted when its certain exits times this exceed what
@@ -83,12 +93,20 @@ data Config = Config
     stressInstall :: Int,
     -- | size of the constant pool before it has to grow (stress mode @pool=N@)
     stressPool :: Maybe Int,
+    -- | random operations to run through the list helpers at startup,
+    -- each checked against the interpreter's (stress mode @lists=N@)
+    stressLists :: Int,
+    -- | the same for the text helpers (stress mode @texts=N@)
+    stressTexts :: Int,
+    -- | and for the bytes helpers (stress mode @bytes=N@)
+    stressBytes :: Int,
     -- | features turned off for debugging, from @UNISON_JIT_DISABLE@
     -- (comma separated): @app@ (closure calls), @apply@ (the interpreter
     -- entering native code for a closure), @ref@, @array@, @cmp@
-    -- (universal comparison), @callout@ (call-outs become resumes), @direct@
-    -- (calls within a module go through cells), @worker@ (no workers with
-    -- register arguments)
+    -- (universal comparison), @list@, @text@, @bytes@ (the C helpers for
+    -- those), @callout@ (call-outs become resumes), @direct@ (calls within a
+    -- module go through cells), @worker@ (no workers with register arguments),
+    -- @copy@ (no private copies of compiled callees), @hash@ (the murmur hash)
     disabled :: [String]
   }
   deriving (Show)
@@ -102,6 +120,8 @@ config = unsafePerformIO $ do
   every <- lookupEnv "UNISON_JIT_STATS_EVERY"
   thresh <- lookupEnv "UNISON_JIT_THRESHOLD"
   batchSize <- lookupEnv "UNISON_JIT_BATCH"
+  copyB <- lookupEnv "UNISON_JIT_COPY"
+  reWait <- lookupEnv "UNISON_JIT_REENTRY_WAIT"
   cost <- lookupEnv "UNISON_JIT_EXIT_COST"
   entry <- lookupEnv "UNISON_JIT_ENTRY_COST"
   mcode <- lookupEnv "UNISON_JIT_DUMP_MCODE"
@@ -117,6 +137,8 @@ config = unsafePerformIO $ do
           _ -> Off,
         threshold = max 1 (fromMaybe 100 (thresh >>= readMaybe)),
         batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
+        copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
+        reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),
         entryCost = max 0 (fromMaybe 3 (entry >>= readMaybe)),
         logging = maybe False (not . null) logging,
@@ -132,6 +154,9 @@ config = unsafePerformIO $ do
         stressAlloc = fromMaybe 0 (setting "alloc"),
         stressInstall = fromMaybe 0 (setting "install"),
         stressPool = setting "pool",
+        stressLists = fromMaybe 0 (setting "lists"),
+        stressTexts = fromMaybe 0 (setting "texts"),
+        stressBytes = fromMaybe 0 (setting "bytes"),
         statsEvery = fromMaybe 0 (every >>= readMaybe),
         disabled = disabledFeatures
       }

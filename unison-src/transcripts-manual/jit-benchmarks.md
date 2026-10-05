@@ -112,6 +112,100 @@ textDrain n t =
   go rem i = if i == n then rem else go (Text.drop 1 rem) (i + 1)
   go t 0
 
+-- Bytes: the same rope as Text, with the same native operations
+bytesAppend : Nat -> Bytes -> Bytes
+bytesAppend n piece =
+  go acc i = if i == n then acc else go (acc Bytes.++ piece) (i + 1)
+  go Bytes.empty 0
+
+bytesDrain : Nat -> Bytes -> Bytes
+bytesDrain n b =
+  go rem i = if i == n then rem else go (Bytes.drop 1 rem) (i + 1)
+  go b 0
+
+-- the characters one at a time, with uncons
+textWalk : Text -> Nat
+textWalk t =
+  go acc t = match Text.uncons t with
+    None -> acc
+    Some (c, rest) -> go (acc + 1) rest
+  go 0 t
+
+-- numbers to text and back
+natRound : Nat -> Nat
+natRound n =
+  go acc i = if i == n then acc else
+    go (acc + Optional.getOrElse 0 (Nat.fromText (Nat.toText i))) (i + 1)
+  go 0 0
+
+-- 8-byte numbers off the front
+bytesDecode : Bytes -> Nat
+bytesDecode b =
+  go acc b = match Bytes.decodeNat64be b with
+    None -> acc
+    Some (n, rest) -> go (acc + n) rest
+  go 0 b
+
+-- every byte, by position
+bytesSum : Bytes -> Nat
+bytesSum b =
+  go acc i = match Bytes.at i b with
+    None -> acc
+    Some x -> go (acc + x) (i + 1)
+  go 0 0
+
+floatWalk : Nat -> Float
+floatWalk n =
+  go acc i =
+    if i == n then acc
+    else
+      x = Nat.toFloat i
+      y = Float.sqrt x Float.+ Float.sin x Float.* Float.cos x
+      z = Float.max y 1.0 Float.+ Int.toFloat (##Float.truncate y) Float.+ Int.toFloat (##Float.round (Float.abs y))
+      go (acc Float.+ z Float./ 3.0) (i + 1)
+  go 0.0 0
+
+byteArrayLoop : Nat ->{IO, Exception} Nat
+byteArrayLoop n =
+  b = IO.Raw.byteArrayOf 0 64
+  go acc i =
+    if i == n then acc
+    else
+      mutable.ByteArray.Raw.write64le b 8 i
+      mutable.ByteArray.Raw.write32be b 0 i
+      mutable.ByteArray.Raw.write16le b 20 i
+      mutable.ByteArray.Raw.write8 b 30 i
+      go (acc + mutable.ByteArray.Raw.read64le b 8 + mutable.ByteArray.Raw.read32be b 0 + mutable.ByteArray.Raw.read24be b 1 + mutable.ByteArray.Raw.read40le b 16 + mutable.ByteArray.Raw.read16le b 20 + mutable.ByteArray.Raw.read8 b 30) (i + 1)
+  go 0 0
+
+arrayFillSum : Nat ->{IO, Exception} Nat
+arrayFillSum n =
+  arr = IO.Raw.arrayOf 0 n
+  fill i = if i == n then () else
+    mutable.Array.Raw.write arr i (i * 3)
+    fill (i + 1)
+  sum acc i = if i == n then acc else sum (acc + mutable.Array.Raw.read arr i) (i + 1)
+  fill 0
+  frozen = mutable.Array.Raw.freeze! arr
+  sumI acc i = if i == n then acc else sumI (acc + data.Array.Raw.read frozen i) (i + 1)
+  sum 0 0 + sumI 0 0
+
+casLoop : Nat ->{IO} Nat
+casLoop n =
+  r = IO.ref 0
+  go i =
+    if i == n then Ref.read r
+    else
+      t = IO.ref.readForCas r
+      if IO.ref.cas r t (IO.ref.Ticket.read t + i) then go (i + 1) else go i
+  go 0
+
+hashLoop : Nat -> Nat
+hashLoop n =
+  go : Nat -> Nat -> Nat
+  go acc i = if i == n then acc else go (acc Nat.+ ##Universal.murmurHashUntyped (Some (i, "x"))) (i Nat.+ 1)
+  go 0 0
+
 jitSuite : '{IO, Exception} ()
 jitSuite = do
   printTime "Sum 0 to 1 million" 1 (n -> repeat n do sumTo 1000000)
@@ -133,6 +227,27 @@ jitSuite = do
   printTime "Text: drop 1, 100000 times" 1 let
     t = Text.repeat 100000 "a"
     n -> repeat n do textDrain 100000 t
+  printTime "Bytes: append 2 bytes 10000 times" 1 let
+    hi = Bytes.fromList [104, 105]
+    n -> repeat n do bytesAppend 10000 hi
+  printTime "Bytes: drop 1, 100000 times" 1 let
+    b = bytesAppend 50000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesDrain 100000 b
+  printTime "Bytes: at, 100000 times" 1 let
+    b = bytesAppend 50000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesSum b
+  printTime "Text: uncons walk over 100000 characters" 1 let
+    t = Text.repeat 100000 "a"
+    n -> repeat n do textWalk t
+  printTime "Nat.toText and Nat.fromText, 10000 times" 1 (n -> repeat n do natRound 10000)
+  printTime "Float: sqrt, sin, cos, arithmetic and conversions, 100000 times" 1 (n -> repeat n do floatWalk 100000)
+  printTime "MutableByteArray: 4 writes and 6 reads, both byte orders, 100000 times" 1 (n -> repeat n do byteArrayLoop 100000)
+  printTime "MutableArray: fill, freeze and sum 10000 elements" 1 (n -> repeat n do arrayFillSum 10000)
+  printTime "Ref.cas loop, 10000 times" 1 (n -> repeat n do casLoop 10000)
+  printTime "murmurHashUntyped of Some (i, \"x\"), 10000 times" 1 (n -> repeat n do hashLoop 10000)
+  printTime "Bytes: decodeNat64be walk over 80000 bytes" 1 let
+    b = bytesAppend 40000 (Bytes.fromList [104, 105])
+    n -> repeat n do bytesDecode b
 ```
 
 ``` ucm

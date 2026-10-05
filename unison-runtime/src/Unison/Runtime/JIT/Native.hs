@@ -2,7 +2,7 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 
--- | Calling into native code. See docs/jit-design.md, "How the interpreter
+-- | Calling into native code. See docs/jit/design.md, "How the interpreter
 -- interacts with native code". With the @jit@ flag off, nothing here can
 -- be reached, because no cell ever holds code.
 module Unison.Runtime.JIT.Native
@@ -27,6 +27,12 @@ module Unison.Runtime.JIT.Native
     textInit,
     textCheck,
     textTest,
+    bytesInit,
+    arrayInit,
+    murmurInit,
+    murmurTest,
+    bytesCheck,
+    bytesTest,
     closureInit,
     nameTest,
     hplimValue,
@@ -41,9 +47,10 @@ import Unison.Runtime.Stack (Closure)
 
 #ifdef UNISON_JIT
 import Data.Int (Int64)
+import Data.Word (Word64)
 import Foreign.Marshal.Alloc (allocaBytes, free)
 import Foreign.Ptr (Ptr, WordPtr (..), wordPtrToPtr)
-import Foreign.Storable (peekElemOff, pokeElemOff)
+import Foreign.Storable (peek, peekElemOff, pokeElemOff)
 import GHC.Exts (MutableArray#, MutableByteArray#)
 #endif
 
@@ -168,7 +175,7 @@ configureNative pollEvery calleeEvery cstack alloc tr =
 ctxLayout :: IO ([Int], Int)
 ctxLayout = allocaBytes (8 * 32) $ \out -> do
   size <- c_ctxLayout out 32
-  offs <- mapM (peekElemOff out) [0 .. 18]
+  offs <- mapM (peekElemOff out) [0 .. 20]
   pure (map fromIntegral offs, fromIntegral size)
 
 -- | Inspects a closure. Element 0 of the array is the sample, the rest are
@@ -209,7 +216,7 @@ foreign import ccall unsafe "unison_jit_text_init" c_textInit :: MutableArray# R
 
 foreign import ccall unsafe "unison_jit_text_check" c_textCheck :: MutableArray# RealWorld Any -> IO Int64
 
-foreign import ccall unsafe "unison_jit_text_test" c_textTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> IO Int64
+foreign import ccall unsafe "unison_jit_text_test" c_textTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> Int64 -> IO Int64
 
 -- | The same three for the text helpers (see unison_jit_text_init and
 -- unison_jit_text_test). 'textTest' returns what the C function does.
@@ -221,8 +228,56 @@ textInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
 textCheck :: MutableArray RealWorld Any -> IO Bool
 textCheck (MutableArray arr#) = (== 1) <$> c_textCheck arr#
 
-textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
-textTest (MutableArray arr#) op a = fromIntegral <$> c_textTest arr# (fromIntegral op) (fromIntegral a)
+textTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+textTest (MutableArray arr#) op a b c = fromIntegral <$> c_textTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b) (fromIntegral c)
+
+foreign import ccall unsafe "unison_jit_bytes_init" c_bytesInit :: MutableArray# RealWorld Any -> Ptr Int64 -> IO Int64
+
+foreign import ccall unsafe "unison_jit_array_init" c_arrayInit :: MutableArray# RealWorld Any -> Ptr Int64 -> IO Int64
+
+foreign import ccall unsafe "unison_jit_murmur_init" c_murmurInit :: MutableArray# RealWorld Any -> Ptr Int64 -> IO Int64
+
+-- the C side returns a pair (ok, hash) by value; the FFI can't, so this
+-- wrapper writes it through a pointer
+foreign import ccall unsafe "unison_jit_murmur_test_ffi" c_murmurTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Ptr Int64 -> IO Int64
+
+-- | Hands the hash helper the type-tag closure in element 0 and the Enum
+-- and DataG info pointers.
+murmurInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+murmurInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
+  mapM_ (\(i, v) -> pokeElemOff p i (fromIntegral v)) (zip [0 ..] infos)
+  fromIntegral <$> c_murmurInit arr# p
+
+-- | The native hash of element 0 (boxed), or of the unboxed value with the
+-- type tag in element 0; Nothing when the helper leaves it to the interpreter.
+murmurTest :: MutableArray RealWorld Any -> Int -> Bool -> IO (Maybe Word64)
+murmurTest (MutableArray arr#) u unboxed = allocaBytes 8 $ \p -> do
+  ok <- c_murmurTest arr# (fromIntegral u) (if unboxed then 1 else 0) p
+  if ok == 1 then Just . fromIntegral <$> peek p else pure Nothing
+
+-- | Hands the array and ref helpers the wrappers' info pointers and tags
+-- (pairs, flattened) and the empty value in element 0.
+arrayInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+arrayInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
+  mapM_ (\(i, v) -> pokeElemOff p i (fromIntegral v)) (zip [0 ..] infos)
+  fromIntegral <$> c_arrayInit arr# p
+
+foreign import ccall unsafe "unison_jit_bytes_check" c_bytesCheck :: MutableArray# RealWorld Any -> IO Int64
+
+foreign import ccall unsafe "unison_jit_bytes_test" c_bytesTest :: MutableArray# RealWorld Any -> Int64 -> Int64 -> Int64 -> Int64 -> IO Int64
+
+-- | And for the bytes helpers (see unison_jit_bytes_init and
+-- unison_jit_bytes_test).
+bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+bytesInit (MutableArray arr#) infos = allocaBytes (8 * length infos) $ \p -> do
+  mapM_ (\(i, v) -> pokeElemOff p i (fromIntegral v)) (zip [0 ..] infos)
+  fromIntegral <$> c_bytesInit arr# p
+
+bytesCheck :: MutableArray RealWorld Any -> IO Bool
+bytesCheck (MutableArray arr#) = (== 1) <$> c_bytesCheck arr#
+
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+bytesTest (MutableArray arr#) op a b c = fromIntegral <$> c_bytesTest arr# (fromIntegral op) (fromIntegral a) (fromIntegral b) (fromIntegral c)
 
 foreign import ccall unsafe "unison_jit_closure_init" c_closureInit :: Ptr Int64 -> IO ()
 
@@ -283,8 +338,17 @@ textInit _ _ = pure 0
 textCheck :: MutableArray RealWorld Any -> IO Bool
 textCheck _ = pure False
 
-textTest :: MutableArray RealWorld Any -> Int -> Int -> IO Int
-textTest _ _ _ = pure 0
+textTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+textTest _ _ _ _ _ = pure 0
+
+bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
+bytesInit _ _ = pure 0
+
+bytesCheck :: MutableArray RealWorld Any -> IO Bool
+bytesCheck _ = pure False
+
+bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
+bytesTest _ _ _ _ _ = pure 0
 
 closureInit :: [Int] -> IO ()
 closureInit _ = pure ()

@@ -2,7 +2,7 @@
 
 Sep 29, 2026 · Paul Chiusano
 
-Companion to the [JIT design](jit-design.md). The design says what we're building and why. This document says how it gets built: which choices the implementation makes, in what order the work happens, and how we know each step is correct.
+Companion to the [JIT design](design.md). The design says what we're building and why. This document says how it gets built: which choices the implementation makes, in what order the work happens, and how we know each step is correct.
 
 **How to review this.** Each choice that needs a decision is numbered (D1, D2, …) and gives a recommendation and the alternatives. The [sign-off checklist](#sign-off-checklist) at the end lists them all. Anything not marked as a decision follows from the design doc.
 
@@ -278,7 +278,7 @@ Everything needed to run one compiled function end to end, with the smallest use
 
 ### M6: performance and release (L)
 
-**Re-scoped 2026-10-01**, see [jit-m6.md](jit-m6.md): running the full `suite` with the JIT on
+**Re-scoped 2026-10-01**, see [m6.md](m6.md): running the full `suite` with the JIT on
 showed most library code slower than the interpreter, because of exits. M6 is now about
 removing that (fewer and cheaper exits, and not compiling what would mostly exit) and about
 workers. Its exit criterion: no `suite` entry more than 15% slower with the JIT on. The
@@ -294,6 +294,14 @@ Driven by measurements from M5, so the list is provisional.
 - Static linking of LLVM.
 - The remaining Unix platforms.
 - Documentation, and the decision on whether to turn the JIT on by default.
+
+### M7: strict representations and native builtins (L)
+
+Not planned here; it grew out of M6's open items and is written up after the fact in
+[m7.md](m7.md). Lists, text and bytes on strict finger trees with native operations and no
+fallback to the interpreter; every Int, Nat, Float, Text, List, array and ref builtin native,
+with the interpreter's semantics bit for bit; inline bump allocation; private copies of
+compiled callees; the generator made strict throughout. Done 2026-10-05.
 
 ## Risks
 

@@ -31,6 +31,8 @@ group n =
       "deque"
       [ bench "snoc" $ whnf (L.foldl' D.snoc D.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip D.cons) D.empty) xs,
+        bench "fromList" $ whnf D.fromList xs,
+        bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + D.size (D.fromList [1 .. i])) 0) nearEnds,
         let x = d in bench "uncons" $ whnf unconsAllD x,
         let x = d in bench "unsnoc" $ whnf unsnocAllD x,
         bench "snoc then uncons" $ whnf (unconsAllD . L.foldl' D.snoc D.empty) xs,
@@ -50,6 +52,8 @@ group n =
       "seq"
       [ bench "snoc" $ whnf (L.foldl' (Seq.|>) Seq.empty) xs,
         bench "cons" $ whnf (L.foldl' (flip (Seq.<|)) Seq.empty) xs,
+        bench "fromList" $ whnf Seq.fromList xs,
+        bench "fromList small" $ whnf (L.foldl' (\acc i -> acc + Seq.length (Seq.fromList [1 .. i])) 0) nearEnds,
         let x = s in bench "uncons" $ whnf unconsAllS x,
         let x = s in bench "unsnoc" $ whnf unsnocAllS x,
         bench "snoc then uncons" $ whnf (unconsAllS . L.foldl' (Seq.|>) Seq.empty) xs,
@@ -70,11 +74,11 @@ group n =
     xs = [1 .. n]
     ps = positions n
     -- 100 pairs of pieces to append
-    pairsD x = [(D.take i x, D.drop i x) | i <- L.take 100 ps]
     pairsS x = [(Seq.take i x, Seq.drop i x) | i <- L.take 100 ps]
     -- cuts one to four elements from an end, as list patterns make: 250 rounds of four
     nearEnds = concat (replicate 250 [1, 2, 3, 4 :: Int])
     d = D.fromList xs
+    pairsD x = [(D.take i x, D.drop i x) | i <- L.take 100 ps]
     s = Seq.fromList xs
 
 unconsAllD :: Deque Int -> Int

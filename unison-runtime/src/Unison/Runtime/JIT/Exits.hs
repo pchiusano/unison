@@ -2,7 +2,7 @@
 {-# LANGUAGE UnboxedTuples #-}
 
 -- | The global exits table. Native code returns an index into it to say
--- what the interpreter should do next. See docs/jit-design.md.
+-- what the interpreter should do next. See docs/jit/design.md.
 module Unison.Runtime.JIT.Exits
   ( Exit (..),
     ExitIndex,

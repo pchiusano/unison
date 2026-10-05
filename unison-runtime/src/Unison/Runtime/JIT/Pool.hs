@@ -1,6 +1,6 @@
 -- | The constant pool: Haskell heap objects that native code needs, in an
--- array whose address is passed on every entry. See docs/jit-design.md,
--- "Appendix: the constant pool", and docs/jit-m3.md for why there is one
+-- array whose address is passed on every entry. See docs/jit/design.md,
+-- "Appendix: the constant pool", and docs/jit/m3.md for why there is one
 -- global pool rather than one per module.
 --
 -- Indices are assigned when a module is compiled ('poolIndices') and are

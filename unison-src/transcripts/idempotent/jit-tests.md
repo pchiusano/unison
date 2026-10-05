@@ -2,7 +2,7 @@
 
 Programs that exercise the parts of the runtime the JIT compiles. Each one is small and has a
 known answer. The transcript is run with the JIT off and on, and the output must be the same.
-See `docs/jit-implementation-plan.md`.
+See `docs/jit/implementation-plan.md`.
 
 This transcript uses only builtins, so it runs in an empty codebase.
 
@@ -1038,9 +1038,9 @@ overApply n =
 
 ## Lists
 
-List primitives have native fast paths (C helpers that read and build the list's
-structure directly): size, the views at both ends that pattern matching uses, cons, snoc
-and `List.at`. Cases they don't handle (a digit that needs a repair) go to the interpreter.
+List primitives are native (C helpers that read and build the list's structure directly):
+size, the views at both ends that pattern matching uses, cons, snoc, `List.at`, append,
+take, drop, the patterns that split off a fixed number of elements, and list literals.
 
 ``` unison
 use Nat + - * / == < > <= >=
@@ -1123,6 +1123,43 @@ pairs n =
     (t, k) +: rest -> walk (acc + Text.size t + k) rest
   walk 0 (go [] 0)
 
+-- take, drop and append in a loop, each on the result of the last
+chop : Nat -> Nat
+chop n =
+  go l acc i =
+    if i == n then acc + List.size l
+    else
+      k = Nat.mod (i * 7) (List.size l + 1)
+      a = List.take k l
+      b = List.drop k l
+      l' = (b :+ i) List.++ a
+      next = if List.size l' > 600 then List.drop 100 l' List.++ List.take 3 l' else l'
+      go next (acc + List.size a * 3 + sumFront (List.take 2 b)) (i + 1)
+  go (build 50) 0 0
+
+-- doubling by append, then cuts in the middle
+doubled : Nat -> Nat
+doubled n =
+  go l i = if i == n then l else go (l List.++ (i +: l)) (i + 1)
+  l = go [1, 2, 3] 0
+  m = List.take (List.size l / 2 + 17) (List.drop (List.size l / 3) l)
+  List.size l + sumFront m + sumBack m + sumAt (List.take 5000 m)
+
+-- patterns that split off a fixed number of elements, and literals
+splits : Nat -> Nat
+splits n =
+  step = cases
+    [a, b, c] ++ rest -> (a + b * 2 + c * 3, rest)
+    rest -> (List.size rest, [])
+  back = cases
+    rest ++ [y, z] -> y * 5 + z + List.size rest
+    _ -> 0
+  go l acc =
+    match step l with
+      (v, []) -> acc + v
+      (v, rest) -> go rest (acc + v + back rest)
+  go (build n List.++ [n, n + 1, n + 2, n + 3]) 0
+
 > sumFront (build 100000)
 > sumBack (buildFront 100000)
 > sumAt (build 30000)
@@ -1132,6 +1169,10 @@ pairs n =
 > mixed 5000
 > pairs 20000
 > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+> chop 20000
+> doubled 14
+> splits 30000
+> (List.take 2 [1, 2, 3], List.drop 2 [1, 2, 3], [1, 2] List.++ [3], List.take 0 [1], List.drop 5 [1], [] List.++ [7])
 ```
 
 ``` ucm :added-by-ucm
@@ -1139,51 +1180,70 @@ pairs n =
 
   + build      : Nat -> [Nat]
   + buildFront : Nat -> [Nat]
+  + chop       : Nat -> Nat
+  + doubled    : Nat -> Nat
   + edges      : Nat -> Nat
   + mixed      : Nat -> Nat
   + pairs      : Nat -> Nat
   + queue      : Nat -> Nat -> Nat
+  + splits     : Nat -> Nat
   + sumAt      : [Nat] -> Nat
   + sumBack    : [Nat] -> Nat
   + sumFront   : [Nat] -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    81 | > sumFront (build 100000)
-           ⧩
-           4999950000
+    118 | > sumFront (build 100000)
+            ⧩
+            4999950000
 
-    82 | > sumBack (buildFront 100000)
-           ⧩
-           4999950000
+    119 | > sumBack (buildFront 100000)
+            ⧩
+            4999950000
 
-    83 | > sumAt (build 30000)
-           ⧩
-           450005000
+    120 | > sumAt (build 30000)
+            ⧩
+            450005000
 
-    84 | > queue 10 100000
-           ⧩
-           4998950110
+    121 | > queue 10 100000
+            ⧩
+            4998950110
 
-    85 | > queue 3000 100000
-           ⧩
-           4708953000
+    122 | > queue 3000 100000
+            ⧩
+            4708953000
 
-    86 | > edges 2000
-           ⧩
-           20594
+    123 | > edges 2000
+            ⧩
+            20594
 
-    87 | > mixed 5000
-           ⧩
-           38978757
+    124 | > mixed 5000
+            ⧩
+            38978757
 
-    88 | > pairs 20000
-           ⧩
-           200030000
+    125 | > pairs 20000
+            ⧩
+            200030000
 
-    89 | > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
-           ⧩
-           (0, 0, 0, Some 1, None)
+    126 | > (sumFront [], sumBack [], sumAt [], List.at 0 [1, 2, 3], List.at 3 [1, 2, 3])
+            ⧩
+            (0, 0, 0, Some 1, None)
+
+    127 | > chop 20000
+            ⧩
+            394214577
+
+    128 | > doubled 14
+            ⧩
+            189028
+
+    129 | > splits 30000
+            ⧩
+            2850305009
+
+    130 | > (List.take 2 [1, 2, 3], List.drop 2 [1, 2, 3], [1, 2] List.++ [3], List.take 0 [1], List.drop 5 [1], [] List.++ [7])
+            ⧩
+            ([1, 2], [3], [1, 2, 3], [], [], [7])
 ```
 
 ## Text
@@ -1236,54 +1296,333 @@ wide n =
     else go (acc + Text.size (Text.take 3 t)) (Text.drop 1 (t ++ "é€😀")) (i + 1)
   go 0 "λx" 0
 
+-- texts of many chunks appended to each other and cut in the middle
+weave : Nat -> Nat
+weave n =
+  go acc t i =
+    if i == n then acc + Text.size t
+    else
+      u = t ++ Nat.toText i ++ t
+      m = Text.size u / 3
+      mid = Text.take m (Text.drop m u)
+      same = Text.eq (Text.take m u ++ Text.drop m u) u
+      go (acc + Text.size mid + (if same then 1 else 0)) (if Text.size u > 100000 then mid else u) (i + 1)
+  go 0 (grow 100) 0
+
+-- for printing the results of the operations that return structures
+restSize : Optional (Char, Text) -> Nat
+restSize = cases
+  None -> 0
+  Some (c, rest) -> Text.size rest
+
+floatOpt : Optional Float -> Text
+floatOpt = cases
+  None -> "none"
+  Some f -> Float.toText f
+
+decodedSize : Either Failure Text -> Int
+decodedSize = cases
+  Left _ -> -1
+  Right t -> Nat.toInt (Text.size t)
+
 > Text.size (grow 20000)
 > Text.size (growFront 3000)
+> weave 60
 > eat (grow 2000)
 > chop (growFront 500)
 > recut (grow 3000)
 > wide 5000
 > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+> (Text.uncons "", Text.uncons "héllo", Text.unsnoc "héllo", restSize (Text.uncons (grow 100)))
+> (Text.toCharList "a€😀", Text.fromCharList (List.cons ?a (Text.toCharList (grow 40))), Text.size (Text.fromCharList (Text.toCharList (grow 1000))))
+> (Nat.toText 0, Nat.toText 18446744073709551615, Int.toText -9223372036854775808, Int.toText +42, Float.toText 0.1, Float.toText 1.0e7, Float.toText 123456.789, Float.toText -0.0, Float.toText (Float.fromRepresentation 9218868437227405312))
+> (Nat.fromText "42", Nat.fromText "-1", Nat.fromText "x", Int.fromText "-42", Int.fromText "+7", Int.fromText "9223372036854775808", Float.fromText "1.5e3", Float.fromText "1.", floatOpt (Float.fromText "NaN"))
+> (Text.indexOf "lo" "héllo", Text.indexOf "z" "héllo", Text.indexOf "" "abc", Text.indexOf "ba" (grow 2000), "abc" Universal.< "abd", "b" Universal.<= "abc", Universal.compare "abc" "abd", Universal.compare (grow 3) (grow 3))
+> (Text.repeat 3 "ab", Text.size (Text.repeat 1000 "héllo"), Text.reverse "héllo", Text.eq (Text.reverse (Text.drop 1 (grow 100))) (Text.take 198 (grow 100)), Text.toUppercase "héllo wörld", Text.toUppercase "hello", Text.toLowercase "HELLO", Char.toText ?€)
+> (Text.toUtf8 "héllo", decodedSize (Text.fromUtf8.impl (Text.toUtf8 (grow 100))), decodedSize (Text.fromUtf8.impl 0xsff))
 ```
 
 ``` ucm :added-by-ucm
   Loading changes detected in scratch.u.
 
-  + chop      : Text -> Nat
-  + eat       : Text -> Nat
-  + grow      : Nat -> Text
-  + growFront : Nat -> Text
-  + recut     : Text -> Nat
-  + wide      : Nat -> Nat
+  + chop        : Text -> Nat
+  + decodedSize : Either Failure Text -> Int
+  + eat         : Text -> Nat
+  + floatOpt    : Optional Float -> Text
+  + grow        : Nat -> Text
+  + growFront   : Nat -> Text
+  + recut       : Text -> Nat
+  + restSize    : Optional (Char, Text) -> Nat
+  + weave       : Nat -> Nat
+  + wide        : Nat -> Nat
 
   Run `update` to apply these changes to your codebase.
 
-    45 | > Text.size (grow 20000)
+    74 | > Text.size (grow 20000)
            ⧩
            40000
 
-    46 | > Text.size (growFront 3000)
+    75 | > Text.size (growFront 3000)
            ⧩
            10890
 
-    47 | > eat (grow 2000)
+    76 | > weave 60
+           ⧩
+           2142964
+
+    77 | > eat (grow 2000)
            ⧩
            8002000
 
-    48 | > chop (growFront 500)
+    78 | > chop (growFront 500)
            ⧩
            1390
 
-    49 | > recut (grow 3000)
+    79 | > recut (grow 3000)
            ⧩
            858
 
-    50 | > wide 5000
+    80 | > wide 5000
            ⧩
            25001
 
-    51 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
+    81 | > (Text.eq (grow 3) "ababab", Text.eq (grow 3) "ababa", Text.take 2 (grow 40), Text.drop 77 (grow 40), "" ++ "", Text.size "")
            ⧩
            (true, false, "ab", "bab", "", 0)
+
+    82 | > (Text.uncons "", Text.uncons "héllo", Text.unsnoc "héllo", restSize (Text.uncons (grow 100)))
+           ⧩
+           (None, Some (?h, "éllo"), Some ("héll", ?o), 199)
+
+    83 | > (Text.toCharList "a€😀", Text.fromCharList (List.cons ?a (Text.toCharList (grow 40))), Text.size (Text.fromCharList (Text.toCharList (grow 1000))))
+           ⧩
+           ( [?a, ?€, ?😀]
+           , "aabababababababababababababababababababababababababababababababababababababababab"
+           , 2000
+           )
+
+    84 | > (Nat.toText 0, Nat.toText 18446744073709551615, Int.toText -9223372036854775808, Int.toText +42, Float.toText 0.1, Float.toText 1.0e7, Float.toText 123456.789, Float.toText -0.0, Float.toText (Float.fromRepresentation 9218868437227405312))
+           ⧩
+           ( "0"
+           , "18446744073709551615"
+           , "-9223372036854775808"
+           , "42"
+           , "0.1"
+           , "1.0e7"
+           , "123456.789"
+           , "-0.0"
+           , "Infinity"
+           )
+
+    85 | > (Nat.fromText "42", Nat.fromText "-1", Nat.fromText "x", Int.fromText "-42", Int.fromText "+7", Int.fromText "9223372036854775808", Float.fromText "1.5e3", Float.fromText "1.", floatOpt (Float.fromText "NaN"))
+           ⧩
+           ( Some 42
+           , None
+           , None
+           , Some -42
+           , Some +7
+           , None
+           , Some 1500.0
+           , None
+           , "NaN"
+           )
+
+    86 | > (Text.indexOf "lo" "héllo", Text.indexOf "z" "héllo", Text.indexOf "" "abc", Text.indexOf "ba" (grow 2000), "abc" Universal.< "abd", "b" Universal.<= "abc", Universal.compare "abc" "abd", Universal.compare (grow 3) (grow 3))
+           ⧩
+           (Some 3, None, Some 0, Some 1, true, false, -1, +0)
+
+    87 | > (Text.repeat 3 "ab", Text.size (Text.repeat 1000 "héllo"), Text.reverse "héllo", Text.eq (Text.reverse (Text.drop 1 (grow 100))) (Text.take 198 (grow 100)), Text.toUppercase "héllo wörld", Text.toUppercase "hello", Text.toLowercase "HELLO", Char.toText ?€)
+           ⧩
+           ( "ababab"
+           , 5000
+           , "olléh"
+           , false
+           , "HÉLLO WÖRLD"
+           , "HELLO"
+           , "hello"
+           , "€"
+           )
+
+    88 | > (Text.toUtf8 "héllo", decodedSize (Text.fromUtf8.impl (Text.toUtf8 (grow 100))), decodedSize (Text.fromUtf8.impl 0xsff))
+           ⧩
+           (0xs68c3a96c6c6f, +200, -1)
+```
+
+## Bytes
+
+Bytes is the same rope as Text with chunks of bytes, and has native versions of the same
+operations (size, `++`, take, drop) plus `Bytes.at`, `Bytes.flatten` and `==` on two Bytes or
+two Text values (universal equality, `Universal.==`).
+
+``` unison
+use Nat + - * / == < > <= >=
+use Bytes ++
+
+bgrow : Nat -> Bytes
+bgrow n =
+  go acc i = if i == n then acc else go (acc ++ Bytes.fromList [Nat.mod i 251, 255]) (i + 1)
+  go Bytes.empty 0
+
+bgrowFront : Nat -> Bytes
+bgrowFront n =
+  go acc i = if i == n then acc else go (Bytes.fromList [Nat.mod i 251, Nat.mod (i + 1) 251, Nat.mod (i + 2) 251] ++ acc) (i + 1)
+  go Bytes.empty 0
+
+-- drop a byte at a time, adding up the bytes seen
+beat : Bytes -> Nat
+beat b =
+  go acc b = match Bytes.at 0 b with
+    None -> acc
+    Some x -> go (acc + x) (Bytes.drop 1 b)
+  go 0 b
+
+-- take all but the last byte, until nothing is left
+bchop : Bytes -> Nat
+bchop b =
+  go acc b = if b Universal.== Bytes.empty then acc else go (acc + Bytes.size b) (Bytes.take (Bytes.size b - 1) b)
+  go 0 b
+
+-- a bytes cut in two and put together again is the same bytes, in other chunks
+brecut : Bytes -> Nat
+brecut b =
+  n = Bytes.size b
+  go acc i =
+    if i > n then acc
+    else
+      u = Bytes.take i b ++ Bytes.drop i b
+      go (if u Universal.== b then acc + 1 else acc) (i + 7)
+  go 0 0
+
+-- bytes of many chunks appended to each other and cut in the middle
+bweave : Nat -> Nat
+bweave n =
+  go acc b i =
+    if i == n then acc + Bytes.size b
+    else
+      u = b ++ Bytes.fromList [i] ++ b
+      m = Bytes.size u / 3
+      mid = Bytes.take m (Bytes.drop m u)
+      same = (Bytes.take m u ++ Bytes.drop m u) Universal.== u
+      go (acc + Bytes.size mid + (if same then 1 else 0)) (if Bytes.size u > 100000 then mid else u) (i + 1)
+  go 0 (bgrow 100) 0
+
+-- every byte of a flattened bytes, weighted by its position
+bsum : Bytes -> Nat
+bsum b =
+  f = Bytes.flatten b
+  byte i = match Bytes.at i f with
+    None -> 0
+    Some x -> x
+  go acc i = if i == Bytes.size f then acc else go (acc + byte i * (i + 1)) (i + 1)
+  go 0 0
+
+decodedBytes : Either Text Bytes -> Int
+decodedBytes = cases
+  Left _ -> -1
+  Right b -> Nat.toInt (Bytes.size b)
+
+> Bytes.size (bgrow 20000)
+> Bytes.size (bgrowFront 3000)
+> bweave 60
+> beat (bgrow 2000)
+> bchop (bgrowFront 500)
+> brecut (bgrow 3000)
+> bsum (bgrow 1000)
+> bsum (bgrowFront 1000)
+> (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
+> (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+> (##Bytes.toList (bgrow 3), ##Bytes.fromList (##Bytes.toList (bgrow 300)) Universal.== bgrow 300, ##Bytes.indexOf 0xs01ff (bgrow 3), ##Bytes.indexOf 0xsffff (bgrow 3), Universal.compare 0xs0102 0xs0103, Universal.compare (bgrow 5) (bgrow 5), 0xs01 Universal.< 0xs0100)
+> (##Bytes.decodeNat16be 0xs0102ff, ##Bytes.decodeNat32le 0xs01020304, ##Bytes.decodeNat64be (bgrow 2), ##Bytes.decodeNat64be 0xs01, ##Bytes.encodeNat16be 258, ##Bytes.encodeNat64le 1, ##Bytes.encodeNat32be 4294967295)
+> (##Bytes.toBase16 0xs00ff10, ##Bytes.toBase32 0xs68656c6c6f, ##Bytes.toBase64 0xs68656c6c6f, ##Bytes.toBase64UrlUnpadded 0xsfbff, ##Bytes.fromBase16 0xs30306666, ##Bytes.fromBase16 0xs303066, decodedBytes (##Bytes.fromBase64 (##Bytes.toBase64 (bgrow 50))), decodedBytes (##Bytes.fromBase32 (##Bytes.toBase32 (bgrow 7))))
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + bchop        : Bytes -> Nat
+  + beat         : Bytes -> Nat
+  + bgrow        : Nat -> Bytes
+  + bgrowFront   : Nat -> Bytes
+  + brecut       : Bytes -> Nat
+  + bsum         : Bytes -> Nat
+  + bweave       : Nat -> Nat
+  + decodedBytes : Either Text Bytes -> Int
+
+  Run `update` to apply these changes to your codebase.
+
+    67 | > Bytes.size (bgrow 20000)
+           ⧩
+           40000
+
+    68 | > Bytes.size (bgrowFront 3000)
+           ⧩
+           9000
+
+    69 | > bweave 60
+           ⧩
+           2142485
+
+    70 | > beat (bgrow 2000)
+           ⧩
+           759028
+
+    71 | > bchop (bgrowFront 500)
+           ⧩
+           1125750
+
+    72 | > brecut (bgrow 3000)
+           ⧩
+           858
+
+    73 | > bsum (bgrow 1000)
+           ⧩
+           389807014
+
+    74 | > bsum (bgrowFront 1000)
+           ⧩
+           516376967
+
+    75 | > (bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2, 255], bgrow 3 Universal.== Bytes.fromList [0, 255, 1, 255, 2], Bytes.toList (Bytes.take 3 (bgrow 40)), Bytes.toList (Bytes.drop 77 (bgrow 40)))
+           ⧩
+           (true, false, [0, 255, 1], [255, 39, 255])
+
+    76 | > (Bytes.at 5 (bgrow 3), Bytes.at 6 (bgrow 3), Bytes.size (Bytes.flatten (bgrow 400)), Bytes.flatten (bgrow 400) Universal.== bgrow 400, ("ab" Text.++ "c") Universal.== "abc", "abc" Universal.== "abd", Bytes.empty Universal.== Bytes.empty)
+           ⧩
+           (Some 255, None, 800, true, true, false, true)
+
+    77 | > (##Bytes.toList (bgrow 3), ##Bytes.fromList (##Bytes.toList (bgrow 300)) Universal.== bgrow 300, ##Bytes.indexOf 0xs01ff (bgrow 3), ##Bytes.indexOf 0xsffff (bgrow 3), Universal.compare 0xs0102 0xs0103, Universal.compare (bgrow 5) (bgrow 5), 0xs01 Universal.< 0xs0100)
+           ⧩
+           ( [0, 255, 1, 255, 2, 255]
+           , true
+           , Some 2
+           , None
+           , -1
+           , +0
+           , true
+           )
+
+    78 | > (##Bytes.decodeNat16be 0xs0102ff, ##Bytes.decodeNat32le 0xs01020304, ##Bytes.decodeNat64be (bgrow 2), ##Bytes.decodeNat64be 0xs01, ##Bytes.encodeNat16be 258, ##Bytes.encodeNat64le 1, ##Bytes.encodeNat32be 4294967295)
+           ⧩
+           ( Some (258, 0xsff)
+           , Some (67305985, 0xs)
+           , None
+           , None
+           , 0xs0102
+           , 0xs0100000000000000
+           , 0xsffffffff
+           )
+
+    79 | > (##Bytes.toBase16 0xs00ff10, ##Bytes.toBase32 0xs68656c6c6f, ##Bytes.toBase64 0xs68656c6c6f, ##Bytes.toBase64UrlUnpadded 0xsfbff, ##Bytes.fromBase16 0xs30306666, ##Bytes.fromBase16 0xs303066, decodedBytes (##Bytes.fromBase64 (##Bytes.toBase64 (bgrow 50))), decodedBytes (##Bytes.fromBase32 (##Bytes.toBase32 (bgrow 7))))
+           ⧩
+           ( 0xs303066663130
+           , 0xs4e42535759334450
+           , 0xs614756736247383d
+           , 0xs2d5f38
+           , Right 0xs00ff
+           , Left "base16: input: invalid length"
+           , +100
+           , +14
+           )
 ```
 
 ## Partial applications
@@ -1356,4 +1695,488 @@ five n =
     40 | > five 3000
            ⧩
            45045000
+```
+
+## Floats, pow and representation casts
+
+Every Float operation is native, as are `pow` on Int and Nat and the type-tag casts behind
+`Nat.toInt`, `Char.toNat` and `Float.toRepresentation`. The results must be bit-for-bit the
+interpreter's (Haskell's), including signed zeros, NaN, Haskell's half-to-even `round`, its
+`min`/`max` with NaN, and its own `atan2`.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+fsum : Nat -> Float
+fsum n =
+  go acc i = if i == n then acc else go (acc Float.+ Float.sqrt (Nat.toFloat i)) (i + 1)
+  go 0.0 0
+
+> (1.5 Float.+ 2.25, 1.5 Float.- 2.25, 1.5 Float.* 2.25, 1.5 Float./ 2.25, 1.0 Float./ 0.0, -1.0 Float./ 0.0, 0.0 Float./ 0.0, -0.0 Float.* 1.0)
+> (Float.lt 1.0 2.0, Float.gt 1.0 2.0, Float.lteq 2.0 2.0, Float.gteq 1.0 2.0, Float.eq 2.0 2.0, Float.eq (0.0 Float./ 0.0) (0.0 Float./ 0.0), Float.lteq (0.0 Float./ 0.0) 1.0, Float.gt (0.0 Float./ 0.0) 1.0)
+> (Float.min 1.0 2.0, Float.max 1.0 2.0, Float.min (0.0 Float./ 0.0) 1.0, Float.min 1.0 (0.0 Float./ 0.0), Float.max (0.0 Float./ 0.0) 1.0, Float.max 1.0 (0.0 Float./ 0.0), Float.min -0.0 0.0, Float.max 0.0 -0.0)
+> (Float.ceiling 2.3, Float.ceiling -2.3, Float.floor 2.3, Float.floor -2.3, Float.truncate 2.7, Float.truncate -2.7, Float.round 2.5, Float.round 3.5, Float.round -2.5, Float.round 0.5, Float.round -0.4, Float.round 2.4999)
+> (Float.abs -3.5, Float.abs 3.5, Float.abs -0.0, Float.sqrt 2.0, Float.sqrt -1.0, Float.exp 1.0, Float.log 10.0, Float.log 0.0, Float.logBase 2.0 1024.0, Float.logBase 10.0 0.001, Float.pow 2.0 0.5, Float.pow -8.0 (1.0 Float./ 3.0))
+> (Float.cos 1.0, Float.sin 1.0, Float.tan 1.0, Float.acos 0.5, Float.asin 0.5, Float.atan 0.5, Float.cosh 0.5, Float.sinh 0.5, Float.tanh 0.5, Float.asinh 1.0, Float.acosh 2.0, Float.atanh 0.5)
+> (Float.atan2 1.0 1.0, Float.atan2 1.0 -1.0, Float.atan2 -1.0 -1.0, Float.atan2 -1.0 1.0, Float.atan2 1.0 0.0, Float.atan2 -1.0 0.0, Float.atan2 0.0 -1.0, Float.atan2 -0.0 -1.0, Float.atan2 0.0 0.0, Float.atan2 -0.0 0.0, Float.atan2 0.0 -0.0, Float.atan2 -0.0 -0.0, Float.atan2 (0.0 Float./ 0.0) 1.0)
+> (Nat.toFloat 3, Nat.toFloat 18446744073709551615, Int.toFloat -3, Int.toFloat +9007199254740993, fsum 1000)
+> (Int.pow +3 4, Int.pow -2 3, Int.pow -2 63, Int.pow +7 0, Int.pow +0 0, Nat.pow 3 4, Nat.pow 2 63, Nat.pow 2 64, Nat.pow 3 41, Nat.pow 0 0)
+> (Nat.toInt 5, Nat.toInt 18446744073709551615, Int.toRepresentation -1, Int.fromRepresentation 18446744073709551615, Char.toNat ?a, Char.fromNat 955, Float.toRepresentation 1.0, Float.toRepresentation -0.0, Float.fromRepresentation 4611686018427387904)
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + fsum : Nat -> Float
+
+  Run `update` to apply these changes to your codebase.
+
+    8 | > (1.5 Float.+ 2.25, 1.5 Float.- 2.25, 1.5 Float.* 2.25, 1.5 Float./ 2.25, 1.0 Float./ 0.0, -1.0 Float./ 0.0, 0.0 Float./ 0.0, -0.0 Float.* 1.0)
+          ⧩
+          ( 3.75
+          , -0.75
+          , 3.375
+          , 0.6666666666666666
+          , Infinity
+          , -Infinity
+          , NaN
+          , -0.0
+          )
+
+    9 | > (Float.lt 1.0 2.0, Float.gt 1.0 2.0, Float.lteq 2.0 2.0, Float.gteq 1.0 2.0, Float.eq 2.0 2.0, Float.eq (0.0 Float./ 0.0) (0.0 Float./ 0.0), Float.lteq (0.0 Float./ 0.0) 1.0, Float.gt (0.0 Float./ 0.0) 1.0)
+          ⧩
+          (true, false, true, false, true, false, false, false)
+
+    10 | > (Float.min 1.0 2.0, Float.max 1.0 2.0, Float.min (0.0 Float./ 0.0) 1.0, Float.min 1.0 (0.0 Float./ 0.0), Float.max (0.0 Float./ 0.0) 1.0, Float.max 1.0 (0.0 Float./ 0.0), Float.min -0.0 0.0, Float.max 0.0 -0.0)
+           ⧩
+           (1.0, 2.0, 1.0, NaN, NaN, 1.0, -0.0, -0.0)
+
+    11 | > (Float.ceiling 2.3, Float.ceiling -2.3, Float.floor 2.3, Float.floor -2.3, Float.truncate 2.7, Float.truncate -2.7, Float.round 2.5, Float.round 3.5, Float.round -2.5, Float.round 0.5, Float.round -0.4, Float.round 2.4999)
+           ⧩
+           (+3, -2, +2, -3, +2, -2, +2, +4, -2, +0, +0, +2)
+
+    12 | > (Float.abs -3.5, Float.abs 3.5, Float.abs -0.0, Float.sqrt 2.0, Float.sqrt -1.0, Float.exp 1.0, Float.log 10.0, Float.log 0.0, Float.logBase 2.0 1024.0, Float.logBase 10.0 0.001, Float.pow 2.0 0.5, Float.pow -8.0 (1.0 Float./ 3.0))
+           ⧩
+           ( 3.5
+           , 3.5
+           , 0.0
+           , 1.4142135623730951
+           , NaN
+           , 2.718281828459045
+           , 2.302585092994046
+           , -Infinity
+           , 10.0
+           , -2.9999999999999996
+           , 1.4142135623730951
+           , NaN
+           )
+
+    13 | > (Float.cos 1.0, Float.sin 1.0, Float.tan 1.0, Float.acos 0.5, Float.asin 0.5, Float.atan 0.5, Float.cosh 0.5, Float.sinh 0.5, Float.tanh 0.5, Float.asinh 1.0, Float.acosh 2.0, Float.atanh 0.5)
+           ⧩
+           ( 0.5403023058681398
+           , 0.8414709848078965
+           , 1.557407724654902
+           , 1.0471975511965976
+           , 0.5235987755982988
+           , 0.46364760900080615
+           , 1.1276259652063807
+           , 0.5210953054937474
+           , 0.46211715726000974
+           , 0.881373587019543
+           , 1.3169578969248166
+           , 0.5493061443340549
+           )
+
+    14 | > (Float.atan2 1.0 1.0, Float.atan2 1.0 -1.0, Float.atan2 -1.0 -1.0, Float.atan2 -1.0 1.0, Float.atan2 1.0 0.0, Float.atan2 -1.0 0.0, Float.atan2 0.0 -1.0, Float.atan2 -0.0 -1.0, Float.atan2 0.0 0.0, Float.atan2 -0.0 0.0, Float.atan2 0.0 -0.0, Float.atan2 -0.0 -0.0, Float.atan2 (0.0 Float./ 0.0) 1.0)
+           ⧩
+           ( 0.7853981633974483
+           , 2.356194490192345
+           , -2.356194490192345
+           , -0.7853981633974483
+           , 1.5707963267948966
+           , -1.5707963267948966
+           , 3.141592653589793
+           , -3.141592653589793
+           , 0.0
+           , -0.0
+           , 3.141592653589793
+           , -3.141592653589793
+           , NaN
+           )
+
+    15 | > (Nat.toFloat 3, Nat.toFloat 18446744073709551615, Int.toFloat -3, Int.toFloat +9007199254740993, fsum 1000)
+           ⧩
+           ( 3.0
+           , 1.8446744073709552e19
+           , -3.0
+           , 9.007199254740992e15
+           , 21065.833110879048
+           )
+
+    16 | > (Int.pow +3 4, Int.pow -2 3, Int.pow -2 63, Int.pow +7 0, Int.pow +0 0, Nat.pow 3 4, Nat.pow 2 63, Nat.pow 2 64, Nat.pow 3 41, Nat.pow 0 0)
+           ⧩
+           ( +81
+           , -8
+           , -9223372036854775808
+           , +1
+           , +1
+           , 81
+           , 9223372036854775808
+           , 0
+           , 18026252303461234787
+           , 1
+           )
+
+    17 | > (Nat.toInt 5, Nat.toInt 18446744073709551615, Int.toRepresentation -1, Int.fromRepresentation 18446744073709551615, Char.toNat ?a, Char.fromNat 955, Float.toRepresentation 1.0, Float.toRepresentation -0.0, Float.fromRepresentation 4611686018427387904)
+           ⧩
+           ( +5
+           , -1
+           , 18446744073709551615
+           , -1
+           , 97
+           , ?λ
+           , 4607182418800017408
+           , 9223372036854775808
+           , 2.0
+           )
+```
+
+## Arrays, byte arrays, refs and tickets
+
+Every array builtin is native (mutable and immutable, pointer and byte arrays: sizes, reads
+of all widths and both byte orders, writes, `copyTo!`, `freeze` and `freeze!`, `toBytes` and
+`fromBytes`, the `Scope` and `IO` constructors), as are `Scope.ref`/`IO.ref`, `Ref.readForCas`,
+`Ticket.read` and `Ref.cas`. The bounds checks are the interpreter's (the failing calls below
+are left to it, which raises).
+
+``` unison
+use Nat + - * / == < > <= >=
+
+catchF : '{IO, Exception} a ->{IO} Either Text a
+catchF c = handle c() with cases
+  { a } -> Right a
+  { Exception.raise f -> _ } -> match f with Failure _ msg _ -> Left msg
+
+fillSq : MutableArray {IO} Nat -> Nat ->{IO, Exception} ()
+fillSq arr i =
+  if i == MutableArray.size arr then ()
+  else
+    MutableArray.write arr i (i * i)
+    fillSq arr (i + 1)
+
+sumM : MutableArray {IO} Nat -> Nat -> Nat ->{IO, Exception} Nat
+sumM arr i acc =
+  if i == MutableArray.size arr then acc else sumM arr (i + 1) (acc + MutableArray.read arr i)
+
+sumI : ImmutableArray Nat -> Nat -> Nat ->{Exception} Nat
+sumI arr i acc =
+  if i == ImmutableArray.size arr then acc else sumI arr (i + 1) (acc + ImmutableArray.read arr i)
+
+pointerArrays : '{IO} (Either Text (Nat, Nat, Nat, Nat, Nat, Nat, Nat), Either Text Nat, Either Text (), Either Text Nat, Either Text Nat)
+pointerArrays = do
+  m = IO.arrayOf 0 8
+  big = IO.arrayOf 99 12
+  (catchF do
+     fillSq m 0
+     im = MutableArray.freeze m 2 4
+     MutableArray.copyTo! big 1 m 0 8
+     ImmutableArray.copyTo! big 9 im 1 3
+     im2 = MutableArray.freeze! m
+     empty = MutableArray.freeze m 5 0
+     (MutableArray.size m, ImmutableArray.size im, sumI im 0 0, sumM big 0 0, ImmutableArray.read im2 7, ImmutableArray.size empty, ImmutableArray.size im2),
+   catchF '(MutableArray.read m 8),
+   catchF '(MutableArray.copyTo! big 5 m 0 8),
+   catchF '(ImmutableArray.size (MutableArray.freeze m 6 3)),
+   catchF '(ImmutableArray.read (MutableArray.freeze m 0 2) 2))
+
+byteReads : MutableByteArray {IO} ->{IO, Exception} [Nat]
+byteReads b =
+  [ MutableByteArray.read8 b 0, MutableByteArray.read16be b 0, MutableByteArray.read16le b 0,
+    MutableByteArray.read24be b 1, MutableByteArray.read24le b 1, MutableByteArray.read32be b 2,
+    MutableByteArray.read32le b 2, MutableByteArray.read40be b 3, MutableByteArray.read40le b 3,
+    MutableByteArray.read64be b 0, MutableByteArray.read64le b 0, MutableByteArray.read8 b 31 ]
+
+immReads : ImmutableByteArray ->{Exception} [Nat]
+immReads b =
+  [ ImmutableByteArray.read8 b 0, ImmutableByteArray.read16be b 0, ImmutableByteArray.read16le b 0,
+    ImmutableByteArray.read24be b 1, ImmutableByteArray.read24le b 1, ImmutableByteArray.read32be b 2,
+    ImmutableByteArray.read32le b 2, ImmutableByteArray.read40be b 3, ImmutableByteArray.read40le b 3,
+    ImmutableByteArray.read64be b 0, ImmutableByteArray.read64le b 0, ImmutableByteArray.size b ]
+
+byteArrays : '{IO} (Either Text ([Nat], [Nat], Nat, Bytes, Bytes, [Nat]), Either Text Nat, Either Text Nat, Either Text (), Either Text (), Either Text Bytes, Either Text Nat)
+byteArrays = do
+  b = IO.bytearrayOf 170 32
+  (catchF do
+     MutableByteArray.write8 b 0 1
+     MutableByteArray.write16be b 1 515
+     MutableByteArray.write32le b 3 67305985
+     MutableByteArray.write64be b 8 1234605616436508552
+     MutableByteArray.write16le b 16 65535
+     MutableByteArray.write32be b 18 305419896
+     MutableByteArray.write64le b 24 18446744073709551615
+     rs = byteReads b
+     c = IO.bytearray 16
+     MutableByteArray.copyTo! c 4 b 0 12
+     MutableByteArray.copyTo! c 0 c 2 4
+     frozen = MutableByteArray.freeze b 0 32
+     snap = MutableByteArray.freeze c 2 10
+     bs = ImmutableByteArray.toBytes frozen 5 11
+     back = ImmutableByteArray.fromBytes (bs Bytes.++ ImmutableByteArray.toBytes snap 0 10)
+     frozen2 = MutableByteArray.freeze! c
+     ImmutableByteArray.copyTo! b 20 frozen2 0 6
+     (rs, immReads frozen, MutableByteArray.size b, bs, ImmutableByteArray.toBytes back 0 (ImmutableByteArray.size back), immReads (MutableByteArray.freeze! b)),
+   catchF '(MutableByteArray.read64le b 25),
+   catchF '(MutableByteArray.read8 b 18446744073709551615),
+   catchF '(MutableByteArray.write16be b 31 1),
+   catchF '(MutableByteArray.copyTo! b 30 b 0 3),
+   catchF '(ImmutableByteArray.toBytes (MutableByteArray.freeze b 0 8) 4 5),
+   catchF '(ImmutableByteArray.size (MutableByteArray.freeze b 30 3)))
+
+scoped : '{IO} (Either Text (Nat, Nat, Nat, Nat, Nat, Nat))
+scoped = do
+  catchF do
+    Scope.run do
+      a = Scope.array 3
+      r = Scope.ref 10
+      MutableArray.write a 0 (Ref.read r)
+      Ref.write r 20
+      MutableArray.write a 1 (Ref.read r)
+      MutableArray.write a 2 (MutableArray.read a 0 + MutableArray.read a 1)
+      z = Scope.arrayOf 7 4
+      ba = Scope.bytearrayOf 9 6
+      MutableByteArray.write8 ba 5 200
+      p = Scope.pinnedByteArrayOf 1 8
+      pm = PinnedByteArray.cast p
+      MutableByteArray.write32be pm 0 4278255360
+      zero = Scope.bytearray 4
+      MutableByteArray.write32le zero 0 0
+      (MutableArray.read a 2, MutableArray.read z 3, MutableByteArray.read8 ba 5 + MutableByteArray.read8 ba 0, MutableByteArray.read16be pm 1, MutableByteArray.read32be pm 4, MutableByteArray.size zero)
+
+tickets : '{IO} (Nat, Boolean, Nat, Boolean, Nat, Boolean, Nat)
+tickets = do
+  r = IO.ref 5
+  t = Ref.readForCas r
+  ok1 = Ref.cas r t 6
+  v1 = Ref.read r
+  ok2 = Ref.cas r t 7
+  t2 = Ref.readForCas r
+  ok3 = Ref.cas r t2 8
+  (Ref.Ticket.read t, ok1, v1, ok2, Ref.Ticket.read t2, ok3, Ref.read r)
+
+casLoop : Nat ->{IO} Nat
+casLoop n =
+  r = IO.ref 0
+  go i =
+    if i == n then Ref.read r
+    else
+      t = Ref.readForCas r
+      if Ref.cas r t (Ref.Ticket.read t + i) then go (i + 1) else go i
+  go 0
+
+casTest : '{IO} Nat
+casTest = do casLoop 10000
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + byteArrays    : '{IO} ( Either
+                      Text
+                      ([Nat], [Nat], Nat, Bytes, Bytes, [Nat]),
+                      Either Text Nat,
+                      Either Text Nat,
+                      Either Text (),
+                      Either Text (),
+                      Either Text Bytes,
+                      Either Text Nat)
+  + byteReads     : MutableByteArray {IO}
+                    ->{IO, Exception} [Nat]
+  + casLoop       : Nat ->{IO} Nat
+  + casTest       : '{IO} Nat
+  + catchF        : '{IO, Exception} a ->{IO} Either Text a
+  + fillSq        : MutableArray {IO} Nat
+                    -> Nat
+                    ->{IO, Exception} ()
+  + immReads      : ImmutableByteArray ->{Exception} [Nat]
+  + pointerArrays : '{IO} ( Either
+                      Text (Nat, Nat, Nat, Nat, Nat, Nat, Nat),
+                      Either Text Nat,
+                      Either Text (),
+                      Either Text Nat,
+                      Either Text Nat)
+  + scoped        : '{IO} Either
+                      Text (Nat, Nat, Nat, Nat, Nat, Nat)
+  + sumI          : ImmutableArray Nat
+                    -> Nat
+                    -> Nat
+                    ->{Exception} Nat
+  + sumM          : MutableArray {IO} Nat
+                    -> Nat
+                    -> Nat
+                    ->{IO, Exception} Nat
+  + tickets       : '{IO} ( Nat,
+                      Boolean,
+                      Nat,
+                      Boolean,
+                      Nat,
+                      Boolean,
+                      Nat)
+
+  Run `update` to apply these changes to your codebase.
+```
+
+``` ucm
+scratch/main> run pointerArrays
+
+  ( Right (8, 4, 54, 289, 49, 0, 8)
+  , Left "MutableArray.read: array index out of bounds"
+  , Left "MutableArray.copyTo!: array index out of bounds"
+  , Left "MutableArray.freeze: array index out of bounds"
+  , Left "ImmutableArray.read: array index out of bounds"
+  )
+
+scratch/main> run byteArrays
+
+  ( Right
+      ( [ 1
+        , 258
+        , 513
+        , 131841
+        , 66306
+        , 50397699
+        , 50462979
+        , 4328719530
+        , 730211746305
+        , 72623846854952106
+        , 12250920193496384001
+        , 255
+        ]
+      , [ 1
+        , 258
+        , 513
+        , 131841
+        , 66306
+        , 50397699
+        , 50462979
+        , 4328719530
+        , 730211746305
+        , 72623846854952106
+        , 12250920193496384001
+        , 32
+        ]
+      , 32
+      , 0xs0304aa1122334455667788
+      , 0xs0304aa1122334455667788010201020301020304aa
+      , [ 1
+        , 258
+        , 513
+        , 131841
+        , 66306
+        , 50397699
+        , 50462979
+        , 4328719530
+        , 730211746305
+        , 72623846854952106
+        , 12250920193496384001
+        , 32
+        ]
+      )
+  , Left "MutableByteArray.read64le: array index out of bounds"
+  , Left "MutableByteArray.read8: array index out of bounds"
+  , Left "MutableByteArray.write16be: array index out of bounds"
+  , Left "MutableByteArray.copyTo!: array index out of bounds"
+  , Left "ImmutableByteArray_toBytes: array index out of bounds"
+  , Left "MutableByteArray.freeze: array index out of bounds"
+  )
+
+scratch/main> run scoped
+
+  Right (30, 7, 209, 255, 16843009, 4)
+
+scratch/main> run tickets
+
+  (5, true, 6, false, 6, true, 8)
+
+scratch/main> run casTest
+
+  49995000
+```
+
+## Universal.murmurHashUntyped
+
+The hash walks the closures natively for numbers, characters, data constructors, text, bytes,
+lists, arrays and byte arrays, and gives the interpreter's result bit for bit; a function, a
+map or a link is left to the interpreter.
+
+``` unison
+use Nat + - * / == < > <= >=
+
+structural type Shape = Dot | Line Nat Nat | Tri Nat Nat Nat
+
+hashes : '{IO, Exception} [Nat]
+hashes = do
+  arr = IO.arrayOf 3 4
+  MutableArray.write arr 0 (Universal.murmurHashUntyped "seed")
+  frozen = MutableArray.freeze! arr
+  b = IO.bytearrayOf 7 5
+  fb = MutableByteArray.freeze! b
+  [ Universal.murmurHashUntyped 0, Universal.murmurHashUntyped 42, Universal.murmurHashUntyped +42,
+    Universal.murmurHashUntyped -42, Universal.murmurHashUntyped 1.5, Universal.murmurHashUntyped ?z,
+    Universal.murmurHashUntyped Dot, Universal.murmurHashUntyped (Line 1 2), Universal.murmurHashUntyped (Tri 1 2 3),
+    Universal.murmurHashUntyped (Some (Line 3 4)), Universal.murmurHashUntyped (None : Optional Nat),
+    Universal.murmurHashUntyped "", Universal.murmurHashUntyped "héllo wörld ✓", Universal.murmurHashUntyped 0xs,
+    Universal.murmurHashUntyped 0xsdeadbeef, Universal.murmurHashUntyped ([] : [Nat]), Universal.murmurHashUntyped [1, 2, 3],
+    Universal.murmurHashUntyped [Some "a", None], Universal.murmurHashUntyped (1, "two", 3.0),
+    Universal.murmurHashUntyped frozen, Universal.murmurHashUntyped fb,
+    Universal.murmurHashUntyped (x -> x + 1) ]
+
+hashLoop : Nat -> Nat
+hashLoop n =
+  go acc i = if i == n then acc else go (acc + Universal.murmurHashUntyped (Some (i, "x"))) (i + 1)
+  go 0 0
+
+> hashLoop 10000
+```
+
+``` ucm :added-by-ucm
+  Loading changes detected in scratch.u.
+
+  + structural type Shape
+
+  + hashes   : '{IO, Exception} [Nat]
+  + hashLoop : Nat -> Nat
+
+  Run `update` to apply these changes to your codebase.
+
+    27 | > hashLoop 10000
+           ⧩
+           1345311805824347027
+```
+
+``` ucm
+scratch/main> run hashes
+
+  [ 6258706058885595179
+  , 18339396765014686940
+  , 18339396765014686940
+  , 13508695160205268227
+  , 14075555906852158245
+  , 6853419648900567049
+  , 14433742370595405518
+  , 2413176120755755857
+  , 6932268299374374561
+  , 316041837696717613
+  , 14433742370595405518
+  , 13706802057387761162
+  , 7199862675967212214
+  , 6466841387522386278
+  , 11995810339273904597
+  , 1330906865450270697
+  , 3347809220357464684
+  , 5588272521198093502
+  , 8249573216398372469
+  , 9655031862619216264
+  , 9566300282615928163
+  , 12727184073911490092
+  ]
 ```

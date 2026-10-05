@@ -1,9 +1,12 @@
-// The JIT's only use of LLVM: a small shim over the C API (see docs/jit-implementation-plan.md, D1).
+// The JIT's only use of LLVM: a small shim over the C API (see docs/jit/implementation-plan.md, D1).
 // Haskell calls these functions and nothing else from LLVM. Grown from jit-spikes/llvm/shim.c.
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Error.h>
@@ -30,7 +33,31 @@ const char *unison_jit_last_error(void) { return last_error; }
 const char *unison_jit_triple(void) { return LLVMOrcLLJITGetTripleString(jit); }
 
 // Returns 0 on success.
+// Process exit while the compile thread is inside LLVM. The RTS's hs_exit
+// doesn't wait for a thread in a safe foreign call, and exit() then runs
+// LLVM's static destructors under the compile in progress, which crashed in
+// the code generator (2026-10-04, seen at the end of transcript runs: the
+// re-entry batches flush after a quiet period, which is just when a program
+// finishes). So: an atexit handler, registered after LLVM's own destructors
+// so that it runs before them, waits for a compile in flight to finish, and
+// a compile that finishes (or starts) once we are exiting parks its thread
+// instead of returning into a runtime that is gone. The process's exit then
+// takes the parked thread with it.
+static int compiling = 0;  // compiles in flight
+static int exiting = 0;
+
+static void park_forever(void) {
+  for (;;) pause();
+}
+
+static void at_exit(void) {
+  __atomic_store_n(&exiting, 1, __ATOMIC_SEQ_CST);
+  struct timespec ms = {0, 1000 * 1000};
+  for (int i = 0; i < 10000 && __atomic_load_n(&compiling, __ATOMIC_SEQ_CST) > 0; i++) nanosleep(&ms, NULL);
+}
+
 int unison_jit_init(void) {
+  atexit(at_exit);
   if (jit) return 0;
   LLVMInitializeNativeTarget();
   LLVMInitializeNativeAsmPrinter();
@@ -63,7 +90,18 @@ int unison_jit_init(void) {
 // `passes` is a pass pipeline such as "default<O2>", or "" for none.
 // If out_opt is non-null, it receives the module's text after the passes
 // ran (malloc'd with LLVM's allocator; free it with unison_jit_free_string).
+static int add_module(const char *ir, size_t len, const char *passes, char **out_opt);
+
 int unison_jit_add_module(const char *ir, size_t len, const char *passes, char **out_opt) {
+  if (__atomic_load_n(&exiting, __ATOMIC_SEQ_CST)) park_forever();
+  __atomic_add_fetch(&compiling, 1, __ATOMIC_SEQ_CST);
+  int r = add_module(ir, len, passes, out_opt);
+  __atomic_sub_fetch(&compiling, 1, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&exiting, __ATOMIC_SEQ_CST)) park_forever();
+  return r;
+}
+
+static int add_module(const char *ir, size_t len, const char *passes, char **out_opt) {
   LLVMContextRef ctx = LLVMContextCreate();
   LLVMOrcThreadSafeContextRef tsctx =
       LLVMOrcCreateNewThreadSafeContextFromLLVMContext(ctx);

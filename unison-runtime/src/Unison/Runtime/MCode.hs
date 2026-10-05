@@ -727,7 +727,7 @@ data GCombInfo comb
       !(Ptr NativeCell) -- Where the JIT keeps this combinator's compiled code
   deriving stock (Show, Eq, Ord, Functor, Foldable, Traversable)
 
--- | A native code cell (see docs/jit-design.md): the mutable part of a
+-- | A native code cell (see docs/jit/design.md): the mutable part of a
 -- combinator, 32 bytes outside the Haskell heap. A pointer to the
 -- combinator's compiled code, null until it is compiled; a count of calls
 -- made while it was null; and a state: 0 until the JIT has been asked to

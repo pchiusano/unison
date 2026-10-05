@@ -12,6 +12,7 @@ library:
   dependencies:
     - base
     - deepseq
+    - primitive
 
 tests:
   util-rope-tests:
@@ -38,6 +39,18 @@ benchmarks:
       - base
       - containers
       - tasty-bench
+      - unison-util-rope
+
+  rope:
+    when:
+      - condition: false
+        other-modules: Paths_unison_util_rope
+    source-dirs: benchmarks/rope
+    main: Main.hs
+    dependencies:
+      - base
+      - tasty-bench
+      - text
       - unison-util-rope
 
 default-extensions:

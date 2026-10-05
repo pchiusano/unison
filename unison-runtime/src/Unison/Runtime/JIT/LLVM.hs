@@ -17,7 +17,10 @@ import Data.Word (Word64)
 import Foreign.Ptr (FunPtr)
 
 #ifdef UNISON_JIT
-import Foreign.C.String (CString, peekCString, withCString, withCStringLen)
+import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
+import Data.Text qualified as T
+import Data.Text.Encoding (encodeUtf8)
+import Foreign.C.String (CString, peekCString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr, WordPtr (..), castPtrToFunPtr, nullPtr, wordPtrToPtr)
@@ -54,9 +57,9 @@ initLLVM = do
 -- | Parses a module from IR text, runs the given pass pipeline
 -- (such as @default<O2>@, or @""@ for none) and hands it to the JIT.
 -- When asked, also returns the module's text after the passes.
-addModule :: Bool -> String -> String -> IO (Either String (Maybe String))
+addModule :: Bool -> String -> T.Text -> IO (Either String (Maybe String))
 addModule wantOptimized passes ir =
-  withCStringLen ir $ \(p, n) -> withCString passes $ \ps -> alloca $ \out -> do
+  unsafeUseAsCStringLen (encodeUtf8 ir) $ \(p, n) -> withCString passes $ \ps -> alloca $ \out -> do
     poke out nullPtr
     r <- c_addModule p (fromIntegral n) ps (if wantOptimized then out else nullPtr)
     if r /= 0
@@ -98,7 +101,7 @@ notBuilt = pure (Left "JIT: not built in (build with --flag unison-runtime:jit)"
 initLLVM :: IO (Either String ())
 initLLVM = notBuilt
 
-addModule :: Bool -> String -> String -> IO (Either String (Maybe String))
+addModule :: Bool -> String -> T.Text -> IO (Either String (Maybe String))
 addModule _ _ _ = notBuilt
 
 lookupSymbol :: String -> IO (Either String (FunPtr a))
