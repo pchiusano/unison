@@ -8,9 +8,7 @@ This document describes the design of Unison's new LLVM-based JIT compiler, whic
 
 A bit of history to motivate this design: we previously attempted a JIT that aimed to compile the entirety of the language to Racket Scheme (itself compiled at runtime to native code). This effort was ultimately abandoned for a few reasons: it was quite complicated to try to cover literally everything in the Unison language, especially the dynamic code-loading and serialization support used by Unison Cloud, and other than simple arithmetic loops, we never saw major performance wins over the interpreter. Certain functional code was actually *faster* with our tuned interpreter. It was also very much an "all or nothing" effort that couldn't be used until every Unison builtin had a Scheme implementation.
 
-This new JIT uses a different approach that allows it to be useful immediately. The idea is to compile functions to native code with [LLVM ORC](https://llvm.org/docs/ORCv2.html). But rather than needing to cover the entirety of the Unison language and its builtins, we allow native-compiled functions to "exit" back to the interpreter. Thus, delimited continuations, abilities, and any other subset of the language which is hard to compile to LLVM will continue to work fine but will defer to the interpreter at runtime. The idea is similar to what's done in a tracing JIT, where branches "off trace" revert to the interpreter, but here we're applying the idea to a function-at-a time JIT.
-
-Native code, once compiled, is entered through an `unsafe` foreign call, using the C calling convention. Native code allocates Haskell heap objects just like any other compiled Haskell code. For instructions that can't be run in native code, the function returns in such a way that the interpreter knows to run that instruction and then re-enter native code right after. This is called a "call-out" in this design. Thus, one unsupported instruction doesn't demote the rest of the function to the interpreter. 
+This new JIT uses a different approach that allows it to be useful immediately. The idea is to compile functions to native code with [LLVM ORC](https://llvm.org/docs/ORCv2.html). But rather than needing to cover the entirety of the Unison language and its builtins, we allow native-compiled functions to "exit" back to the interpreter. Thus, delimited continuations, abilities, and any other subset of the language which is hard to compile to LLVM will continue to work but will defer to the interpreter at runtime. The idea is similar to what's done in a tracing JIT, where branches "off trace" revert to the interpreter, but here we're applying the idea to a function-at-a time JIT.
 
 A few tricky concerns to be aware of for the design:
 
@@ -35,23 +33,22 @@ Note that code for a definition never changes, so compiled code never needs inva
 
 ## Background: the runtime the JIT builds on
 
-Our existing machinery has already, before compilation, converted the code to a set of  _supercombinators_ (occasionally "combinators" in this document). A supercombinator is a function definition in A-normal form that contains no inner functions or lambdas and which can only call other supercombinators. The body of a supercombinator is a value of type `MCode` (for "machine code"). 
+Our existing machinery has already, before native compilation, converted the code to a set of  _supercombinators_ (or just "functions" in this document). A supercombinator is a function definition in A-normal form that contains no inner functions or lambdas and which can only call other supercombinators. The body of a supercombinator is a value of type `MCode` (for "machine code"). 
 
 Here are the relevant types:
 
-- **MCode** (`Unison.Runtime.MCode`). Each combinator (`CombIx`) is a `GSection` tree: `Ins`, `Let`, `App`, `Call`, `Match`/`DMatch`/`NMatch`/`RMatch`, `Yield`, `Jump`, `Die`, `Exit`. Instructions (`GInstr`) include `Prim1`/`Prim2`, `Pack`/`Unpack`, `ForeignCall`, `Capture`, `Reset` and so on. Known, saturated calls are already marked as `Call`, as opposed to the general `App`.
+- **MCode** (`Unison.Runtime.MCode`). Each supercombinator is a `GSection` tree of instructions. Instructions include things like `DMatch` (pattern matching on a value), `App` (call an unknown function), `Call` (fully saturated call to known function), `ForeignCall` (call a foreign function), `Let` (evaluate and push result to stack), and so on.
 - **Stack** (`Unison.Runtime.Stack`). It has three pointers, `ap` (arg pointer), `fp` (frame pointer) and `sp` (stack pointer), an unboxed `MutableByteArray` (`ustk`) and a boxed `MutableArray Closure` (`bstk`). Both arrays are unpinned and are reallocated when the stack grows. Instructions address slots relative to `sp`, so the layout at each program point is fixed statically. `ap` matters for frames: `saveFrame` records a frame's size as `sp - fp` and its pending-argument count as `fp - ap`, and `restoreFrame` rebuilds `ap` from that count.
-- **Continuation** `K`. A chain of frames: `Push` (frame size, pending args, resumption `CombIx` + `RSection`, stack guard), `Mark`/`AMark` (prompts) and `Local`/`Keep`/`CB`. `Capture` copies stack segments plus `K` frames up to a prompt.
-- **Builtins.** Arithmetic and a few other operations are `Prim1`/`Prim2` instructions. Most builtins (around 460 of them, including all of Text, Bytes and IO) are `ForeignCall` instructions that run a Haskell function on the stack. Some of these can signal an exception to be routed to the current `{Exception}` handler; the interpreter's `exec` returns a flag for that.
-- **Every `Let` body has a `CombIx`.** A `Let` body is not a supercombinator: it's a position inside one, the point a non-tail call returns to. But the existing compiler gives each one a `CombIx` and stores its code under that name, so that continuations can be serialized. The JIT uses these names for [re-entry points](#re-entry-points).
+- **Builtins.** Some builtin functions like arithmetic have direct instructions (via `Prim1` and `Prim2`) but most others are `ForeignCall` instructions that run a Haskell function and push results to the stack.
 - **Values.** `Closure` wraps `GClosure`: `GPAp`, `GEnum`, `GData1`, `GData2`, `GDataG`, `GCaptured`, `GForeign`, `GUnboxedTypeTag`, `GAffine`, `GBlackHole`. Unboxed values are a `ustk` word plus a type-tag closure in the matching `bstk` slot.
+- **Continuation** `K`. A chain of frames: `Push` (frame size, pending args, resumption `CombIx` + `RSection`, stack guard), `Mark`/`AMark` (prompts) and `Local`/`Keep`/`CB`. `Capture` copies stack segments plus `K` frames up to a prompt.
 
 ## Approach: a batched supercombinator JIT
 
-The unit of compilation is a batch of supercombinators, compiled as a single LLVM module. It is highly beneficial to compile multiple related supercombinators together, so that inlining and further optimizations can be applied that cross function boundaries. We use the following scheme:
+The compilation unit is a batch of supercombinators, compiled as a single LLVM module. It is highly beneficial to compile multiple related supercombinators together, so that inlining and further optimizations can be applied that cross function boundaries. We use the following scheme:
 
 * Each supercombinator yet to be native-compiled (an "interpreted" function) keeps a count of how many times it has been called.
-* When this count reaches N (default 100), it is said to be "hot" and the definition is queued (idempotently) for a background compile thread that submits batches of definitions for compilation. Each supercombinator's [native code cell](#native-code-cells) holds a state: not requested, queued, or taken by the compile thread.
+* When this count reaches N (default 100), it is said to be "hot" and the definition is queued (idempotently) for a background compile thread. This thread submits batches of definitions for compilation. Each supercombinator's [native code cell](#native-code-cells) holds a state: not requested, queued, or taken by the compile thread.
 * We use the dependency graph of the code to pull related definitions into the same batch. At the moment, the compile thread forms a batch by iterating breadth-first over the hot definition's interpreted dependencies and dependents (what it calls, and what calls it), up to a batch of size B. A definition is taken only if it is in use: its own request is already waiting in the queue, or, for a dependency, it has been called at least N/2 times, or for a dependent, at least once. The dependents direction tends to matter more since a callee is called at least as often as its caller, so it usually gets hot first. 
 * Once compiled, pointers to native code for each supercombinator are installed while the program runs, one pointer write per supercombinator. Nothing assumes a batch appears all at once.
 
@@ -63,23 +60,27 @@ One tricky part of the JIT is producing "re-entry" functions. Whenever native co
 
 ### Uniform representation of native functions
 
-Every native-compiled function has a wrapper with the same signature, explained below. This is sometimes called the "Unison calling convention" in this document. The uniform signature is what the interpreter calls. (Note: each supercombinator also gets compiled as a separate *worker* that takes arguments as ordinary parameters and returns its result as an unboxed LLVM tuple. The wrapper calls the worker, and within a batch, workers can call each other and themselves directly without having to stash values on the Unison stack.) 
+Native code, once compiled, is entered through a foreign call, using the C calling convention. Native code allocates Haskell heap objects just like any other compiled Haskell code. For instructions that can't be run in native code, the function returns in such a way that the interpreter knows to run that instruction and then re-enter native code right after. (This is called a "call-out" in this design and is discussed later in this document TODO where).
+
+Every native-compiled function has a wrapper with the same signature, explained below. This uniform signature is what the interpreter calls:
 
 ```c
 typedef STATUS (*UnisonNativeFn)(Ctx *ctx, int64_t ap, int64_t fp, int64_t sp);
 ```
 
-Here, `Ctx` is a per-thread value with pointers to the Unison boxed and unboxed stacks, a writeable `ap`, `fp`, and `sp`, among other things, exact representation TBD. The stack pointers appear twice on purpose: the `ap`, `fp` and `sp` *arguments* are the values on entry to the function, and the `Ctx` fields are where native code writes the values on exit, since a C function can only return the one `STATUS`. The interpreter will twiddle the `Ctx` as needed before calling into native code, and native code will also write information back to the `Ctx` before returning.
+(Note: each supercombinator also gets compiled as a separate *worker* that takes arguments as ordinary parameters and returns results via unboxed LLVM tuples. The wrapper calls the worker, and within a batch, workers can call each other and themselves directly without having to stash values on the Unison stack.) 
+
+Here, `Ctx` is a per-thread value with pointers to the Unison boxed and unboxed stacks, a writeable `ap`, `fp`, and `sp`, among other things. The stack pointers appear twice on purpose: the `ap`, `fp` and `sp` *arguments* are the values on entry to the function, and the `Ctx` fields are where native code writes the values on exit, since a C function can only return the one `STATUS`. The interpreter will twiddle the `Ctx` as needed before calling into native code, and native code will also write information back to the `Ctx` before returning.
 
 `STATUS` is an `int64_t` where:
 
 * `OK = 0` means the function returned normally
 * `EXIT_ERROR = -1` means the function returned with an error, details stashed in `ctx`. Other negative values are reserved.
-* positive values are an exit, a 1-based index into the global `Exit` table, described below
+* Positive values are an exit, a 1-based index into the global `Exit` table, described below.
 
 Two pieces of global state connect the interpreter and native code:
 
-1. A *native code cell* for each supercombinator: one pointer-sized slot that is either null (the function is still being run interpreted) or holds the `FunPtr UnisonNativeFn` for its compiled code. Cells live outside the Haskell heap and are read by both the interpreter and native code. See [Native code cells](#native-code-cells).
+1. A *native code cell* for each supercombinator: this contains a `FunPtr UnisonNativeFn` that is either null (the function is still being run interpreted) or has a pointer to the compiled function. Cells live outside the Haskell heap and are read by both the interpreter and native code. See [Native code cells](#native-code-cells).
 2. The exits table, containing values of type `Exit` (defined below) which tells the interpreter what to do when returning from native code. This is an ordinary Haskell structure, since an `Exit` holds Haskell heap objects (`RSection`, `GInstr`). Native code never reads it: it only returns an index into it, as a constant baked into the generated code. (Each supercombinator has a fixed number of possible exits, known at compilation time, so it's no problem to give each supercombinator a range in the global exits table.)
 
 ```haskell
@@ -121,13 +122,13 @@ Both of these rely on [re-entry points](#re-entry-points), described below: ways
 | Combinator returns | not an exit: status `OK`, which goes to `yield` |
 | `Die`, or an error from a foreign call | not an exit: status `EXIT_ERROR`, with the message in `ctx` |
 
-#### Re-entry points
+### Re-entry points
 
 A compiled function can exit to the interpreter for a few reasons:
 
 * To grow the stack
 * To allow for GC or thread preemption
-* A call-out to have the interpreter run an instruction with no native equivalent
+* A call-out to have the interpreter run `MCode` with no native equivalent
 
 In each of these cases, we may have to resume the interrupted function midway through its execution.  For example, consider:
 
@@ -141,12 +142,15 @@ If `g` returns normally, native `f` just carries on into `x + 10`, and no re-ent
 
 We generate re-entry functions eagerly for resumptions after a call-out (since these locations are statically known), but the others are generated lazily, if and when they are needed.
 
+
 Properties of re-entry points:
 
 - **Each one is a `UnisonNativeFn`.** It starts by reading its locals from the Unison stack slots, which is always possible because of [the core rule](#entering-and-exiting-native-code), and begins with the same [stack check](#stack-guards) as any native function.
 - **No code is duplicated.** The code after a call-out lives only in the re-entry function.
 - **They're optional.** A `Let` with no re-entry point is resumed in the interpreter, which is always correct. So they can be added gradually.
 - **Native code never looks one up;** only the interpreter does. A call-out's re-entry point is a cell held by its `Exit` (a cell rather than a bare pointer because the re-entry function can itself exit with `GrowStack` or `Reenter`, which say "call this function again"). A `Let`'s re-entry point is the native code of the `Let` body's own combinator: the MCode emitter already makes every `Let` body a combinator whose arguments are the whole frame, so calling it is resuming at the body. Its [native code cell](#native-code-cells) is carried by the `Let` node and by the `Push` frame, and `yield` checks it with one load when it pops the frame.
+
+## Implementation notes
 
 #### Native code cells
 
@@ -455,23 +459,6 @@ Native code does this once per return to Haskell, not once per write. No GC can 
 | Closure compilation (MCode → a tree of Haskell closures) | No native code, so a lower ceiling. Worth building as a baseline to measure against. |
 | Full GHC-ABI native code (`ghccc`, info tables, CPS, `stg_gc_*`) | Essentially a new GHC backend. GC bugs are very hard to find, it's tightly coupled to GHC versions, and it requires LLVM. |
 | Hybrid: `foreign import prim` + `ghccc` + bump allocation on `Hp`, exiting when the heap check fails | Cheaper allocation and preemption, with no stack maps. Kept as an upgrade path if allocation or entry/exit costs dominate. |
-
-## Risks and open questions
-
-**Risks**
-
-- **Write-barrier and layout bugs corrupt the heap silently.** Mitigations: a debug mode that uses a slow, Haskell-checked path; the existing `STACK_CHECK` sentinels; and tests that run a fully JIT'd program under the interpreter and compare results.
-- **GHC coupling.** `allocate` and the `rCurrentAlloc` block whose free pointer native code bumps, info-pointer lookup, the array barrier and the `HpLim` poll depend on RTS internals. Check them on every GHC upgrade.
-- **Frequent exits could erase the gains.** Call-outs keep a `ForeignCall` from demoting the rest of a function to the interpreter, but each one still costs two foreign calls, so builtins used in hot code need native implementations over time. Calls to function values are handled natively in the common case, but over- and under-saturated calls still exit. Profile exit and call-out counts from the beginning.
-- **Missing polls stall the whole process.** Every native function must poll at its entry, including re-entry points, and the compiler should check for this.
-- **Linking LLVM statically may be hard.** Statically linking LLVM and the C++ runtime into a GHC-built binary on macOS (arm64 and x86-64), Linux and Windows (which needs a mingw-built LLVM to match GHC's toolchain) could take a while and affects everyone's build. Static linking is preferred but not required: if a time-boxed build spike shows it's painful, dynamically link a pinned LLVM (shared library found at runtime, with the JIT disabled and a warning logged if it's missing), and revisit static linking later. Do the spike before writing any codegen, but don't let it block the project.
-
-**Open questions**
-
-- [x] LLVM ORC or Cranelift for the first backend? Decided: LLVM ORC.
-- [x] Does the binary need to work without any external toolchain at runtime? Decided: ideally yes, by statically linking the LLVM components we use (OrcJIT, JITLink, the native target, the optimization passes). ORC links code in memory, so no clang or system linker is needed at runtime. This adds tens of MB to the binary, plus the C++ runtime library. If static linking turns out to be hard, that's acceptable: fall back to a dynamically linked LLVM, with the JIT disabled when the library isn't available (see [Risks](#risks-and-open-questions)).
-- [x] Which Haskell builtins (`Text`, `Bytes`, arithmetic on `Nat`/`Int`) to reimplement natively so they don't cause exits? Decided: start with arithmetic, comparison, bitwise and conversion operations on Int, Nat, Float, Char and Boolean (with exactly the interpreter's overflow and truncation semantics), plus array read, write and size. Bounds failures exit, and the interpreter raises the error. Skip Text and Bytes for now. Other easy candidates: Ref.read and Ref.write (with the write barrier), and tag and equality tests on data.
-- [x] How does this interact with the Racket/`run.native` backend going forward? Decided: that backend is defunct and will be deleted if the JIT succeeds.
 
 ## Appendix: the constant pool
 
