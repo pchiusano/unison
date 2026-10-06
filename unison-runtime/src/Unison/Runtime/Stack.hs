@@ -232,6 +232,7 @@ import Unison.Runtime.Foreign.Dynamic
 import Unison.Runtime.JIT.Config qualified as JIT
 import Unison.Runtime.MCode
 import Unison.Runtime.Referenced (Referenced, dereference)
+import Unison.Runtime.Signal qualified as Signal
 import Unison.Runtime.TypeTags qualified as TT
 import Unison.Type qualified as Ty
 import Unison.Util.Deque (Deque)
@@ -1888,6 +1889,8 @@ data Foreign
   | WrapValue !(Referenced Value)
   | WrapX509PrivKey !X509.PrivKey
   | WrapX509SignedCertificate !X509.SignedCertificate
+  | WrapSignal !Signal.Signal
+  | WrapSignalSubscription !Signal.Subscription
 
 -- Convenience class for (un)wrapping Haskell values automatically
 class BuiltinForeign f where
@@ -1897,6 +1900,8 @@ class BuiltinForeign f where
 
 foreignRef :: Foreign -> Reference
 foreignRef WrapArray {} = Ty.iarrayRef
+foreignRef WrapSignal {} = Ty.signalRef
+foreignRef WrapSignalSubscription {} = Ty.signalSubscriptionRef
 foreignRef WrapByteArray {} = Ty.ibytearrayRef
 foreignRef WrapBytes {} = Ty.bytesRef
 foreignRef WrapCDynFunc {} = Ty.ffiFuncRef
@@ -1940,6 +1945,8 @@ foreignRef WrapX509SignedCertificate {} = Ty.tlsSignedCertRef
 
 foreignName :: Foreign -> String
 foreignName WrapArray {} = "Array"
+foreignName WrapSignal {} = "IO.signal.Signal"
+foreignName WrapSignalSubscription {} = "IO.signal.Subscription"
 foreignName WrapByteArray {} = "ByteArray"
 foreignName WrapBytes {} = "Bytes"
 foreignName WrapCDynFunc {} = "DLL.Func"
@@ -1995,6 +2002,8 @@ ptrEq x y =
     return (sn1 == sn2)
 
 instance Eq Foreign where
+  WrapSignal l == WrapSignal r = l == r
+  WrapSignalSubscription l == WrapSignalSubscription r = l == r
   WrapArray l == WrapArray r = l == r
   WrapText l == WrapText r = l == r
   WrapReferent l == WrapReferent r = l == r
@@ -2047,6 +2056,8 @@ instance Eq Foreign where
         <> "`"
 
 compareForeign :: Bool -> Foreign -> Foreign -> Ordering
+compareForeign _tyEq (WrapSignal l) (WrapSignal r) = compare l r
+compareForeign _tyEq (WrapSignalSubscription l) (WrapSignalSubscription r) = compare l r
 compareForeign _tyEq (WrapText l) (WrapText r) = compare l r
 compareForeign _tyEq (WrapReference l) (WrapReference r) = compare l r
 compareForeign _tyEq (WrapReferent l) (WrapReferent r) = compare l r
@@ -2409,6 +2420,22 @@ instance BuiltinForeign CharPattern where
   wrapBuiltin = WrapCharPattern
   maybeUnwrapBuiltin = \case
     WrapCharPattern v -> Just v
+    _ -> Nothing
+  {-# INLINE maybeUnwrapBuiltin #-}
+
+instance BuiltinForeign Signal.Signal where
+  builtinName = Tagged "IO.signal.Signal"
+  wrapBuiltin = WrapSignal
+  maybeUnwrapBuiltin = \case
+    WrapSignal v -> Just v
+    _ -> Nothing
+  {-# INLINE maybeUnwrapBuiltin #-}
+
+instance BuiltinForeign Signal.Subscription where
+  builtinName = Tagged "IO.signal.Subscription"
+  wrapBuiltin = WrapSignalSubscription
+  maybeUnwrapBuiltin = \case
+    WrapSignalSubscription v -> Just v
     _ -> Nothing
   {-# INLINE maybeUnwrapBuiltin #-}
 

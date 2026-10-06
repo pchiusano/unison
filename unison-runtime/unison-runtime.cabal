@@ -91,6 +91,7 @@ library
       Unison.Runtime.Referenced
       Unison.Runtime.Serialize
       Unison.Runtime.Serialize.Get
+      Unison.Runtime.Signal
       Unison.Runtime.SparseVector
       Unison.Runtime.Stack
       Unison.Runtime.TypeTags
@@ -213,6 +214,11 @@ library
     extra-libraries:
         LLVM
     ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
+  if !os(windows)
+    c-sources:
+        cbits/signals.c
+    build-depends:
+        unix
 
 test-suite runtime-tests
   type: exitcode-stdio-1.0
@@ -224,9 +230,11 @@ test-suite runtime-tests
       Unison.Test.Runtime.ANF.Serialization
       Unison.Test.Runtime.Crypto.P256
       Unison.Test.Runtime.Crypto.Rsa
+      Unison.Test.Runtime.Foreign.Dynamic
       Unison.Test.Runtime.MCode
       Unison.Test.Runtime.MCode.Serialization
       Unison.Test.Runtime.Process
+      Unison.Test.Runtime.Signal
       Unison.Test.UnisonSources
       Paths_unison_runtime
   hs-source-dirs:
@@ -311,3 +319,8 @@ test-suite runtime-tests
     extra-libraries:
         LLVM
     ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
+  if !os(windows)
+    c-sources:
+        tests/cbits/signals.c
+    build-depends:
+        unix

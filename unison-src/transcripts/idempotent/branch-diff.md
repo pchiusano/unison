@@ -73,13 +73,13 @@ scratch/bob> reflog
        history.
 
        Branch        Hash          Description
-  1.   scratch/bob   #l3m16lkm0r   update
-  2.   scratch/bob   #nrdil51ie8   Branch created from scratch/main
+  1.   scratch/bob   #uubt8jeuva   update
+  2.   scratch/bob   #voo9u71lsi   Branch created from scratch/main
 
 scratch/bob> branch.diff 2 1
 
   Changes on
-  #l3m16lkm0rjttrts86k3hvbq7ifup8kc6oj73999lbnjv1g1fdhc7oql81rjvle46579eqoporvqqaum2hioe6qe3rr6bagcsf3ocio:
+  #uubt8jeuvaev34j5g28it9meo3k9r73rvcpg3d9n83l13tka1qe6is76eukc5hv5ou5cltdpi1ir4cqg91d3gb3nb3jrc762ubkfomg:
 
   ~ bar : Nat
   ~ baz : Nat
