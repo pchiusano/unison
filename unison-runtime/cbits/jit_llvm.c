@@ -1,5 +1,5 @@
 // The JIT's only use of LLVM: a small shim over the C API (see docs/jit/implementation-plan.md, D1).
-// Haskell calls these functions and nothing else from LLVM. Grown from jit-spikes/llvm/shim.c.
+// Haskell calls these functions and nothing else from LLVM. Grown from the M0 LLVM spike (see docs/jit/progress.md, "M0 spike results").
 
 #include <stdint.h>
 #include <stdio.h>

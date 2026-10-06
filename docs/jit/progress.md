@@ -157,10 +157,13 @@ Update it whenever a step finishes or something non-obvious is learned.
 
 ## M0 spike results
 
-### Spike 1: LLVM (`jit-spikes/llvm/`)
+The spike programs lived in `jit-spikes/` and were deleted on 2026-10-06, once everything they
+showed was in the JIT itself (see the commit history of `jit` before then). Their results stay here.
 
-Run with `jit-spikes/llvm/run.sh`. It builds with `stack ghc`, outside the Stack project, and links
-LLVM dynamically through `llvm-config`. Result on macOS arm64, LLVM 23.1.2, 2026-09-29: all pass.
+### Spike 1: LLVM
+
+It built with `stack ghc`, outside the Stack project, and linked LLVM dynamically through
+`llvm-config`. Result on macOS arm64, LLVM 23.1.2, 2026-09-29: all pass.
 
 | Question | Answer |
 | --- | --- |
@@ -186,18 +189,17 @@ Things learned about the LLVM 23 C API:
 
 Not done: the same spike on Linux x86-64. Paul decided to skip Linux for now (2026-09-29).
 
-### Spike 2: the GHC runtime from C (`jit-spikes/runtime/`)
+### Spike 2: the GHC runtime from C
 
-Run with `jit-spikes/runtime/run.sh` (normal runtime), `run.sh debug` (debug runtime, heap sanity
-checks on every GC, 64 KB nursery) or `run.sh nomark` (negative test). It links the real
-`unison-runtime` package, so the project must be built first. Result on macOS arm64, GHC 9.10.3,
+It ran in three modes: the normal runtime, the debug runtime (heap sanity checks on every GC, 64 KB
+nursery) and `nomark` (negative test). It linked the real `unison-runtime` package. Result on macOS arm64, GHC 9.10.3,
 2026-09-29: all pass, in both normal and debug mode.
 
 | Question | Answer |
 | --- | --- |
 | Does the layout probe work on the real `Closure` types? | yes. It finds the info pointer, pointer tag and the offset of every field of `Enum`, `Data1` and `Data2` by building a sample with recognizable values. |
 | Can C allocate closures with `allocate` that Haskell reads correctly? | yes. C built a 2 million cell list of `Data2` closures over 3419 separate unsafe calls, with GCs in between. Haskell pattern matching read back every cell. |
-| Is marking the array's header and cards enough for the GC? | yes. With marking, the debug runtime's sanity checks pass. Without it (`run.sh nomark`) the sanity check aborts at `rts/sm/Sanity.c` line 530. So the test detects the bug it's meant to, and adding the array to the mutable list is not needed. |
+| Is marking the array's header and cards enough for the GC? | yes. With marking, the debug runtime's sanity checks pass. Without it (`nomark`) the sanity check aborts at `rts/sm/Sanity.c` line 530. So the test detects the bug it's meant to, and adding the array to the mutable list is not needed. |
 | Can marking be done once per return to Haskell? | yes. The spike stores with no barrier and marks once before returning. |
 | Does memory stay bounded when native code allocates with a budget? | yes. 5.5 GB allocated as garbage in 4096-word budgets; peak memory in use 230 MB, most of which is the list from the previous test. |
 | Can native code see the runtime's request to stop? | yes, by reading `rHpLim` from the register table and comparing with null. A spinning loop saw it within 30 ms every time (normal runtime), which matches the runtime's 20 ms timeslice plus a 10 ms tick. |
