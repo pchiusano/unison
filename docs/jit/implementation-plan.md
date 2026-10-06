@@ -2,7 +2,7 @@
 
 Sep 29, 2026 · Paul Chiusano
 
-Companion to the [JIT design](design.md). The design says what we're building and why. This document says how it gets built: which choices the implementation makes, in what order the work happens, and how we know each step is correct.
+Companion to the [JIT design](../../unison-runtime/src/Unison/Runtime/JIT/design.md). The design says what we're building and why. This document says how it gets built: which choices the implementation makes, in what order the work happens, and how we know each step is correct.
 
 **How to review this.** Each choice that needs a decision is numbered (D1, D2, …) and gives a recommendation and the alternatives. The [sign-off checklist](#sign-off-checklist) at the end lists them all. Anything not marked as a decision follows from the design doc.
 

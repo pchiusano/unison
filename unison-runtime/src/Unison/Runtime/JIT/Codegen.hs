@@ -4,7 +4,7 @@
 {-# LANGUAGE PatternSynonyms #-}
 
 -- | MCode to LLVM IR, for the subset the JIT supports. See docs/jit/m1.md
--- for what that subset is and docs/jit/design.md for the conventions.
+-- for what that subset is and unison-runtime/src/Unison/Runtime/JIT/design.md for the conventions.
 --
 -- Within a function, every Unison stack slot is an LLVM alloca (decision
 -- D11): @%u<k>@ holds the unboxed word and @%b<k>@ the boxed pointer of the

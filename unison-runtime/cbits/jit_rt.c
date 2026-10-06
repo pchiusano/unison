@@ -1,5 +1,5 @@
 // Runtime helpers for JIT-compiled code, and the pieces of the GHC runtime it needs.
-// See docs/jit/design.md.
+// See unison-runtime/src/Unison/Runtime/JIT/design.md.
 
 #include "Rts.h"
 #include "jit_rt.h"

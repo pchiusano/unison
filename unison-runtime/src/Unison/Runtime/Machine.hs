@@ -951,7 +951,7 @@ jitStats = JIT.stats JIT.config
 
 -- The trampoline: runs compiled code for a combinator whose frame has
 -- been set up as `enter` sets it up, then acts on the status it returns.
--- See docs/jit/design.md, "How the interpreter interacts with native code".
+-- See unison-runtime/src/Unison/Runtime/JIT/design.md, "The trampoline", and unison-runtime/src/Unison/Runtime/JIT/internals.md.
 runNative ::
   (RuntimeProfiler prof) =>
   Ticker prof ->
@@ -1760,7 +1760,7 @@ cacheAdd0 ntys0 (normalizeCodes -> termSuperGroups) sands cc = go
   where
     toAdd = M.fromList (termSuperGroups <&> second codeGroup)
 
-    -- Every new combinator gets a native code cell (see docs/jit/design.md).
+    -- Every new combinator gets a native code cell (see unison-runtime/src/Unison/Runtime/JIT/design.md).
     -- Cells come from the cache's pool, so the transaction never allocates
     -- memory, which a retried transaction would leak. If the pool is too
     -- small, the transaction makes no changes to the code and reports how

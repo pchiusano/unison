@@ -1,4 +1,4 @@
--- | The JIT's entry points for the rest of the runtime. See docs/jit/design.md.
+-- | The JIT's entry points for the rest of the runtime. See unison-runtime/src/Unison/Runtime/JIT/design.md.
 module Unison.Runtime.JIT
   ( startJIT,
     jitCompileGroup,

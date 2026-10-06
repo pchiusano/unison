@@ -178,7 +178,7 @@ data CCache prof = CCache
     refTm :: TVar (M.Map Reference Word64),
     refTy :: TVar (M.Map Reference Word64),
     sandbox :: TVar (M.Map Reference (Set Reference)),
-    -- native code cells for combinators loaded through this cache (see docs/jit/design.md)
+    -- native code cells for combinators loaded through this cache (see unison-runtime/src/Unison/Runtime/JIT/design.md)
     nativeCells :: TVar NativeCellPool
   }
 

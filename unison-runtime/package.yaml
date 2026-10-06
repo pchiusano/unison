@@ -28,7 +28,7 @@ flags:
     manual: true
     default: false
 
-  # Build the JIT (see docs/jit/design.md). Needs LLVM; its paths are in stack.yaml.
+  # Build the JIT (see unison-runtime/src/Unison/Runtime/JIT/design.md). Needs LLVM; its paths are in stack.yaml.
   # Off by default so that nobody else needs LLVM installed.
   jit:
     manual: true

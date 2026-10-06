@@ -1,0 +1,250 @@
+# Unison JIT internals
+
+How the pieces described in the [design](design.md) are built today, organized by mechanism so that a reader with a source file open finds its section. Each section names the files it describes and the design section it implements. Numbers here are what the code does now; where they came from is in the milestone writeups and the [progress log](../../../../../docs/jit/progress.md).
+
+## The interface
+
+*`cbits/jit_rt.h`, `JIT/Exits.hs`, `JIT/Frames.hs`, `MCode.hs`; implements [Exits](design.md#exits-how-native-code-covers-a-subset-of-the-language) and [Native code cells](design.md#native-code-cells).*
+
+**`Ctx`** (`UnisonJitCtx` in `jit_rt.h`) is one struct per OS thread that runs native code, allocated with `malloc` and never moved. The trampoline sets, before every entry: the addresses of element 0 of `ustk`, `bstk` and the constant pool, the stack size in slots, the address of the capability's `HpLim` (null means "stop"), the C stack limit, the capability, the allocation budget's end and the bump pointer and its limit (see [Allocation](#allocation-and-the-barrier)). Native code writes `ap`, `fp` and `sp` before it returns, keeps `max_sp` (the highest slot it may have written, for marking the boxed stack), and appends frame records to the `frames` buffer (`n_frames` of at most `max_frames`). The Haskell side (`CtxOffsets` in `Codegen.hs`) mirrors the byte offsets and checks them at startup with `unison_jit_ctx_layout`, so the two can't disagree silently.
+
+**Status values.** `OK` is 0; `EXIT_ERROR` is -1; -2 is a worker's "tail call this for me" (see [The generator](#the-generator)); positive values index the exits table, 1-based.
+
+**The exits and frame tables** (`Exits.hs`, `Frames.hs`) are arrays of Haskell values that grow by copying. Looking one up is on the path of every exit, so it is two loads. Only the compile thread writes: an entry is in place before the code that returns its index is installed, and a reader that still holds an older array finds every index it can be handed there. A module's entries are registered from the generator's first pass, whose cells are placeholders, and replaced by the second pass's entries (which name the real cells) before the code is installed; the indices don't change between the passes, since a call site has the same exits either way. An `Exit` is one of `Resume`, `CallOut` (with the instruction, the section after it, the number of values it pushes, and the re-entry cell), `GrowStack` (the size wanted, and the cell to call again), `Reenter` (the cell to call again) or `Named`, a description wrapped around another for statistics; every exit also records its combinator. A `Frame` holds what a `Push` needs besides the two runtime sizes: the `CombIx`, the frame size, the body section and the body's cell.
+
+**The cell.** `NativeCell` in `MCode.hs` is an empty data type used only as the pointer's tag; the accessors there read and write the 32 bytes by offset. As a C struct it would be
+
+```c
+struct NativeCell {
+  UnisonNativeFn code;   // null until compiled
+  int64_t count;         // calls made while code was null, from minus the threshold
+  int64_t state;         // 0 not requested, 1 queued, 2 taken by the compile thread
+  int64_t verdict;       // the JIT's decision on the combinator
+};
+```
+
+The count starts at minus the compilation threshold, so that "hot" is the count reaching zero and the interpreter's test is one comparison with a constant; a count that starts at zero or above never gets there, which is how the JIT is turned off for a cell. The state moves forward only, by compare-and-swap (`claimNativeCell`, `takeNativeCell`), so a combinator is asked for once; a definition's state is its entry combinator's. The verdicts are: 0 undecided; "not worth compiling" (the interpreter never asks again); "too small to enter" (`readNativeEntry` returns null to the interpreter although the code is there for native callers). The C side has no declaration of the cell: generated code holds a cell's address as a constant and loads the code pointer from offset 0.
+
+**Lifecycle.** Cells are allocated when code is loaded, every supercombinator gets one, and the builtin combinators get theirs when the runtime starts. Supercombinators exist in two forms: *unresolved*, where references to other supercombinators are `CombIx` names (what the compiler emits and what is read from a compiled program file), and *resolved*, where those references point to the supercombinators themselves (what the interpreter runs and what closures contain). Only resolved supercombinators can run, so only they need cells: an unresolved `GCombInfo` holds a null cell address, and resolution fills in the real one. Resolution is a pure function and allocating cells needs IO, so the loader allocates a block of cells first and passes it in. Cells are never freed (code isn't unloaded). The serializer for compiled program files writes a supercombinator's fields one by one and doesn't write this one, so the file format is unchanged. `GCombInfo` is unpacked into every partial application closure, so each of those grows by one word.
+
+**How generated code gets a cell's address.** For a known function, the compiler has the callee's `GCombInfo` when it compiles a `Call`, reads the cell's address from it and writes that number into the generated code as a constant. This is safe because the cell never moves and compiled code is never saved to disk. If the callee's cell is at address `0x7f3a12004e80`, which is 139887386840704 in decimal, the generated IR for the call starts like this:
+
+```llvm
+%fn = load ptr, ptr inttoptr (i64 139887386840704 to ptr)   ; read the cell
+%is_null = icmp eq ptr %fn, null
+br i1 %is_null, label %exit_to_interpreter, label %do_call
+```
+
+For a function value, native code loads the closure pointer from the boxed stack, clears the tag bits, and loads the cell's address from a fixed offset inside the `GPAp` closure, where `GCombInfo` is unpacked and the address is a raw word. Calls within a module don't use cells: the callee is in the same module, so the call refers to its symbol directly.
+
+**Cells for re-entry points.** The compiler creates a `GCombInfo` for each `Let` body, and its cell is the `Let`'s re-entry point. The other re-entry points (after call-outs, and for `Let`s inside inline bindings) are auxiliary functions in the same module as their function; the JIT allocates a cell for each when it compiles the module, and the exit or frame-table entry that leads there holds it.
+
+## The trampoline
+
+*`JIT/Native.hs`, `Machine.hs`; implements [The trampoline](design.md#the-trampoline).*
+
+The trampoline fills in `Ctx`, makes the `unsafe` foreign call (`unison_jit_enter` in `jit_rt.c`, which sets up the per-thread context and calls the function), and reads the results back. The C entry point copies `ap`, `fp`, `sp`, the number of frame records and the first few records into spare words that the unboxed stack keeps past its last slot (`nativeOutWords` in `Stack.hs`), so a round trip allocates nothing; the arrays themselves are the ones the interpreter already holds. A round trip is about 37 ns, and everything on this path showed in the profile when it was more.
+
+**What each status does** is in the design's table. Two details:
+
+- A `Reenter` or `GrowStack` exit names the function to call again, which after tail calls need not be the one entered here. Its cell can still be empty: the functions of a module call each other directly, and one can be running before the compile thread has written the cell of another that it called. The cell is about to be filled, so the trampoline waits for it (`again` in `Machine.hs`, polling with a short delay, up to a limit).
+- A `CallOut` runs the instruction with `exec`, then re-enters only if the cell has code *and* the instruction pushed exactly the recorded number of values with the frame pointer unmoved; otherwise it interprets the section after the instruction, and if the cell was empty, counts the miss against the cell (that count is what asks for a deferred re-entry function). If the instruction raised an exception, the trampoline builds the `Push` frame for the rest of the function (with the cell as its re-entry point when the instruction pushes one value) and applies the handler, as the interpreter's `eval` does.
+
+The interpreter's side: `enter` and `apply` check the callee's cell (`readNativeEntry`, which hides a "too small to enter" verdict from the interpreter), count a call made while it is empty, and hand a non-null pointer to the trampoline with the arguments already moved into place; `yield` checks the `Let` body's cell, which the `Push` frame carries, when it pops the frame.
+
+## Frame records and the frame base
+
+*`Codegen.hs` (`writeRecord`, `unwindWith`, `unwindEnclosing`, `feBase`), `Machine.hs`; implements [Frames](design.md#frames-native-code-records-haskell-builds) and the last property of [Re-entry points](design.md#re-entry-points).*
+
+After every non-tail native call, the generated code does the equivalent of:
+
+```c
+STATUS r = g(ctx, sp, sp, sp);
+if (r != OK) {
+  // g is exiting, so we are too. Record the frame the interpreter
+  // would have pushed before calling g, then pass g's status along.
+  add_frame_record(ctx, LET_BODY_ID, sp - fp, fp - ap);
+  return r;
+}
+// g returned normally: continue with the Let body
+```
+
+- **Order.** Records are written innermost caller first, since that's the order the exit passes through them. `K` has the innermost frame on top, so the interpreter builds from the last record to the first.
+- **Inlined `Let`s.** Native code may compile a `Let` binding inline instead of calling it as a function. If it exits partway through that binding, the exiting function itself writes the record for that `Let` before returning (`unwindEnclosing`: innermost binding first). So a function's own enclosing `Let`s come first, then its callers'. Which `Let`s enclose each exit point is known at compile time.
+- **Buffer size.** Each record corresponds to one native call in progress, and the C stack guard already limits how deep those can nest, so the buffer has a fixed size with room for that many records.
+- **Cost.** Nothing on the normal path beyond the status check. On an exit, a few stores per native frame, plus one `Push` allocation per frame in Haskell.
+
+**The frame base.** When native code exits from inside an inline binding, its frame records describe the interpreter's picture: a fresh frame for the binding, starting at the binding's base, and a `Push` frame for the body. Code that re-enters there is therefore generated in that picture: entered with the interpreter's frame pointer at the base (`feBase`, zero for a combinator), it recovers the function's own frame pointer by subtracting the base, writes records only for bindings nested inside, and the binding's own `Yield` is a return, which lets the interpreter pop the `Push` frame and run the body. Slot offsets stay relative to the function's frame throughout. The same mechanism gives a `Let` nested inside an inline binding its re-entry point, which the body combinator's own code can't provide (its arity counts the enclosing function's slots).
+
+## The generator
+
+*`JIT/Codegen.hs`; implements [Calls](design.md#calls) and the per-function parts of everything else.*
+
+**Slots.** Within a function, every Unison stack slot is an LLVM `alloca`: `%u<k>` holds the unboxed word and `%b<k>` the boxed pointer of the slot at frame offset `k`. The frame depth at every point is known statically, so MCode's "slot `i` from the top" is a fixed offset, and LLVM's `mem2reg` turns the allocas into registers. The real stack is touched only at entry, before a tail call through the stack, and on exit paths. A boolean produced by a comparison stays an `i1` register until something stores it where it escapes; a `DMatch` on it is a branch.
+
+**Workers, wrappers and the fast entry.** A function whose every `Yield` returns one value is generated as a worker, `<name>_w`, with `tailcc` and the signature in the design; the function its cell points to is the wrapper, `<name>`, with the uniform signature. The worker doesn't take `ap`: the wrapper hands a call with pending arguments (`ap` differs from `fp`) to the interpreter before the worker runs, so a worker never sees one. Details:
+
+- *Exits.* A worker is passed the frame pointer its frame would have on the Unison stack, and its caller's stack check leaves room for its arguments there; when it exits, it writes its slots to that place and each native caller above it writes its own frame and record as the status passes up. Re-entry points keep the uniform signature and call workers like any other caller.
+- *Tail calls.* Worker to worker is a real tail call (`musttail`, which `tailcc` allows between different signatures). A worker can't tail call a function with the uniform signature, since the return types differ: it puts the arguments on the stack and returns status -2 with the code pointer and the stack pointer in the other two return values; the wrapper at the bottom makes the call as a real tail call, and a worker that had called this one with a plain call makes it as a plain call. Either way the C stack doesn't grow.
+- *Checks.* A worker checks the Unison stack, the poll and the C stack once, at entry, and looks at the allocation budget only if it allocates. The high-water mark for marking the boxed stack is raised where a worker writes the stack, on its exit paths, instead of at every entry.
+- *The fast entry.* Many functions start with a test and return at once in the base case. For such a worker a second, tiny function, `<name>_wf`, is what callers call: it holds only the paths that can't exit, call or loop, which need nothing checked, and returns from them directly; any other path tail calls the full worker, which starts again from the top (what it repeats is a few instructions without side effects). The base case then costs no stack check, no poll, and none of the register saving the full worker does on behalf of its exit paths. Worth 15% on `fib`.
+- *Cold paths.* Every branch to an exit or a slow path carries a branch weight (`!prof`). Without them LLVM kept the values the exit paths need in callee-saved registers, which every call then paid to save and restore; this alone took `fib 20` from 89 to 74 µs before workers existed.
+- *Which functions get one.* `workerShape` is a first sieve on the MCode (every `Yield` is one value or `VArgV`, whose count depends on the frame depth); the generator refuses a worker mid-way if a `Yield` turns out to return another number of values, and the function is generated in the uniform form instead.
+
+**A worked example.** `sumTo n = if Nat.eq n 0 then 0 else n + sumTo (Nat.drop n 1)` is one combinator: a test, a `Let` whose binding is the recursive call, and the addition. Below is LLVM's output after its O2 pipeline, shortened: the blocks that write the frame back to the Unison stack and return an exit status (the stack-growth check, the poll, and the unwind when the recursive call comes back with a status other than `OK`) are elided, since they are the same stores as the wrapper's `ok:` block. The generated IR before optimization is about four times longer.
+
+The worker. Its arguments are the argument's unboxed word `%a.u1` and boxed pointer `%a.b1` (for a `Nat`, the word is the number and the pointer is the type-tag closure for `Nat`, which the result carries too), and it returns `{status, u, b}`. The recursive call is a direct call from worker to worker:
+
+```llvm
+define internal tailcc { i64, i64, ptr } @u645_0_w(ptr %ctx, i64 %fp.in, i64 %a.u1, ptr %a.b1) {
+head:
+  %pool = load ptr, ptr (ctx + 16)            ; the constant pool
+  %tag.nat = load ptr, ptr (pool + 24)        ; the Nat type-tag closure
+  %c.2 = icmp eq i64 %a.u1, 0
+  br i1 %c.2, label %yield.52, label %false.57
+
+yield.52:                                     ; the base case: n == 0
+  %ret.56 = insertvalue { i64, i64, ptr } { i64 0, i64 0, ptr undef }, ptr %tag.nat, 2
+  ret { i64, i64, ptr } %ret.56               ; status OK, value 0
+
+false.57:                                     ; the recursive case: room on the Unison stack?
+  %need.i = add i64 %fp.in, 11
+  %room.i = icmp slt i64 %need.i, %stack.size.i
+  br i1 %room.i, label %head.i, label %grow.i, !prof !0
+
+head.i:                                       ; the poll (another thread sets HpLim to null)
+  %hplim.36.i = load volatile ptr, ptr %hplim.p.i
+  %stop.37.i = icmp eq ptr %hplim.36.i, null
+  ...                                         ; and the C stack depth check
+  br i1 %stop.43.i, label %exit.44.i, label %body.63.i, !prof !1
+
+body.63.i:
+  %r.126.i = add i64 %a.u1, -1                ; Nat.drop n 1
+  %fpk.184.i = add i64 %fp.in, 5              ; the callee's frame pointer
+  %r.185.i = tail call tailcc { i64, i64, ptr } @u645_0_w(ptr %ctx, i64 %fpk.184.i, i64 %r.126.i, ptr %tag.nat)
+  %st.186.i = extractvalue { i64, i64, ptr } %r.185.i, 0
+  %cond.i = icmp eq i64 %st.186.i, 0
+  br i1 %cond.i, label %yield.341.i, label %unwind.194.i, !prof !3
+
+yield.341.i:                                  ; n + the result
+  %r.u.187.i = extractvalue { i64, i64, ptr } %r.185.i, 1
+  %r.268.i = add i64 %r.u.187.i, %a.u1
+  %ret.344.i = insertvalue { i64, i64, ptr } { i64 0, i64 undef, ptr undef }, i64 %r.268.i, 1
+  %ret.345.i = insertvalue { i64, i64, ptr } %ret.344.i, ptr %tag.nat, 2
+  ret { i64, i64, ptr } %ret.345.i
+
+grow.i:        ; store the frame, the stack pointers into Ctx, return status 2975 (grow the stack)
+exit.44.i:     ; likewise, status 2977 (re-enter this function when the thread next runs)
+unwind.194.i:  ; store the frame and a frame record for the Let, pass the callee's status on
+}
+```
+
+The wrapper has the uniform signature. It loads the argument from the Unison stack, calls the worker, and on `OK` stores the result where a `Yield` would put it and sets the stack pointers in `Ctx`; any other status is an exit the worker has already prepared, and is passed on:
+
+```llvm
+define i64 @u645_0(ptr %ctx, i64 %ap, i64 %fp.in, i64 %sp) {
+  %pending.not = icmp eq i64 %ap, %fp.in
+  br i1 %pending.not, label %enter, label %pending.exit, !prof !0
+
+enter:
+  %ustk = load ptr, ptr %ctx                  ; the unboxed and boxed stacks
+  %bstk = load ptr, ptr (ctx + 8)
+  %ix1 = add i64 %ap, 1
+  %u1 = load i64, ptr (ustk + ix1)            ; the argument
+  %b1 = load ptr, ptr (bstk + ix1)
+  %r = tail call tailcc { i64, i64, ptr } @u645_0_w(ptr %ctx, i64 %ap, i64 %u1, ptr %b1)
+  %st = extractvalue { i64, i64, ptr } %r, 0
+  %cond = icmp eq i64 %st, 0
+  br i1 %cond, label %ok, label %exit
+
+ok:                                           ; the result goes where Yield would put it
+  store i64 %r.u, ptr (ustk + ix1)
+  store ptr %r.b, ptr (bstk + ix1)
+  store i64 %ap, ptr (ctx + 40)               ; ap, fp, sp
+  store i64 %ap, ptr (ctx + 48)
+  store i64 %ix1, ptr (ctx + 56)
+  ...                                         ; raise the high-water mark of written slots
+  ret i64 0
+
+exit:
+  ret i64 %st
+
+pending.exit:                                 ; the stack pointers go back as they came
+  ...
+  ret i64 2982                                ; status: resume this function in the interpreter
+}
+```
+
+(The `ptr (ctx + 16)` forms are a shorthand for the `getelementptr` and `load` pairs in the real output. The module also holds a third function, `@u645_2`: the re-entry point for the `Let`'s body, which the interpreter calls when the recursive call exited and it has run the rest; it has the uniform signature and adds the two values.)
+
+**Re-entry functions.** The code after a call-out, and the body of a `Let` nested inside an inline binding, are auxiliary functions in the same module, named `<name>_r<n>`, each with its own cell; the exit or frame-table entry that leads there holds the cell. One for an instruction with no native version is generated with its module. One on the slow path of an instruction that has a native fast path is *deferred* in `on` mode (`genAuxFunction` with `later`): it gets a name, a cell and a `Deferred` record, and is generated only when the interpreter has found the cell empty often enough. Auxiliary functions are memoized per (section, depth, frame base), since the same continuation is met again wherever its enclosing code is generated more than once (inline after a binding and in the auxiliary function for the binding's body); without this the output grew exponentially with the nesting of bindings. A re-entry function generated later reuses the cells its parent handed out, through the memo kept per root function.
+
+**Private copies** are generated under a fresh name with internal linkage for the function and its worker (a flag in the environment; the auxiliary functions stay external, since they are installed in cells of the module's own).
+
+**The generator is strict throughout:** its text is `Unison.Util.Text`, its sequences are `Unison.Util.Deque`, its pairs and record fields are strict, and `put` evaluates the state, so forcing the state forces all of it and no thunk over a module's text outlives the step that made it. Each module's IR is handed to LLVM as one UTF-8 buffer; `UNISON_JIT_DUMP_IR=dir` writes each module's IR before and after O2.
+
+## The compile driver
+
+*`JIT.hs`, `JIT/Compile.hs`, `JIT/Estimate.hs`; implements [What gets compiled, and when](design.md#what-gets-compiled-and-when).*
+
+**Units.** The driver works on *units*, one LLVM function each: a combinator (an entry point or local function of a group), or a re-entry function. A group (a top-level definition with its local functions and `Let` bodies) is split into the units compiled now and those that wait to be asked for. Function names are `u<group>_<index>` with a suffix when a second runtime in the process reuses group numbers; copies get `_c<n>`.
+
+**Two passes.** A module is generated twice: the first pass finds out which functions compile and how many exits, frames and cells each needs (its cells are a counting supply); the exits, frames and cells are then registered, and the second pass generates with the real bases, which also knows which functions of the module compiled and so can call them directly and as workers. A function that fails as a worker in the first pass is generated in the uniform form in the second.
+
+**Batches.** The threshold N is `UNISON_JIT_THRESHOLD` (100); the batch size B is `UNISON_JIT_BATCH` (32). The compile thread walks callers as well as callees; the code cache records only what each definition calls, so the thread keeps the reverse index. A neighbour whose own request is still queued is taken into the batch (its request state is set by compare-and-swap, three states). Callees get hot before callers, so batches of more than one definition are rare and direct calls mostly matter within a definition.
+
+**Private copies.** When a batch is formed, the callees of its members that are compiled already and not in the batch are candidates: `judge` gives the callee's estimated work per call, and one under `UNISON_JIT_COPY` (40) that doesn't loop or recurse is compiled again into the new module. The copy is not installed in its cell. In the test transcript every copy was inlined and deleted by O2.
+
+**Re-entry batches.** A re-entry function asked for on demand is held and compiled with the others when there are B of them or no request has arrived for `UNISON_JIT_REENTRY_WAIT` ms (20). A definition's request is served ahead of the held ones.
+
+**The estimate** (`Estimate.hs`). For an average path from entry to return: the saving is one unit per instruction or branch, three per call or `let`, nothing for an instruction the interpreter has to run anyway; branch arms count equally, except arms that end in an error, and in a function that calls itself the arms that loop or recurse weigh four times the others. A call that returns to the function counts as an exit to the extent that the callee is likely to exit (its own certain exits, at most one): when a callee exits, the caller's frame is unwound with it. The function is left interpreted if `exits × E > saving`, E being `UNISON_JIT_EXIT_COST` (7). "Too small to enter" is a saving below `UNISON_JIT_ENTRY_COST` (3 units, about 20 ns) with no loop.
+
+**Installation.** Each function's symbol is looked up and its cell written, one at a time (`UNISON_JIT_STRESS=install=N` delays each write). The re-entry functions left for later become pending before any code that can exit to them is installed. The module's memo of auxiliary functions is recorded, forced, per root function.
+
+**Startup and shutdown.** The startup checks (layouts, helpers, see [Data representations](#data-representations-and-the-c-helpers)) run on the compile thread in `on` mode and before the first compile in `eager` mode; if any fails, the JIT is off and the log says so. An `atexit` handler in the LLVM glue waits for a compile in flight and parks the compile thread, since `hs_exit` doesn't wait for a thread in a safe foreign call and `exit()` would otherwise run LLVM's destructors under a compile.
+
+## Allocation and the barrier
+
+*`jit_rt.c` ("Allocation"), `Codegen.hs` (`allocWords`); implements [Memory](design.md#memory).*
+
+**Bump allocation.** The context carries a copy of the capability's current allocation block's free pointer and end (`hp`, `hp_lim`), set by the trampoline at entry from the register table's `rCurrentAlloc`, the block the RTS's `allocate` uses for allocation from C. Generated code and the C helpers bump `hp` against `hp_lim` and call `unison_jit_alloc_words` only when the object doesn't fit or there is no block yet; the slow path writes `hp` back to the block, calls `allocate` (which may move on to a new block) and reloads the copy; the trampoline writes it back on return and charges the thread's allocation counter for the words taken inline. GHC's own `Hp` can't be used: on arm64 and x86-64 it is a callee-saved machine register, not a word in the register table, and native code runs inside an unsafe foreign call where that register holds whatever the C code put there. While native code runs the block's own `free` is stale and `hp` is the truth; nothing else allocates on the capability in that time. Objects of the large-object size go to `allocate`, which gives them their own block. `UNISON_JIT_BUMP=0` turns the bump path off for diagnosis.
+
+**The budget as an address.** `budget_end` is `hp` plus the words the budget still allows; `hp_lim` is the nearer of the block's end and `budget_end`, so the fast path's one compare covers both limits and the slow path finds out which it hit. When the block is full it moves to a new one and moves `budget_end` with `hp`. When the budget is used up the slow path still hands out the object (nothing can exit halfway through a `Pack`), leaves `hp_lim` below `hp` so that the rest of the run's allocations take the slow path too, and the poll, which tests `hp` against `budget_end`, fires at the next function entry. Each `Pack` allocates once for everything it builds: a constructor's fields are already evaluated, so nothing can exit between the allocation and the last store.
+
+**Layouts.** Constructor info pointers and field offsets (`GData1`, `GData2`, `GDataG`, `GEnum`, `GPAp`, `Val`, the type-tag closures, the `Foreign` wrappers with their pointer tags, …) are read at startup by probing sample closures (`JIT/Layout.hs`), because `UNPACK` only takes effect in optimized builds. `GDataG` holds a `Seg`, a tuple of a `ByteArray` and an `Array`: a tuple's fields can't be unpacked, so the closure points at two lifted boxes that each point at an array; building one is five objects, reading a field is three loads, and native code matches this. Taking a constructor apart needs its field count, which for three or more fields isn't in the pointer tag, so the interface registers every data type's constructor arities with the JIT as it loads them. `GClosure` has ten constructors, more than the seven tag values, so only the first six are identified by the tag alone.
+
+**The write barrier.** Before returning to Haskell (on `OK`, an exit or an error), the C entry point sets `bstk`'s header to `stg_MUT_ARR_PTRS_DIRTY_info` and marks every card (one byte per 128 elements) covering the slots native code could have written: from the `ap` it was entered with up to `max_sp`. `ustk` holds no pointers and needs no barrier. `Ref.write` calls a C helper that stores the value and then calls the runtime's `dirty_MUT_VAR`, as compiled Haskell does; `MutableArray.write` stores, sets the array's info pointer to the dirty one and marks the card, again as compiled Haskell does. Marking the header and cards is sufficient on GHC 9.10.3: with it the debug runtime's heap sanity checks pass, and without it they fail. The non-moving collector, which needs a different barrier, is assumed not to be in use.
+
+**Untagged pointers.** The interpreter can leave an untagged pointer in a boxed stack slot: a top-level constant such as `noneClo` stored as itself puts the static closure's address there, which is untagged whether or not the CAF has been forced. GHC's optimized code reads a strict field without checking the tag, so native code checks the pointer tag before reading through such a pointer (a match on it sends tag 0 to the interpreter) and before storing it into a strict field (`requireTagged`: in `Pack`, list literals and pushes, `Ref` and array writes), taking the slow path for tag 0. Arrays and the stack itself may hold untagged pointers. An evaluated CAF is an `IND_STATIC` to a `BLACKHOLE` whose indirectee is the value; the C helpers that follow indirections for the startup samples know that case.
+
+## Stack guards and the poll
+
+*`Codegen.hs` (`entryBlock`, `genHead`, `cStackGuard`), `jit_rt.c`; implements [Stack growth and preemption](design.md#stack-growth-and-preemption).*
+
+The C stack limit is the thread's stack floor plus a reserve, set when the context is made; GHC's worker threads on macOS get 512 KB, which leaves about 250 KB for native frames, roughly 1600 frames of a small function. A function with the uniform signature checks it before each non-tail call; a worker checks it once at entry, if it makes calls. The Unison stack check at entry demands the frame size plus one slot, as the interpreter's `ensure` does; the size the grow exit asks for is fixed up once the whole function has been generated, since the frame covers every slot the function touches. The poll loads `HpLim` through the pointer in `Ctx` with a volatile load (without it LLVM hoists the load out of the loop and the poll never fires) and, in code that allocates, compares `hp` with `budget_end`. The timer that sets the context-switch flag runs every 20 ms by default. Stress modes (`UNISON_JIT_STRESS=poll=N,callee=N,cstack=N,alloc=N`) fire the poll every N entries, treat every N-th callee as not compiled, lower the C stack limit, and shrink the budget, so that the exit paths run in the tests.
+
+## Data representations and the C helpers
+
+*`jit_rt.c` (the "Ropes", "Lists", "Arrays and Refs", "Numbers" and "murmurHashUntyped" sections), `JIT/Layout.hs`, `JIT/Native.hs`, `lib/unison-util-rope`; implements [Builtins and data structures](design.md#builtins-and-data-structures).*
+
+**Lists.** A Unison `List` is a `Unison.Util.Deque Val`, a strict finger tree: a prefix and a suffix digit of up to ten items as strict lists, a strict middle of nodes that are eight leaves inline or an array of two to eight children; both digits of a tree with a middle have an item. Pushes and pops are amortized O(1) when a list is used once and O(log n) in the worst case; lookup, take, drop and append are O(log n). The C list helpers are ports of the module's operations (cons, snoc, uncons, unsnoc, lookup, take, drop, append, the views and splits that list patterns compile to, list literals), one set of functions handling the top level and the levels of nodes below it.
+
+**Text and bytes.** A `Text` is a `Unison.Util.Rope` of chunks (a character count and a `Data.Text`), `Bytes` the same rope over chunks of byte arrays: the Deque's finger tree with chunks for elements and sizes counted in characters or bytes, sharing the Deque's middle below the top level. Invariants: no chunk is empty; a rope of one chunk is `One`; both digits of a `Deep` hold a chunk; two chunks next to each other hold more than `threshold` (64) elements between them, which bounds the number of chunks by the length. Every rope function in C takes a `RopeKind` that holds the kind's constructors, the threshold, where a chunk's fields are and whether counts are characters that have to be turned into bytes through UTF-8; the text helpers and the bytes helpers are the same functions with different kinds. The threshold is handed to the C side at startup.
+
+**Arrays and refs.** Each array kind is `Foreign (WrapX arr)`, the wrapper holding the unlifted array; the layout probe reads each wrapper's info pointer and pointer tag, since the wrappers are not all tag 7. The helpers reproduce the interpreter's bounds arithmetic exactly (wrapping `Word64` for byte arrays) and answer "not handled" when a check fails, so exactly the calls the interpreter rejects go to the call-out, where it raises. New arrays get the RTS's layout (dirty info pointers, a zeroed card table, `allocatePinned` for pinned byte arrays); `Ref.cas` is `casMutVar#`'s compare-and-swap with `dirty_MUT_VAR` when it succeeds on a clean variable. A `Ticket` is a newtype over the value.
+
+**Numbers.** Floats are their IEEE bits in the unboxed slot. The generated code calls the libm functions compiled Haskell calls (`exp`, `log`, `pow`, the trigonometric and hyperbolic functions) and uses the intrinsics for `sqrt` and `abs`; conversions to `Int` use the saturating intrinsic (`fcvtzs` on arm64; NaN gives 0); `round` is `rint` then that conversion; `ceiling` and `floor` are GHC.Float's truncate-then-adjust with wrapping arithmetic; `min`/`max` are `Ord Double`'s defaults; `atan2` is a C port of GHC's case-defined instance; `pow` is a C loop. The `--fast` build's interpreter differs on out-of-range conversions (the RULES that make them saturate don't fire at `-O0`), so the optimized build is the reference for edge cases.
+
+**The hash.** `Universal.murmurHashUntyped` is `Value.value` followed by a foreign call that hashes the reflected tree; the generator fuses the two into one C helper that walks the closures and feeds the same words to the same MurmurHash64A accumulator (the library's seed and finalization hardcoded). A value it doesn't handle (a function, a map, a link, quoted code, a continuation, a big number) goes to the call-out.
+
+**Checks.** The constructor layouts are GHC's, not ours, so they are checked at startup like the closure layouts: the helpers learn the constructors from sample values, a C walk checks the shape and the stored counts of every constructor in a set of samples, and each helper is then run against the Haskell operation it stands in for; 21 sample values of every kind for the hash. If anything differs, the JIT stays off. `UNISON_JIT_STRESS=lists=N`, `texts=N`, `bytes=N` run N random operations through the helpers, each on the results of earlier ones, checking every result's structure and elements against Haskell. `UNISON_JIT_TRACE_TEST=1` prints each self-test operation as it runs. The modules whose constructors the C side reads (`Deque.Internal`, `Rope`, `Text`, `Bytes`) are compiled with `-O2 -funbox-strict-fields` in every build, so that the layouts don't change with the build's optimization level. The linker drops C functions that nothing refers to, and only generated code refers to the helpers, so the runtime keeps a table of them.
+
+## The constant pool's growth
+
+*`JIT/Pool.hs`; implements the [constant pool](design.md#appendix-the-constant-pool).*
+
+The array grows by copying, and superseded arrays are kept alive so that an address read at entry stays valid for the rest of that native run. Because code is installed while native code runs, a run can call a function that is newer than the array it holds. So a new entry is also written to the superseded arrays where it fits, and a function that uses an index beyond the size of the pool's first array checks the size of the array it was given at entry; if it is too small, it exits (`stale constant pool`) and is entered again with the current array. A `Reference` is kept as the field of a prebuilt field-less constructor of its type. The pool's first entries are fixed: the type-tag closures and the boolean constructors, at indices every function may use without a check.
+
+## Diagnostics
+
+The environment variables (`UNISON_JIT`, `UNISON_JIT_LOG`, `UNISON_JIT_STATS`, `UNISON_JIT_DUMP_IR`, `UNISON_JIT_DISABLE`, `UNISON_JIT_STRESS`, the thresholds and costs) are listed with what each does under "Building with the JIT" in the [progress log](../../../../../docs/jit/progress.md#building-with-the-jit), and parsed in `JIT/Config.hs`.

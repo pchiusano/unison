@@ -2,7 +2,7 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 
--- | Calling into native code. See docs/jit/design.md, "How the interpreter
+-- | Calling into native code. See unison-runtime/src/Unison/Runtime/JIT/design.md, "How the interpreter
 -- interacts with native code". With the @jit@ flag off, nothing here can
 -- be reached, because no cell ever holds code.
 module Unison.Runtime.JIT.Native

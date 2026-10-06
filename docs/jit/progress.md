@@ -1,7 +1,7 @@
 # Unison JIT: progress log
 
 Working notes for whoever picks this up next, human or Claude. Read this first, then the
-[design](design.md) and the [implementation plan](implementation-plan.md).
+[design](../../unison-runtime/src/Unison/Runtime/JIT/design.md) and the [implementation plan](implementation-plan.md).
 Update it whenever a step finishes or something non-obvious is learned.
 
 ## Status

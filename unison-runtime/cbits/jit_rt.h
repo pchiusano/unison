@@ -1,4 +1,4 @@
-// Shared state between the interpreter and JIT-compiled code. See docs/jit/design.md.
+// Shared state between the interpreter and JIT-compiled code. See unison-runtime/src/Unison/Runtime/JIT/design.md.
 // The Haskell side (Unison.Runtime.JIT.Codegen, CtxOffsets) mirrors this layout and checks
 // it at startup with unison_jit_ctx_layout.
 #ifndef UNISON_JIT_RT_H

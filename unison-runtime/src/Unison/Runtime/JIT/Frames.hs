@@ -1,7 +1,7 @@
 -- | The global frame table. A native caller whose callee exits writes a
 -- frame record naming an entry here; the trampoline turns the record into
--- the @Push@ frame the interpreter would have pushed. See docs/jit/design.md,
--- "On dynamically constructing K frames".
+-- the @Push@ frame the interpreter would have pushed. See unison-runtime/src/Unison/Runtime/JIT/design.md,
+-- "Frames: native code records, Haskell builds", and unison-runtime/src/Unison/Runtime/JIT/internals.md.
 module Unison.Runtime.JIT.Frames
   ( Frame (..),
     FrameIndex,
