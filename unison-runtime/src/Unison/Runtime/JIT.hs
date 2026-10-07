@@ -138,7 +138,7 @@ jitCompileGroup sandbox ref grp cmbs = case mode config of
 
 -- ---------------------------------------------------------------------------
 -- The @on@ mode: compiling what gets hot, on a thread of its own.
--- See docs/jit/m5.md.
+-- See design.md, "What gets compiled, and when", and internals.md, "The compile driver".
 
 -- | What the interpreter asks the compile thread for.
 data Request

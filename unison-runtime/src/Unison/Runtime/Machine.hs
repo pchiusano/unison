@@ -1006,6 +1006,7 @@ runNative !yld env henv0 !activeThreads !stk0 !k0 fn0 = go fn0 henv0 stk0 k0
       Resume cix sect -> do
         when tracing $ JIT.jitDump ("resume " ++ show cix ++ " at\n" ++ prettySection 4 sect "")
         eval yld env henv activeThreads stk k cix sect
+      -- Grow by at least the stack's current size, ensuring push is amortized O(1)
       GrowStack n cell -> do
         when tracing $ JIT.jitDump ("grow stack by " ++ show n)
         stk <- ensureGenerously stk n

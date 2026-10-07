@@ -2,7 +2,7 @@
 
 Sep 26, 2026 · Paul Chiusano
 
-This document is the model: what the JIT is, the invariants it keeps, and why. How each part is built today is in [internals.md](internals.md), organized by mechanism; the history of how it got there is in the milestone writeups and the [progress log](../../../../../docs/jit/progress.md).
+This document is the model: what the JIT is, the invariants it keeps, and why. How each part is built today is in [internals.md](internals.md), organized by mechanism; how to build, run and test it is in [development.md](development.md); the measurements that shaped it are in [benchmarks/](benchmarks/) and the history in the branch's commits.
 
 ## Summary
 
@@ -333,7 +333,17 @@ Most of what library code does is in builtins over a few representations: lists,
 - **The representations are strict in every field** (a `List` is a strict finger tree, a `Text` and a `Bytes` are ropes of packed chunks on the same tree), so everything reachable from one is an evaluated constructor, and native code can take them apart and build new ones with no thunk in sight.
 - **The native operations are complete ports of the Haskell ones**, as C helpers that generated code calls directly, and they are checked against the Haskell operations at startup on sample values (and by a longer randomized test on request); if anything differs, the JIT stays off. A helper that can't decide a case exactly answers "not handled" and the interpreter does it, so a helper is never wrong, only sometimes absent. The price is that a helper has to be kept in step with the Haskell operation it ports, which is what the checks are for.
 
-The results are the interpreter's bit for bit: GHC's `Double` semantics for floats, the interpreter's bounds arithmetic for arrays, the Haskell lexer's forms for numbers read from text. Which builtins are native is in [builtins.md](../../../../../docs/jit/builtins.md); the representations and helpers are in [internals](internals.md#data-representations-and-the-c-helpers).
+The results are the interpreter's bit for bit: GHC's `Double` semantics for floats, the interpreter's bounds arithmetic for arrays, the Haskell lexer's forms for numbers read from text. Which builtins are native is in [builtins.md](builtins.md); the representations and helpers are in [internals](internals.md#data-representations-and-the-c-helpers).
+
+## Alternatives considered
+
+Things that were proposed along the way and not done, so that they aren't proposed again without the reason being known:
+
+- **A dynamic safety net instead of the static estimate.** Count a function's exits against its entries at run time and drop its native code when it exits nearly every time. It can't tell a function that is all call-outs from one that does real work and then calls out once, and it compiles the code it later rejects. The static estimate reads the code, needs no bookkeeping, and never compiles what it refuses; what it can't see is behaviour (which branch runs, whether a function value is native), and the cheaper round trip made that blind spot cost little.
+- **Re-entry points as one function with an entry-index switch.** Every `Let` boundary on the fast path would become a merge point, which hurts LLVM's optimization of the fast path, and the entry branch would be shared between normal calls and re-entries. Separate functions, generated when used, keep the fast path straight.
+- **Static analysis of which re-entry points are reachable.** Nearly all are: any callee can exit at its poll, its stack check or the C stack guard, so the analysis would remove almost nothing. Whether a point is *used* is dynamic, so it is counted.
+- **Native code on a C stack of its own,** so that a call-out switches stacks, lets the interpreter run one instruction, and switches back with every native frame still there. The GC can run during that instruction and move objects, so every parked frame would have to put its live values on the Unison stack before the call and reload them after, which is most of the cost of unwinding, plus a parked stack per Unison thread and per nested evaluation, and exceptions would have to discard it. Set aside in favour of making exits rarer and cheaper; worth revisiting only if exits still dominate.
+- **A bare code pointer in a `CallOut` exit** instead of a cell. The re-entry function can itself exit with `GrowStack` or `Reenter`, both of which mean "call this function again", and the trampoline does that through a cell.
 
 ## Appendix: the constant pool
 

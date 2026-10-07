@@ -2,7 +2,7 @@
 {-# LANGUAGE LambdaCase #-}
 
 -- | Compiling a group of combinators to a native module and installing
--- the result in their cells. See docs/jit/m1.md.
+-- the result in their cells. See internals.md, "The compile driver".
 module Unison.Runtime.JIT.Compile
   ( JITState (..),
     Unit,
@@ -364,7 +364,7 @@ compileUnits st types modName lazy candidates = do
       env local workers u (base, fbase, cells) =
         CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) (uCombs u) poolIxs (jsRts st) typeArities cells disabledD lazy (Map.findWithDefault Map.empty (uRoot u) memos) local workers (uSandboxed u) (uCopy u)
       -- The functions that get a worker: calls to them from this module
-      -- pass arguments and results in registers (docs/jit/m6.md, step 9).
+      -- pass arguments and results in registers (design.md, "Workers").
       workersOf us
         | any (`elem` disabled config) ["direct", "worker"] = Map.empty
         | otherwise = Map.fromList [(uCell u, Pair (UT.pack (uName u ++ "_w")) a) | u <- us, Just a <- [uWorker u]]

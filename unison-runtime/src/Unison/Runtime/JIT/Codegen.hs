@@ -3,8 +3,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PatternSynonyms #-}
 
--- | MCode to LLVM IR, for the subset the JIT supports. See docs/jit/m1.md
--- for what that subset is and unison-runtime/src/Unison/Runtime/JIT/design.md for the conventions.
+-- | MCode to LLVM IR, for the subset the JIT supports. See design.md for
+-- the conventions and internals.md ("The generator") for how this module
+-- is organized.
 --
 -- Within a function, every Unison stack slot is an LLVM alloca (decision
 -- D11): @%u<k>@ holds the unboxed word and @%b<k>@ the boxed pointer of the
@@ -322,7 +323,7 @@ data GS = GS
     -- | highest frame offset used
     gsMaxK :: !Int,
     -- | slots whose value is a boolean held as an i1 register, with no
-    -- closure built yet (docs/jit/m3.md, step 3). Absent means the slot's
+    -- closure built yet (internals.md, "Slots"). Absent means the slot's
     -- allocas hold the value. Saved and restored around branch arms.
     gsKinds :: !(IM.IntMap Text),
     -- | set when the function can't be compiled after all
@@ -627,8 +628,8 @@ data FnEnv = FnEnv
     -- | the inline @Let@ bindings the code being generated is inside of,
     -- innermost first
     feEnclosing :: !(Deque Enclosing),
-    -- | The function is being generated as a /worker/ (docs/jit/m6.md,
-    -- step 9): its arguments arrive as LLVM parameters instead of on the
+    -- | The function is being generated as a /worker/ (design.md,
+    -- "Workers"): its arguments arrive as LLVM parameters instead of on the
     -- Unison stack, and it returns @{status, u, b}@, its one result in
     -- registers. The Unison stack is written only when something exits.
     -- The function the cell points to is then a wrapper around it.
@@ -3119,8 +3120,10 @@ requireTagged slow bs = do
 
 -- | Allocates a constructor with the given fields and pushes it. The
 -- reference comes from the pool entry for the type's enumeration
--- constructor 0 (its first field). See docs/jit/m3.md for why each Pack
--- allocates separately. An untagged field value goes to @slow@.
+-- constructor 0 (its first field). Each Pack allocates separately, since
+-- a run of instructions can exit between two Packs and words taken for a
+-- later one would be left uninitialized in the nursery, which the debug
+-- RTS's heap walker rejects. An untagged field value goes to @slow@.
 genPack :: FnEnv -> Int -> Int -> PackedTag -> Deque Int -> Text -> Gen ()
 genPack fe d refIx (PackedTag t) fields slow = do
   let env = feEnv fe

@@ -3,6 +3,16 @@
 -- | The foreign interface to LLVM, through the C shim in @cbits/jit_llvm.c@.
 -- With the @jit@ package flag off, every function here reports that the
 -- JIT isn't built in, and nothing links against LLVM.
+--
+-- The shim is ours, over LLVM's C API, because the @llvm-hs@ bindings lag
+-- LLVM releases and we need six functions. Modules are handed over as IR
+-- /text/, which LLVM parses in memory: text can be built by string
+-- building, read by a person and pasted into LLVM's command-line tools,
+-- where bitcode is a bit-level stream only LLVM's own libraries write, and
+-- building IR through the C API would mean many more foreign calls for IR
+-- that can't be inspected without asking LLVM to print it. If parsing ever
+-- shows in the compile times, the generator can be retargeted to the C API
+-- without touching the code generator's logic.
 module Unison.Runtime.JIT.LLVM
   ( jitBuiltIn,
     initLLVM,

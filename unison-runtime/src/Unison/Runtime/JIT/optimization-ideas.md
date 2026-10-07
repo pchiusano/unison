@@ -24,8 +24,8 @@ than deleting it.
 
 ## Allocation
 
-- **Bump allocation inline.** Done 2026-10-03 (see the progress log, "Inline bump
-  allocation"): native code and the C helpers bump a copy of `rCurrentAlloc`'s free pointer
+- **Bump allocation inline.** Done 2026-10-03 (see
+  [the measurements](benchmarks/2026-10-03-inline-bump-allocation.md)): native code and the C helpers bump a copy of `rCurrentAlloc`'s free pointer
   against the block's end and call `allocate` only on a miss. Allocation-heavy `jitSuite`
   rows 1.1× to 1.5× faster. GHC's own `Hp` couldn't be used: it is a callee-saved machine
   register during the unsafe call, not a word in the register table. The budget was folded
@@ -43,6 +43,22 @@ than deleting it.
   boundary is "the next instruction that can exit", not "the end of the run": consecutive
   `Pack`s and the arithmetic between them share one call. Simple, and combines with the
   previous item.
+
+## Compilation policy
+
+- **`on` mode has two timing regimes on the suite.** The same build, run twice, gives either
+  `Decode Nat` 157 ns, `Map.lookup` 194 ns, `List.foldLeft` 1.28 ms or 180 ns, 212 ns,
+  1.20 ms: the benchmarks that go through the harness loop move one way and the list ones
+  the other, by 7 to 15%. Exit and entry counts are the same in both. What gets compiled
+  depends on timing (batches, and verdicts reached through a cycle), so the likely cause is
+  a function that is compiled in one run and not the other. Both regimes are within the
+  criterion; a deterministic choice would be better than either. Noted 2026-10-01, still
+  open at the end of M7.
+
+- **Which combinator's count means hot.** Any combinator of a group reaching the threshold
+  compiles the group, including a local loop inside a function called once; a batch member
+  is judged by its entry combinator only. Neither rule has been argued for against the
+  other; noted as open in M5.
 
 ## Batching tweaks
 
@@ -98,7 +114,7 @@ than deleting it.
   buys is the per-module fixed cost, which the re-entry-point coalescing covers.
 
 - **Private copies of compiled callees, for inlining across definitions.** Done 2026-10-04
-  (see the progress log, "Private copies and re-entry batches"): callees whose estimated work
+  (see [the measurements](benchmarks/2026-10-04-private-copies-and-reentry-batches.md)): callees whose estimated work
   per call is under `UNISON_JIT_COPY` and that don't loop or recurse are compiled again into
   the caller's module with internal linkage; in the test transcript every copy was inlined and
   deleted by O2. The re-entry-function batching from the discussion above is done too
@@ -107,7 +123,8 @@ than deleting it.
   loaded, before its callers exist). Left to measure: a program where a hot loop calls small
   library functions from other definitions, which is where this should show; the suite's
   steady-state rows did not move (every copy there was of something already cheap to call),
-  and `List.map murmurHash` got 5 to 12% slower, which is open (progress log).
+  and `List.map murmurHash` read 5 to 12% slower, which the next day's run showed to be
+  that row's noise.
 
 - **Compile a function's hot re-entry points together.** Each re-entry function asked for is a
   module of its own. Requests for the same function that are queued together could share a
@@ -119,8 +136,13 @@ than deleting it.
   - Re-entry functions still pass everything through the stack. One that is hot (a loop
     that exits every iteration re-enters every iteration) could get a worker-like body.
   - Functions that return several values keep the uniform form.
-  - The registers saved for exit paths (see m6.md's learnings): half of `fib`'s
-    per-call cost. Ideas: write only the slots the continuation can read (needs liveness
+  - The registers saved for exit paths: half of `fib`'s per-call cost. Every native
+    function has many exits, and each needs the frame's values to write back; LLVM keeps
+    values that are live across a call in callee-saved registers and saves and restores
+    every one of them on every call, whether or not an exit is ever taken (`fib`'s worker
+    saved ten, six of them only for its exit paths). Branch weights helped a lot, computing
+    frame offsets at their use a little, and the fast entry sidesteps it for base cases;
+    `-regalloc-csr-first-time-cost` changed nothing. Ideas: write only the slots the continuation can read (needs liveness
     for frame slots, and a look at what captured continuations do with dead slots); or
     keep type tags out of registers by passing unboxed values without them (see
     "Unboxed values without the tag write").
@@ -167,7 +189,7 @@ than deleting it.
 
 ## Code size
 
-- **Re-entry functions on demand.** Done in M5 for the `on` mode (see [m5.md](m5.md)):
+- **Re-entry functions on demand.** Done in M5 for the `on` mode:
   a function's first compile is linear in its size, and a re-entry function is generated when
   a counter says it is used. Still generated with the function: the continuation of a call-out
   with no fast path, which could be counted too.
@@ -226,7 +248,7 @@ than deleting it.
   2026-09-30 after M4.
 
 - **No thunks on the boxed stack.** Paul's preferred fix for the untagged-pointer crash
-  (2026-10-03; see the progress log, "A fixed crash: untagged pointers in strict fields"):
+  (2026-10-03; see the internals, "Untagged pointers"):
   make the interpreter guarantee that a boxed stack slot only ever holds an evaluated, tagged
   pointer, instead of (or as well as) native code checking the tag on every store into a
   strict field. The hazard funnels through `bpoke`, `bpokeOff` and `poke` in `Stack.hs`. The
@@ -257,7 +279,7 @@ than deleting it.
   is silent heap corruption found two GCs later), and measure both the interpreter and
   `jitSuite`.
 - **`Bytes` operations.** Done 2026-10-02 and 2026-10-03: every Bytes primitive and the
-  pure foreign functions are native (see the progress log, "The rest of Text and Bytes").
+  pure foreign functions are native (see the internals, "Data representations").
   Left as call-outs: the compression functions (`zlib`, `gzip`, `zstd`: library-bound; a C
   port would mean linking those libraries into the runtime's C side), and the exceptions and
   error messages, which the interpreter raises on the slow path.
@@ -289,16 +311,15 @@ than deleting it.
   value as `Bytes.fromList [...]` and the printer shows that as `0xs...`, so printing is
   unaffected either way.
 - **More of `Text` natively.** Done 2026-10-03: every Text primitive and the pure foreign
-  functions are native; see the progress log. Left as call-outs: the Text patterns
+  functions are native; see the internals, "Data representations". Left as call-outs: the Text patterns
   (`Text.patterns.*` build pattern values that `Pattern.run`/`isMatch` interpret in Haskell;
   Paul, 2026-10-03: skip for now), `Link.toText` (hashing), `toUppercase`/`toLowercase` of
   non-ASCII text (Unicode case mapping tables), and the forms of `Int.fromText` and friends
   that the Haskell lexer reads beyond sign and digits (hex, spaces, "NaN"). The ASCII-only
   case mapping could be widened with a table for the common scripts if a program needs it.
 - **The rope itself** (`Unison.Util.Rope`, a finger tree of chunks since 2026-10-02;
-  numbers in the progress log):
-  - *`Json.toText` is 20% slower than on the old rope and the cause is not found* (the
-    progress log has what was tried). Worth one more look at the interpreter's `catt`
+  numbers in [the rope benchmark](benchmarks/2026-10-02-rope-vs-old-rope.md)):
+  - *`Json.toText` is 20% slower than on the old rope and the cause is not found* ([what was tried](benchmarks/2026-10-02-text-and-bytes-helpers.md)). Worth one more look at the interpreter's `catt`
     path: the same `"[" ++ x ++ "]"` is three times faster through the C helper.
   - *Appending two large texts is slower than it was.* The size-balanced tree it replaced
     made one node when the two sides were within a factor of two of each other (20 to 30
@@ -326,7 +347,8 @@ than deleting it.
   - The threshold (64) was chosen from 16, 32, 64 and 128 on the rope benchmark: 64 and
     128 halve the cost of walking and comparing against 32 and cost nothing when building;
     128 makes appending pieces of 40 characters and indexing short-chunk texts slower.
-  - Any change here has to be made in the C helpers too (see the progress log).
+  - Any change here has to be made in the C helpers too, which the startup checks and
+    `UNISON_JIT_STRESS=texts=N` enforce (development.md).
 - **What is left of lists.** Every list primitive is native since 2026-10-02 (the C
   helpers are ports of `Unison.Util.Deque`). What still leaves native code or costs more
   than it should:
@@ -349,8 +371,9 @@ than deleting it.
   result. The helper already handles closures with arguments captured. Also: more than
   four arguments at once.
 - **The list structure itself** (`Unison.Util.Deque`, a strict finger tree, the runtime's
-  list since 2026-10-02; numbers in the progress log, where it is called Deque2, its name
-  while the structure it replaced still existed):
+  list since 2026-10-02; numbers in [the Deque benchmark](benchmarks/2026-10-02-deque-vs-data-sequence.md)
+  and [the suite runs](benchmarks/2026-10-02-native-lists-in-the-suite.md), where it is called
+  Deque2, its name while the structure it replaced still existed):
   - *JSON parsing is slower than it was on `Data.Sequence`, and the list is not why.* With
     the JIT off: 7.2 µs per document on `Data.Sequence`, 10.2 µs on the old Deque, 10.1 µs
     on Deque2, whose pushes are faster than both; complex parsing 10.7, 18.1, 18.1 µs. So
@@ -375,7 +398,8 @@ than deleting it.
     runtime even for three elements), and a single array-only node constructor in place
     of the inline node of eight leaves (pushes 7% slower, pops 20 to 45%, `sum` and
     `toList` 60 to 70%).
-  - Any change here has to be made in the C helpers too (see the progress log).
+  - Any change here has to be made in the C helpers too, which the startup checks and
+    `UNISON_JIT_STRESS=lists=N` enforce (development.md).
 
   The structure it replaced (worst-case O(1) pushes and pops, about twice the code, slower
   on every operation measured) was deleted on 2026-10-02; it is in the branch's history,
@@ -383,6 +407,14 @@ than deleting it.
   `Unison.Util.Skews` (two skew binary lists back to back, also Paul's) is in the same
   package as a possible alternative: it compiles, nothing uses it, and it hasn't been
   measured against either structure.
+
+## Allocation budget
+
+- **The budget with a small nursery.** The allocation budget relies on the interpreter's
+  next heap check to trigger the GC after a budget exit. That worked in the memory test
+  (bounded residency, 400 budget exits over 20 M cells) and under `alloc=64`, but it hasn't
+  been tried with a small nursery (`+RTS -A256k`) or on a capability shared with other busy
+  Haskell threads. Open since M3 (2026-09-30).
 
 ## Release
 
@@ -426,6 +458,25 @@ for a later milestone.
   bounces through the interpreter every 1600 frames. Switching to a large malloc'd stack in
   `unison_jit_enter` would make that many times rarer. Cheap to try; needs care with signal
   handlers and with anything that inspects the stack.
+
+- **The Unison stack as a linked list of chunks.** `ustk` and `bstk` are single arrays, so
+  growing the stack is a reallocation and a copy of everything below `sp`: `ensure` grows by
+  a fixed 1280 slots, and the trampoline's `ensureGenerously` by at least the current size,
+  since native code pays for each growth with an unwind of every native frame
+  ([internals](internals.md#the-trampoline)). GHC's own threads haven't had a copying stack
+  since 7.2: a stack is a linked list of fixed-size chunks (1 KB to start, 32 KB each after
+  that), an overflow links a new chunk in with the top kilobyte copied across for slack, an
+  emptied chunk is dropped, and growth is O(1) with no copy at all. The same shape for the
+  Unison stack would make growth cheap for the interpreter and remove the unwind for native
+  code, since a native function whose frame doesn't fit could keep running in a new chunk
+  rather than exiting. What it costs: slot addressing. MCode addresses slots as offsets from
+  `sp` and native code as offsets from `fp`, and both assume the frame is contiguous; a
+  frame would have to live entirely in one chunk (a function's maximum frame size is known,
+  so an entry check can guarantee that, moving to a new chunk when it won't fit), and
+  anything that walks the stack across frames (`Capture`, `saveFrame`'s copies, the
+  continuation code, the GC marking in `unison_jit_enter`, the C helpers that read argument
+  slots) would have to follow chunk links. A sizeable interpreter change, not a JIT one.
+  Noted 2026-10-07 after a question about why growth isn't amortized.
 
 - **Frame records for inline bindings.** A frame nested inside k inline `Let` bindings writes
   k + 1 records on unwind. Fine unless unwinds turn out to be frequent.

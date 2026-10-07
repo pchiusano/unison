@@ -1,5 +1,6 @@
 -- | Settings for the JIT, read once from the environment.
--- See docs/jit/implementation-plan.md, D18.
+-- The mode also has a command-line option, @--jit@, which overrides the
+-- variable. How to use these is in development.md next to this module.
 module Unison.Runtime.JIT.Config
   ( Mode (..),
     Config (..),

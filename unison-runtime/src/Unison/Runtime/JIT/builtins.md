@@ -17,14 +17,14 @@ when reading it:
 
 - All of Int, Nat and Float is native (since 2026-10-04: `pow`, `toFloat`, the `CAST`
   coercions behind `Nat.toInt`, `Char.toNat`, `Float.toRepresentation` and the like, and every
-  Float operation). The Float results are the interpreter's bit for bit; see "Floats, pow and
-  representation casts" in the progress log for what that took.
+  Float operation). The Float results are the interpreter's bit for bit; the internals ("Numbers") say
+  what that took.
 - `Text`, `List` and `Universal` comparison are complete. `Bytes` is complete except the
   compression functions. The Text patterns were skipped on purpose (Paul, 2026-10-03).
 - Arrays and Refs are complete (2026-10-05): every `MutableArray`, `ImmutableArray`,
   `MutableByteArray`, `ImmutableByteArray` and `PinnedByteArray` builtin, the `Scope` and `IO`
   constructors for them, `Scope.ref`/`IO.ref`, `Ref.readForCas`, `Ticket.read` and `Ref.cas`.
-  See "Arrays and Refs" in the progress log.
+  See the internals, "Arrays and refs".
 - `Universal.murmurHashUntyped` is native (2026-10-04) for numbers, characters, data
   constructors, text, bytes, lists, arrays and byte arrays; a function, a map, a link, quoted
   code, a continuation or a big number in the value sends the whole hash to the interpreter.
