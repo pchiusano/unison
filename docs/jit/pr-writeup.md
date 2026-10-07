@@ -1,25 +1,21 @@
 # The `jit` branch against `trunk`: what the diff is made of
 
-Measured on 2026-10-06 with `git diff --numstat` from the merge base with `trunk` (`84b95a623`), after
-the M0 spike programs were deleted. Lines are added plus removed.
+Measured on 2026-10-06 with `git diff --numstat` from the merge base with `trunk` (`a1652e3ad`, the
+head of `trunk` at the time), after the M0 spike programs were deleted. Lines are added plus removed.
 
-The branch also carries about 1,300 lines that are not JIT work: the GADT, GADT-indexed abilities
-and pattern-matching error-message branches that were merged into `jit` ahead of `trunk`
-(`parser-typechecker`, `unison-syntax` and their transcripts). Everything below excludes them.
-
-JIT diff: 23,634 lines added, 349 removed, 23,983 in all.
+23,706 lines added, 349 removed, 24,055 in all. This writeup counts itself among the docs.
 
 ## By kind of file
 
 | Kind | Files | Added | Removed | Lines | Share |
 | --- | --- | --- | --- | --- | --- |
 | New Haskell: JIT modules (`Runtime/JIT.hs`, `Runtime/JIT/*.hs`) | 12 | 7,586 | 0 | 7,586 | 32% |
-| Markdown docs (`docs/jit/*.md`, `JIT/design.md`, `JIT/internals.md`) | 13 | 5,437 | 0 | 5,437 | 23% |
+| Markdown docs (`docs/jit/*.md`, `JIT/design.md`, `JIT/internals.md`) | 14 | 5,505 | 0 | 5,505 | 23% |
 | C (`cbits/jit_rt.c` 3,934, `jit_llvm.c` 167, `jit_rt.h` 79) | 3 | 4,180 | 0 | 4,180 | 17% |
 | Transcripts: tests 2,182, benchmarks 273 | 3 | 2,455 | 0 | 2,455 | 10% |
 | New Haskell: `Deque`, `Skews`, rope tests and benchmarks | 7 | 2,446 | 0 | 2,446 | 10% |
 | Existing Haskell, modified | 16 | 1,290 | 343 | 1,633 | 7% |
-| Build config and CLI flags | 7 | 240 | 6 | 246 | 1% |
+| Build config and CI | 8 | 244 | 6 | 250 | 1% |
 
 The modified existing code is concentrated in three files:
 
@@ -35,7 +31,7 @@ The modified existing code is concentrated in three files:
 
 | Area | What it is | Where | Lines | Share |
 | --- | --- | --- | --- | --- |
-| Documentation | design, internals, plan, ideas, builtins, milestone writeups m1 to m7, progress log | 13 Markdown files | 5,437 | 23% |
+| Documentation | design, internals, plan, ideas, builtins, milestone writeups m1 to m7, progress log, this file | 14 Markdown files | 5,505 | 23% |
 | Code generation | MCode to LLVM IR | `Codegen.hs` 4,137, `Strict.hs` 50 | 4,187 | 17% |
 | Native builtins | C implementations of the list, Text, Bytes, array, Ref and hashing primitives, and the Haskell side that registers them | `jit_rt.c` sections Lists 1,067, Ropes 846, the rest of Text and Bytes 857, Arrays and Refs 290, murmurHash 251; `Native.hs` 363 | 3,674 | 15% |
 | Runtime data structures | `Deque` and `Skews`, the `Rope` rework, their tests and benchmarks, small `Text` and `Bytes` changes | `lib/unison-util-rope`, `Util/Text.hs`, `Util/Bytes.hs` | 3,257 | 14% |
@@ -43,7 +39,7 @@ The modified existing code is concentrated in three files:
 | Trampoline and interpreter integration | native cells, exits, frames, the constant pool, entering and leaving native code, partial applications | `Exits.hs`, `Frames.hs`, `Pool.hs`, `MCode.hs`, `Machine.hs`, `Machine/Types.hs`, `Stack.hs`, `Interface.hs`, `Foreign/Function.hs`, `jit_rt.h`, `jit_rt.c` sections Entering native code 136 and Partial applications 217 | 1,698 | 7% |
 | Compile driver | what to compile and when, budgets, configuration, the LLVM shim | `JIT.hs` 409, `Compile.hs` 478, `Config.hs` 187, `Estimate.hs` 237, `LLVM.hs` 116, `jit_llvm.c` 167 | 1,594 | 7% |
 | Closure layout and allocation | probing GHC's heap layouts at startup, allocation and the write barrier | `Layout.hs` 1,210, `jit_rt.c` sections Allocation 129, Numbers 31, layout probe 33 | 1,403 | 6% |
-| Build config and CLI | packaging and flags | `package.yaml`, `.cabal`, `stack.yaml`, `hie.yaml`, `ArgParse.hs`, `Main.hs` | 278 | 1% |
+| Build config, CI and CLI | packaging, the CI flag, command-line flags | `package.yaml`, `.cabal`, `stack.yaml`, `hie.yaml`, `test.yaml`, `ArgParse.hs`, `Main.hs` | 282 | 1% |
 
 The compiler proper (code generation, the driver, layout, the trampoline) is 8,900 lines, 37% of
 the diff, and `Codegen.hs` alone is nearly half of that. The native builtins plus the data-structure
