@@ -21,4 +21,5 @@ against.
 | [2026-10-04 private copies and re-entry batches](2026-10-04-private-copies-and-reentry-batches.md) | compile totals and the suite with copies and batched re-entry functions |
 | [2026-10-04 floats and hash](2026-10-04-floats-and-hash.md) | the float loop and `murmurHashUntyped` |
 | [2026-10-05 arrays and refs](2026-10-05-arrays-and-refs.md) | the array, ref and CAS rows |
-| [2026-10-05 every benchmark, end of M7](2026-10-05-every-benchmark-end-of-m7.md) | the closing tables of M7, the current reference |
+| [2026-10-05 every benchmark, end of M7](2026-10-05-every-benchmark-end-of-m7.md) | the closing tables of M7 |
+| [2026-10-07 LLVM loaded at run time](2026-10-07-llvm-loaded-at-run-time.md) | every benchmark after the switch to `dlopen`; unchanged from the end of M7 |
