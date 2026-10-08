@@ -16,11 +16,17 @@ than deleting it.
   an interpreter change (`GClosure`, `dataBranch`, `buildData`, serialization of values), not a
   JIT one, so it needs its own plan. Noted 2026-09-30 during M3.
 
-- **Unboxed values without the tag write.** Every unboxed slot carries a type-tag closure in
-  `bstk`. Native code keeps the word in a register but still stores the tag pointer whenever the
-  slot reaches the stack. The slot-kind mechanism from M3 (booleans as `i1`) could carry "known
-  Nat/Int/Float, tag not written" the same way, so the tag store happens only where the value
-  escapes. Small, local to the code generator.
+- **Unboxed values without the tag write: measured, nothing to gain (2026-10-07).** Every
+  unboxed slot carries a type-tag closure in `bstk`, and the generator stores the tag pointer
+  with every unboxed result. The thought was to defer that store with a slot kind, as booleans
+  are kept as an `i1` until they escape. But the store goes to the slot's `alloca`, which
+  `mem2reg` turns into a register copy, so it already costs nothing. In the optimized IR of the
+  whole benchmark suite, 3,277 of the roughly 3,700 surviving tag stores are in `exit` and
+  `unwind` blocks (cold), and the rest write a `yield`ed value or stack-passed arguments for a
+  reader (the interpreter, or a function with the uniform signature) that can't know the kind.
+  The self tail call goes through the allocas and a branch to the head, so loops carry no tag
+  store, and workers pass the tag in a register. What remains is the non-worker calling
+  convention itself; see the worker entries above.
 
 ## Allocation
 
