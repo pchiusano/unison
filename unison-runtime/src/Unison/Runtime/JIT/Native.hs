@@ -1,4 +1,3 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE UnliftedFFITypes #-}
 
@@ -45,14 +44,12 @@ import Foreign.Ptr (FunPtr)
 import GHC.Exts (Any, RealWorld)
 import Unison.Runtime.Stack (Closure)
 
-#ifdef UNISON_JIT
 import Data.Int (Int64)
 import Data.Word (Word64)
 import Foreign.Marshal.Alloc (allocaBytes, free)
 import Foreign.Ptr (Ptr, WordPtr (..), wordPtrToPtr)
 import Foreign.Storable (peek, peekElemOff, pokeElemOff)
 import GHC.Exts (MutableArray#, MutableByteArray#)
-#endif
 
 -- | The uniform signature of compiled code: @(ctx, ap, fp, sp) -> status@.
 data NativeFn
@@ -87,8 +84,6 @@ outFrameCount ustk size = readByteArray ustk (size + 3)
 -- first). Call at most once per entry: a long list is freed as it is read.
 outFrames :: MutableByteArray RealWorld -> Int -> IO [FrameRecord]
 outFrames = frameRecords
-
-#ifdef UNISON_JIT
 
 foreign import ccall unsafe "unison_jit_enter"
   c_enter ::
@@ -294,70 +289,3 @@ closureInit infos = allocaBytes (8 * length infos) $ \p -> do
 nameTest :: MutableArray RealWorld Any -> Int -> IO Bool
 nameTest (MutableArray arr#) n = (== 1) <$> c_nameTest arr# (fromIntegral n)
 
-#else
-
-enterNative ::
-  FunPtr NativeFn ->
-  MutableByteArray RealWorld ->
-  MutableArray RealWorld Closure ->
-  MutableArray RealWorld Closure ->
-  Int ->
-  Int ->
-  Int ->
-  Int ->
-  IO Status
-enterNative _ _ _ _ _ _ _ _ = error "JIT: not built in, but a native code cell holds code"
-
-frameRecords :: MutableByteArray RealWorld -> Int -> IO [FrameRecord]
-frameRecords _ _ = pure []
-
-configureNative :: Int -> Int -> Int -> Int -> Bool -> IO ()
-configureNative _ _ _ _ _ = pure ()
-
-rtsFacts :: IO [Int]
-rtsFacts = pure []
-
-ctxLayout :: IO ([Int], Int)
-ctxLayout = pure ([], 0)
-
-probeClosure :: MutableArray RealWorld Any -> IO [Int]
-probeClosure _ = pure []
-
-listInit :: MutableArray RealWorld Any -> [Int] -> IO Int
-listInit _ _ = pure 0
-
-listCheck :: MutableArray RealWorld Any -> IO Int
-listCheck _ = pure (-1)
-
-listTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> IO Bool
-listTest _ _ _ _ = pure False
-
-textInit :: MutableArray RealWorld Any -> [Int] -> IO Int
-textInit _ _ = pure 0
-
-textCheck :: MutableArray RealWorld Any -> IO Bool
-textCheck _ = pure False
-
-textTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
-textTest _ _ _ _ _ = pure 0
-
-bytesInit :: MutableArray RealWorld Any -> [Int] -> IO Int
-bytesInit _ _ = pure 0
-
-bytesCheck :: MutableArray RealWorld Any -> IO Bool
-bytesCheck _ = pure False
-
-bytesTest :: MutableArray RealWorld Any -> Int -> Int -> Int -> Int -> IO Int
-bytesTest _ _ _ _ _ = pure 0
-
-closureInit :: [Int] -> IO ()
-closureInit _ = pure ()
-
-nameTest :: MutableArray RealWorld Any -> Int -> IO Bool
-nameTest _ _ = pure False
-
-hplimValue :: IO Int
-hplimValue = pure 0
-
-
-#endif

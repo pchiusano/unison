@@ -25,7 +25,7 @@ import Text.Read (readMaybe)
 data Mode
   = -- | never compile
     Off
-  | -- | compile what gets hot, in the background
+  | -- | compile what gets hot, in the background (LLVM is loaded at startup)
     On
   | -- | compile everything as it is loaded (for testing)
     Eager

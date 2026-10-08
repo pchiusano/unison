@@ -331,7 +331,7 @@ jitParser =
   optional . strOption $
     long "jit"
       <> metavar "MODE"
-      <> help "[Experimental] JIT compilation mode: off, on, or eager. Same as the UNISON_JIT environment variable."
+      <> help "[Experimental] JIT compilation mode: off, on, or eager. Needs LLVM 20 or newer installed (UNISON_LLVM_LIB can point at the library). Same as the UNISON_JIT environment variable."
 
 jitDumpIRParser :: Parser (Maybe String)
 jitDumpIRParser =

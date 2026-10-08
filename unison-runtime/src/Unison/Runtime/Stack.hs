@@ -4,12 +4,10 @@
 {-# LANGUAGE MagicHash #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE UnboxedTuples #-}
-#ifdef UNISON_JIT
 -- The JIT's code generator relies on the optimized layout of GClosure and
 -- Val (strict fields unboxed), so this module is always compiled with
--- optimization when the JIT is built in, even under `stack build --fast`.
+-- optimization, even under `stack build --fast`.
 {-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
-#endif
 
 module Unison.Runtime.Stack
   ( K (..),

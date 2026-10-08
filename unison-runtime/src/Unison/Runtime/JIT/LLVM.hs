@@ -1,8 +1,8 @@
-{-# LANGUAGE CPP #-}
-
 -- | The foreign interface to LLVM, through the C shim in @cbits/jit_llvm.c@.
--- With the @jit@ package flag off, every function here reports that the
--- JIT isn't built in, and nothing links against LLVM.
+-- LLVM isn't linked in: the shim loads it with @dlopen@ when the JIT is
+-- turned on ('initLLVM'), so that ucm builds and runs without LLVM, and the
+-- JIT is unavailable, with a message saying where it looked, on a machine
+-- that has no LLVM 20 or newer.
 --
 -- The shim is ours, over LLVM's C API, because the @llvm-hs@ bindings lag
 -- LLVM releases and we need six functions. Modules are handed over as IR
@@ -14,8 +14,8 @@
 -- shows in the compile times, the generator can be retargeted to the C API
 -- without touching the code generator's logic.
 module Unison.Runtime.JIT.LLVM
-  ( jitBuiltIn,
-    initLLVM,
+  ( initLLVM,
+    LoadFailure (..),
     addModule,
     lookupSymbol,
     defineSymbol,
@@ -23,20 +23,23 @@ module Unison.Runtime.JIT.LLVM
   )
 where
 
-import Data.Word (Word64)
-import Foreign.Ptr (FunPtr)
-
-#ifdef UNISON_JIT
 import Data.ByteString.Unsafe (unsafeUseAsCStringLen)
 import Data.Text qualified as T
 import Data.Text.Encoding (encodeUtf8)
 import Foreign.C.String (CString, peekCString, withCString)
 import Foreign.C.Types (CInt (..), CSize (..))
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Ptr (Ptr, WordPtr (..), castPtrToFunPtr, nullPtr, wordPtrToPtr)
+import Foreign.Ptr (FunPtr, Ptr, WordPtr (..), castPtrToFunPtr, nullPtr, wordPtrToPtr)
 import Foreign.Storable (peek, poke)
+import Data.Word (Word64)
 
 foreign import ccall safe "unison_jit_init" c_init :: IO CInt
+
+foreign import ccall unsafe "unison_jit_load_attempts" c_loadAttempts :: IO CString
+
+foreign import ccall unsafe "unison_jit_llvm_path" c_llvmPath :: IO CString
+
+foreign import ccall unsafe "unison_jit_llvm_version" c_llvmVersion :: IO CString
 
 foreign import ccall safe "unison_jit_add_module" c_addModule :: CString -> CSize -> CString -> Ptr CString -> IO CInt
 
@@ -50,19 +53,32 @@ foreign import ccall unsafe "unison_jit_last_error" c_lastError :: IO CString
 
 foreign import ccall unsafe "unison_jit_triple" c_triple :: IO CString
 
-jitBuiltIn :: Bool
-jitBuiltIn = True
-
 lastError :: String -> IO String
 lastError what = do
   e <- peekCString =<< c_lastError
   pure ("JIT: " ++ what ++ ": " ++ e)
 
--- | Starts LLVM. Safe to call more than once. Returns an error message on failure.
-initLLVM :: IO (Either String ())
+-- | Why LLVM couldn't be started.
+data LoadFailure
+  = -- | no usable library: each location tried, with what was found there
+    NotFound [String]
+  | -- | a library was loaded but the JIT couldn't be set up
+    InitError String
+
+-- | Loads LLVM and starts the JIT. Safe to call more than once. On success,
+-- the version loaded and the path it came from.
+initLLVM :: IO (Either LoadFailure (String, FilePath))
 initLLVM = do
   r <- c_init
-  if r == 0 then pure (Right ()) else Left <$> lastError "initializing LLVM"
+  path <- peekCString =<< c_llvmPath
+  if r == 0
+    then do
+      v <- peekCString =<< c_llvmVersion
+      pure (Right (v, path))
+    else
+      if null path
+        then Left . NotFound . lines <$> (peekCString =<< c_loadAttempts)
+        else Left . InitError <$> lastError "initializing LLVM"
 
 -- | Parses a module from IR text, runs the given pass pipeline
 -- (such as @default<O2>@, or @""@ for none) and hands it to the JIT.
@@ -100,27 +116,3 @@ defineSymbol name addr = do
 targetTriple :: IO String
 targetTriple = peekCString =<< c_triple
 
-#else
-
-jitBuiltIn :: Bool
-jitBuiltIn = False
-
-notBuilt :: IO (Either String a)
-notBuilt = pure (Left "JIT: not built in (build with --flag unison-runtime:jit)")
-
-initLLVM :: IO (Either String ())
-initLLVM = notBuilt
-
-addModule :: Bool -> String -> T.Text -> IO (Either String (Maybe String))
-addModule _ _ _ = notBuilt
-
-lookupSymbol :: String -> IO (Either String (FunPtr a))
-lookupSymbol _ = notBuilt
-
-defineSymbol :: String -> Word64 -> IO (Either String ())
-defineSymbol _ _ = notBuilt
-
-targetTriple :: IO String
-targetTriple = pure "none"
-
-#endif

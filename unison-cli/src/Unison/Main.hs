@@ -46,7 +46,7 @@ import System.Exit (ExitCode (..))
 import System.Exit qualified as Exit
 import System.Exit qualified as System
 import System.FilePath (replaceExtension, takeExtension, (</>))
-import System.IO (stderr)
+import System.IO (hFlush, hIsTerminalDevice, stderr, stdout)
 import System.IO.CodePage (withCP65001)
 import System.IO.Temp qualified as Temp
 import System.Path qualified as Path
@@ -88,6 +88,7 @@ import Unison.Prelude
 import Unison.PrettyTerminal qualified as PT
 import Unison.Project (defaultBranchName)
 import Unison.Runtime.Interface qualified as RTI
+import Unison.Runtime.JIT qualified as JIT
 import Unison.Server.Backend qualified as Backend
 import Unison.Server.CodebaseServer qualified as Server
 import Unison.Symbol (Symbol)
@@ -163,6 +164,7 @@ main version = do
       -- The runtime reads its JIT settings from the environment, once, at startup.
       for_ jitOption (setEnv "UNISON_JIT")
       for_ jitDumpIROption (setEnv "UNISON_JIT_DUMP_IR")
+      announceJIT
       currentDir <- getCurrentDirectory
       case command of
         PrintVersion ->
@@ -757,3 +759,19 @@ codebasePathOptionToPath codebasePathOption =
   case codebasePathOption of
     CreateCodebaseWhenMissing p -> p
     DontCreateCodebaseWhenMissing p -> p
+
+-- | With the JIT turned on (--jit or UNISON_JIT), loads LLVM now and says
+-- how it went. When it can't be loaded the program runs interpreted, as
+-- it would with the JIT off.
+announceJIT :: IO ()
+announceJIT = do
+  tty <- hIsTerminalDevice stdout
+  let loading = "JIT compilation requested, loading LLVM library..."
+  when tty $ putStr loading >> hFlush stdout
+  r <- JIT.loadJIT
+  -- back to the start of the line, and clear it
+  when tty $ putStr ("\r" ++ replicate (length loading) ' ' ++ "\r")
+  case r of
+    Nothing -> pure ()
+    Just (Right _) -> putStrLn "JIT compilation activated \x26a1\x1f680" >> hFlush stdout
+    Just (Left msgs) -> mapM_ putStrLn msgs >> hFlush stdout

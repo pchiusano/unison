@@ -1,26 +1,295 @@
 // The JIT's only use of LLVM: a small shim over the C API. Haskell calls these
 // functions and nothing else from LLVM (why a shim of our own, and why IR text:
 // src/Unison/Runtime/JIT/LLVM.hs).
+//
+// LLVM is not linked in. It is loaded with dlopen when the JIT is turned on,
+// and the thirty-odd functions used are looked up with dlsym, so that building
+// and running ucm need no LLVM at all unless the JIT is asked for. For the
+// same reason there are no LLVM headers here: the declarations below are our
+// own copies of the C API's, which has kept these types and values stable
+// since LLVM 12. The one version-sensitive function is
+// LLVMOrcCreateNewThreadSafeContextFromLLVMContext (LLVM 20), which is why 20
+// is the oldest version accepted; LLVMRunPasses (17) and LLVMGetVersion (16)
+// are the other recent ones.
 
+#include <dirent.h>
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
-#include <llvm-c/Core.h>
-#include <llvm-c/Error.h>
-#include <llvm-c/IRReader.h>
-#include <llvm-c/LLJIT.h>
-#include <llvm-c/Orc.h>
-#include <llvm-c/Target.h>
-#include <llvm-c/TargetMachine.h>
-#include <llvm-c/Transforms/PassBuilder.h>
+// ---- Declarations copied from llvm-c (Types.h, Error.h, Orc.h, TargetMachine.h)
+
+typedef int LLVMBool;
+typedef struct LLVMOpaqueContext *LLVMContextRef;
+typedef struct LLVMOpaqueModule *LLVMModuleRef;
+typedef struct LLVMOpaqueMemoryBuffer *LLVMMemoryBufferRef;
+typedef struct LLVMOpaqueError *LLVMErrorRef;
+typedef struct LLVMTarget *LLVMTargetRef;
+typedef struct LLVMOpaqueTargetMachine *LLVMTargetMachineRef;
+typedef struct LLVMOpaquePassBuilderOptions *LLVMPassBuilderOptionsRef;
+typedef struct LLVMOrcOpaqueLLJIT *LLVMOrcLLJITRef;
+typedef struct LLVMOrcOpaqueLLJITBuilder *LLVMOrcLLJITBuilderRef;
+typedef struct LLVMOrcOpaqueJITDylib *LLVMOrcJITDylibRef;
+typedef struct LLVMOrcOpaqueThreadSafeContext *LLVMOrcThreadSafeContextRef;
+typedef struct LLVMOrcOpaqueThreadSafeModule *LLVMOrcThreadSafeModuleRef;
+typedef struct LLVMOrcOpaqueSymbolStringPoolEntry *LLVMOrcSymbolStringPoolEntryRef;
+typedef struct LLVMOrcOpaqueMaterializationUnit *LLVMOrcMaterializationUnitRef;
+typedef uint64_t LLVMOrcExecutorAddress;
+
+typedef struct {
+  uint8_t GenericFlags;
+  uint8_t TargetFlags;
+} LLVMJITSymbolFlags;
+
+typedef struct {
+  LLVMOrcExecutorAddress Address;
+  LLVMJITSymbolFlags Flags;
+} LLVMJITEvaluatedSymbol;
+
+typedef struct {
+  LLVMOrcSymbolStringPoolEntryRef Name;
+  LLVMJITEvaluatedSymbol Sym;
+} LLVMOrcCSymbolMapPair;
+
+enum { LLVMJITSymbolGenericFlagsExported = 1, LLVMJITSymbolGenericFlagsCallable = 4 };
+enum { LLVMCodeGenLevelDefault = 2 };
+enum { LLVMRelocDefault = 0 };
+enum { LLVMCodeModelJITDefault = 1 };
+
+// ---- The functions used, as pointers filled in by dlsym.
+// X(name, return type, argument types)
+
+#if defined(__aarch64__) || defined(__arm64__)
+#define ARCH AArch64
+#define ARCH_SUPPORTED 1
+#elif defined(__x86_64__)
+#define ARCH X86
+#define ARCH_SUPPORTED 1
+#else
+#define ARCH Unsupported
+#define ARCH_SUPPORTED 0
+#endif
+#define CAT3(a, b, c) a##b##c
+#define CAT3_(a, b, c) CAT3(a, b, c)
+#define TARGET_FN(suffix) CAT3_(LLVMInitialize, ARCH, suffix)
+
+#define LLVM_FUNCTIONS(X)                                                                      \
+  X(LLVMGetVersion, void, (unsigned *, unsigned *, unsigned *))                                \
+  X(LLVMGetErrorMessage, char *, (LLVMErrorRef))                                               \
+  X(LLVMDisposeErrorMessage, void, (char *))                                                   \
+  X(LLVMDisposeMessage, void, (char *))                                                        \
+  X(LLVMContextCreate, LLVMContextRef, (void))                                                 \
+  X(LLVMDisposeModule, void, (LLVMModuleRef))                                                  \
+  X(LLVMPrintModuleToString, char *, (LLVMModuleRef))                                          \
+  X(LLVMCreateMemoryBufferWithMemoryRangeCopy, LLVMMemoryBufferRef,                            \
+    (const char *, size_t, const char *))                                                      \
+  X(LLVMParseIRInContext, LLVMBool, (LLVMContextRef, LLVMMemoryBufferRef, LLVMModuleRef *, char **)) \
+  X(LLVMGetDefaultTargetTriple, char *, (void))                                                \
+  X(LLVMGetHostCPUName, char *, (void))                                                        \
+  X(LLVMGetHostCPUFeatures, char *, (void))                                                    \
+  X(LLVMGetTargetFromTriple, LLVMBool, (const char *, LLVMTargetRef *, char **))               \
+  X(LLVMCreateTargetMachine, LLVMTargetMachineRef,                                             \
+    (LLVMTargetRef, const char *, const char *, const char *, int, int, int))                  \
+  X(LLVMCreatePassBuilderOptions, LLVMPassBuilderOptionsRef, (void))                           \
+  X(LLVMDisposePassBuilderOptions, void, (LLVMPassBuilderOptionsRef))                          \
+  X(LLVMRunPasses, LLVMErrorRef,                                                               \
+    (LLVMModuleRef, const char *, LLVMTargetMachineRef, LLVMPassBuilderOptionsRef))            \
+  X(LLVMOrcCreateLLJIT, LLVMErrorRef, (LLVMOrcLLJITRef *, LLVMOrcLLJITBuilderRef))             \
+  X(LLVMOrcLLJITGetTripleString, const char *, (LLVMOrcLLJITRef))                              \
+  X(LLVMOrcLLJITGetMainJITDylib, LLVMOrcJITDylibRef, (LLVMOrcLLJITRef))                        \
+  X(LLVMOrcLLJITAddLLVMIRModule, LLVMErrorRef,                                                 \
+    (LLVMOrcLLJITRef, LLVMOrcJITDylibRef, LLVMOrcThreadSafeModuleRef))                         \
+  X(LLVMOrcLLJITLookup, LLVMErrorRef, (LLVMOrcLLJITRef, LLVMOrcExecutorAddress *, const char *)) \
+  X(LLVMOrcLLJITMangleAndIntern, LLVMOrcSymbolStringPoolEntryRef, (LLVMOrcLLJITRef, const char *)) \
+  X(LLVMOrcJITDylibDefine, LLVMErrorRef, (LLVMOrcJITDylibRef, LLVMOrcMaterializationUnitRef))  \
+  X(LLVMOrcAbsoluteSymbols, LLVMOrcMaterializationUnitRef, (LLVMOrcCSymbolMapPair *, size_t))  \
+  X(LLVMOrcCreateNewThreadSafeContextFromLLVMContext, LLVMOrcThreadSafeContextRef, (LLVMContextRef)) \
+  X(LLVMOrcDisposeThreadSafeContext, void, (LLVMOrcThreadSafeContextRef))                      \
+  X(LLVMOrcCreateNewThreadSafeModule, LLVMOrcThreadSafeModuleRef,                              \
+    (LLVMModuleRef, LLVMOrcThreadSafeContextRef))                                              \
+  X(LLVMOrcDisposeThreadSafeModule, void, (LLVMOrcThreadSafeModuleRef))                        \
+  X(TARGET_FN(TargetInfo), void, (void))                                            \
+  X(TARGET_FN(Target), void, (void))                                                \
+  X(TARGET_FN(TargetMC), void, (void))                                              \
+  X(TARGET_FN(AsmPrinter), void, (void))                                            \
+  X(TARGET_FN(AsmParser), void, (void))
+
+// The indirection through DECLARE_ and ENTRY_ expands TARGET_FN(...) before
+// the name is stringified.
+#define DECLARE(name, ret, args) static ret (*name) args;
+#define DECLARE_(name, ret, args) DECLARE(name, ret, args)
+LLVM_FUNCTIONS(DECLARE_)
+
+#define ENTRY(name, ret, args) {#name, (void **)&name},
+#define ENTRY_(name, ret, args) ENTRY(name, ret, args)
+static struct {
+  const char *name;
+  void **slot;
+} symbols[] = {LLVM_FUNCTIONS(ENTRY_)};
+
+// ---- Loading
+
+static void *llvm_lib = NULL;
+static char llvm_path[1024] = "";
+static char llvm_version[64] = "";
+static char last_error[4096] = "";
+
+// What loading tried, one line per location: "path: outcome".
+static char attempts[8192] = "";
+
+static void note(const char *path, const char *outcome) {
+  size_t n = strlen(attempts);
+  snprintf(attempts + n, sizeof attempts - n, "%s: %s\n", path, outcome);
+}
+
+const char *unison_jit_last_error(void) { return last_error; }
+const char *unison_jit_load_attempts(void) { return attempts; }
+const char *unison_jit_llvm_path(void) { return llvm_path; }
+const char *unison_jit_llvm_version(void) { return llvm_version; }
+
+#define MIN_MAJOR 20
+
+// Tries one library. Returns 1 if it is now loaded and usable.
+static int try_lib(const char *path) {
+  if (!ARCH_SUPPORTED) {
+    note(path, "unsupported CPU architecture (the JIT runs on arm64 and x86_64)");
+    return 0;
+  }
+  void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  if (!lib) {
+    // dlerror's text for a missing file is long; say less for that case
+    struct stat st;
+    int absolute = path[0] == '/';
+    if (absolute && stat(path, &st) != 0) note(path, "not found");
+    else if (!absolute) note(path, "not found on the dynamic loader's search path");
+    else note(path, dlerror());
+    return 0;
+  }
+  void (*get_version)(unsigned *, unsigned *, unsigned *) = (void (*)(unsigned *, unsigned *, unsigned *))dlsym(lib, "LLVMGetVersion");
+  unsigned major = 0, minor = 0, patch = 0;
+  if (get_version) get_version(&major, &minor, &patch);
+  char v[64];
+  snprintf(v, sizeof v, "%u.%u.%u", major, minor, patch);
+  if (!get_version || major < MIN_MAJOR) {
+    char why[128];
+    if (get_version) snprintf(why, sizeof why, "LLVM %s, too old", v);
+    else snprintf(why, sizeof why, "not an LLVM library (or one older than 16)");
+    note(path, why);
+    dlclose(lib);
+    return 0;
+  }
+  for (size_t i = 0; i < sizeof symbols / sizeof symbols[0]; i++) {
+    void *p = dlsym(lib, symbols[i].name);
+    if (!p) {
+      char why[256];
+      snprintf(why, sizeof why, "LLVM %s, but it has no %s", v, symbols[i].name);
+      note(path, why);
+      dlclose(lib);
+      return 0;
+    }
+    *symbols[i].slot = p;
+  }
+  llvm_lib = lib;  // never dlclosed: generated code lives in it
+  snprintf(llvm_path, sizeof llvm_path, "%s", path);
+  snprintf(llvm_version, sizeof llvm_version, "%s", v);
+  note(path, "loaded");
+  return 1;
+}
+
+#ifdef __APPLE__
+#define LIB "libLLVM.dylib"
+#else
+#define LIB "libLLVM.so"
+#endif
+
+// Tries <dir>/<entry>/lib/libLLVM.* for every entry of dir whose name starts
+// with prefix, newest version first (names sort as text: llvm@9 would come
+// after llvm@23, but there is no such version to worry about).
+static int try_versioned_dir(const char *dir, const char *prefix) {
+  DIR *d = opendir(dir);
+  if (!d) return 0;
+  char names[64][64];
+  int n = 0;
+  struct dirent *e;
+  while ((e = readdir(d)) && n < 64)
+    if (strncmp(e->d_name, prefix, strlen(prefix)) == 0 && strlen(e->d_name) < 64)
+      snprintf(names[n++], 64, "%s", e->d_name);
+  closedir(d);
+  // insertion sort, descending by (name length, then text): llvm@23 before llvm@9
+  for (int i = 1; i < n; i++)
+    for (int j = i; j > 0; j--) {
+      size_t la = strlen(names[j - 1]), lb = strlen(names[j]);
+      if (la < lb || (la == lb && strcmp(names[j - 1], names[j]) < 0)) {
+        char t[64];
+        memcpy(t, names[j - 1], 64);
+        memcpy(names[j - 1], names[j], 64);
+        memcpy(names[j], t, 64);
+      } else break;
+    }
+  for (int i = 0; i < n; i++) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s/lib/" LIB, dir, names[i]);
+    if (try_lib(path)) return 1;
+  }
+  return 0;
+}
+
+// Finds and loads LLVM. Returns 0 on success. On failure, last_error says
+// why and unison_jit_load_attempts lists every location tried.
+int unison_jit_load(void) {
+  if (llvm_lib) return 0;
+  attempts[0] = 0;
+  const char *override = getenv("UNISON_LLVM_LIB");
+  if (override && override[0]) {
+    if (try_lib(override)) return 0;
+    snprintf(last_error, sizeof last_error, "UNISON_LLVM_LIB=%s is not a usable LLVM library", override);
+    return -1;
+  }
+  if (try_lib(LIB)) return 0;
+#ifdef __APPLE__
+  // Homebrew: /opt/homebrew (Apple silicon) or /usr/local (Intel); `llvm` is
+  // the current version, `llvm@N` the others. Then MacPorts.
+  const char *brews[] = {"/opt/homebrew/opt", "/usr/local/opt", NULL};
+  for (int i = 0; brews[i]; i++) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/llvm/lib/" LIB, brews[i]);
+    if (try_lib(path)) return 0;
+    if (try_versioned_dir(brews[i], "llvm@")) return 0;
+  }
+  if (try_versioned_dir("/opt/local/libexec", "llvm-")) return 0;
+#else
+  // apt.llvm.org and Debian/Ubuntu: /usr/lib/llvm-N/lib. Then the usual
+  // system directories, where distributions name the file after the version.
+  if (try_versioned_dir("/usr/lib", "llvm-")) return 0;
+  const char *dirs[] = {"/usr/lib64", "/usr/lib", "/usr/local/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", NULL};
+  for (int i = 0; dirs[i]; i++) {
+    DIR *d = opendir(dirs[i]);
+    if (!d) continue;
+    struct dirent *e;
+    int found = 0;
+    while (!found && (e = readdir(d)))
+      if (strncmp(e->d_name, "libLLVM", 7) == 0 && strstr(e->d_name, ".so")) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/%s", dirs[i], e->d_name);
+        found = try_lib(path);
+      }
+    closedir(d);
+    if (found) return 0;
+  }
+#endif
+  snprintf(last_error, sizeof last_error, "no LLVM %d or newer found", MIN_MAJOR);
+  return -1;
+}
+
+// ---- The JIT
 
 static LLVMOrcLLJITRef jit = NULL;
 static LLVMTargetMachineRef machine = NULL;
-static char last_error[4096] = "";
 
 static int fail(const char *where, LLVMErrorRef e) {
   char *msg = LLVMGetErrorMessage(e);
@@ -29,21 +298,18 @@ static int fail(const char *where, LLVMErrorRef e) {
   return -1;
 }
 
-const char *unison_jit_last_error(void) { return last_error; }
+const char *unison_jit_triple(void) { return jit ? LLVMOrcLLJITGetTripleString(jit) : "none"; }
 
-const char *unison_jit_triple(void) { return LLVMOrcLLJITGetTripleString(jit); }
-
-// Returns 0 on success.
 // Process exit while the compile thread is inside LLVM. The RTS's hs_exit
 // doesn't wait for a thread in a safe foreign call, and exit() then runs
 // LLVM's static destructors under the compile in progress, which crashed in
 // the code generator (2026-10-04, seen at the end of transcript runs: the
 // re-entry batches flush after a quiet period, which is just when a program
-// finishes). So: an atexit handler, registered after LLVM's own destructors
-// so that it runs before them, waits for a compile in flight to finish, and
-// a compile that finishes (or starts) once we are exiting parks its thread
-// instead of returning into a runtime that is gone. The process's exit then
-// takes the parked thread with it.
+// finishes). So: an atexit handler, registered after LLVM is loaded so that
+// it runs before LLVM's own destructors, waits for a compile in flight to
+// finish, and a compile that finishes (or starts) once we are exiting parks
+// its thread instead of returning into a runtime that is gone. The process's
+// exit then takes the parked thread with it.
 static int compiling = 0;  // compiles in flight
 static int exiting = 0;
 
@@ -57,12 +323,16 @@ static void at_exit(void) {
   for (int i = 0; i < 10000 && __atomic_load_n(&compiling, __ATOMIC_SEQ_CST) > 0; i++) nanosleep(&ms, NULL);
 }
 
+// Loads LLVM if needed and starts the JIT. Returns 0 on success.
 int unison_jit_init(void) {
-  atexit(at_exit);
   if (jit) return 0;
-  LLVMInitializeNativeTarget();
-  LLVMInitializeNativeAsmPrinter();
-  LLVMInitializeNativeAsmParser();
+  if (unison_jit_load() != 0) return -1;
+  atexit(at_exit);
+  TARGET_FN(TargetInfo)();
+  TARGET_FN(Target)();
+  TARGET_FN(TargetMC)();
+  TARGET_FN(AsmPrinter)();
+  TARGET_FN(AsmParser)();
 
   LLVMErrorRef e = LLVMOrcCreateLLJIT(&jit, NULL);
   if (e) return fail("create LLJIT", e);

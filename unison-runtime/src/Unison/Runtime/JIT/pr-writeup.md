@@ -39,7 +39,7 @@ The modified existing code is concentrated in three files:
 | Trampoline and interpreter integration | native cells, exits, frames, the constant pool, entering and leaving native code, partial applications | `Exits.hs`, `Frames.hs`, `Pool.hs`, `MCode.hs`, `Machine.hs`, `Machine/Types.hs`, `Stack.hs`, `Interface.hs`, `Foreign/Function.hs`, `jit_rt.h`, `jit_rt.c` sections Entering native code 136 and Partial applications 217 | 1,702 | 8% |
 | Compile driver | what to compile and when, budgets, configuration, the LLVM shim | `JIT.hs` 410, `Compile.hs` 478, `Config.hs` 188, `Estimate.hs` 237, `LLVM.hs` 126, `jit_llvm.c` 168 | 1,607 | 7% |
 | Closure layout and allocation | probing GHC's heap layouts at startup, allocation and the write barrier | `Layout.hs` 1,210, `jit_rt.c` sections Allocation 129, Numbers 31, layout probe 33 | 1,403 | 6% |
-| Build config, CI and CLI | packaging, the CI flag, command-line flags | `package.yaml`, `.cabal`, `stack.yaml`, `hie.yaml`, `test.yaml`, `ArgParse.hs`, `Main.hs` | 282 | 1% |
+| Build config, CI and CLI | packaging, command-line flags, the startup message | `package.yaml`, `.cabal`, `stack.yaml`, `hie.yaml`, `test.yaml`, `ArgParse.hs`, `Main.hs` | 282 | 1% |
 
 The compiler proper (code generation, the driver, layout, the trampoline) is 8,900 lines, 41% of
 the diff, and `Codegen.hs` alone is nearly half of that. The native builtins plus the data-structure

@@ -74,12 +74,6 @@ flags:
   haskeline:
     terminfo: false
 
-# For the JIT (unison-runtime's `jit` flag, off by default). Harmless when the flag is off.
-extra-include-dirs:
-  - /opt/homebrew/opt/llvm/include
-extra-lib-dirs:
-  - /opt/homebrew/opt/llvm/lib
-
 allow-newer: true
 allow-newer-deps:
   - fuzzyfind

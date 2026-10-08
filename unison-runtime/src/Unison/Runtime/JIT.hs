@@ -1,6 +1,7 @@
 -- | The JIT's entry points for the rest of the runtime. See unison-runtime/src/Unison/Runtime/JIT/design.md.
 module Unison.Runtime.JIT
   ( startJIT,
+    loadJIT,
     jitCompileGroup,
     jitRequestGroup,
     jitRequestCell,
@@ -55,9 +56,9 @@ jitState = unsafePerformIO (newIORef Nothing)
 {-# NOINLINE jitState #-}
 
 -- | Gets the JIT going if it is enabled. Called once when the runtime
--- starts. In eager mode this starts LLVM; in @on@ mode it only starts the
--- compile thread, which starts LLVM when the first request arrives, so
--- that a program that never gets hot pays nothing.
+-- starts. LLVM is normally loaded already, by 'loadJIT' at ucm's startup;
+-- if not (another host of the runtime), eager mode loads it here and
+-- @on@ mode on the compile thread, when the first request arrives.
 startJIT :: IO ()
 startJIT = do
   when (statsEach config) (writeIORef outputHook printExitsSinceOutput)
@@ -66,18 +67,42 @@ startJIT = do
 startCompiler :: IO ()
 startCompiler = case mode config of
   Off -> pure ()
-  Eager ->
-    readIORef jitState >>= \case
-      Just _ -> pure () -- a second runtime in the same process
-      Nothing -> initJIT
+  Eager -> void initJIT
   On -> do
     first <- atomicModifyIORef' compileThreadStarted (\started -> (True, not started))
     when first (void (forkIO compileThread))
 
--- | Starts LLVM and probes the runtime. On success 'jitState' is set; if
--- anything is wrong the JIT stays off, with a message.
-initJIT :: IO ()
-initJIT = do
+-- | Loads LLVM at startup, when the JIT is turned on, and says how it
+-- went: Nothing when the JIT is off, otherwise whether it is activated,
+-- and if not, lines explaining why. Whatever the answer, the program runs:
+-- without the JIT everything is interpreted.
+loadJIT :: IO (Maybe (Either [String] String))
+loadJIT = case mode config of
+  Off -> pure Nothing
+  _ -> Just <$> initJIT
+
+-- | Set once a load has been tried, so that it is tried once only: a
+-- failure would be the same the second time, and would print again.
+initTried :: IORef (Maybe (Either [String] String))
+initTried = unsafePerformIO (newIORef Nothing)
+{-# NOINLINE initTried #-}
+
+-- | Loads LLVM, starts the JIT and probes the runtime, the first time it
+-- is called; later calls return the first outcome. On success 'jitState'
+-- is set and the result names the LLVM loaded; if anything is wrong the
+-- JIT stays off and the result says why, in lines meant for the user.
+initJIT :: IO (Either [String] String)
+initJIT =
+  readIORef initTried >>= \case
+    Just r -> pure r
+    Nothing -> do
+      r <- initJIT'
+      writeIORef initTried (Just r)
+      either (mapM_ jitLog) jitLog r
+      pure r
+
+initJIT' :: IO (Either [String] String)
+initJIT' = do
   let timed what io = do
         t0 <- getMonotonicTimeNSec
         x <- io
@@ -85,8 +110,10 @@ initJIT = do
         x <$ jitLog (what ++ ": " ++ show (fromIntegral (t1 - t0) / 1e6 :: Double) ++ " ms")
   r <- initLLVM
   case r of
-    Left e -> jitLog (e ++ "; the JIT is off")
-    Right () -> do
+    Left (NotFound tried) ->
+      pure (Left (("JIT compilation needs LLVM version >= " ++ show minLLVM ++ ", searched these locations:") : map ("  " ++) tried))
+    Left (InitError e) -> pure (Left [e ++ "; the JIT is off"])
+    Right (version, path) -> do
       layouts <- probeLayouts >>= \case
         Left e -> pure (Left e)
         -- the list helpers are part of the generated code's contract too
@@ -109,7 +136,7 @@ initJIT = do
                             Right () -> fmap (const ls) <$> probeNames ls
       (offs, _) <- ctxLayout
       case (layouts, offs) of
-        (Left e, _) -> jitLog (e ++ "; the JIT is off")
+        (Left e, _) -> pure (Left [e ++ "; the JIT is off"])
         (Right ls, [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u]) -> do
           configureNative (stressPoll config) (stressCallee config) (stressCStack config) (stressAlloc config) (trace config)
           facts <- rtsFacts
@@ -120,9 +147,13 @@ initJIT = do
               let rts = RtsFacts arrWordsInfo arrPtrsInfo bytesHdr bytesCount ptrsHdr ptrsCount ptrsSize cardBits mutVarVar arrPtrsDirtyInfo
               writeIORef jitState (Just (JITState ls (CtxOffsets a b c d e f g h i j k l m n o p q r s t u) rts))
               triple <- targetTriple
-              jitLog ("mode " ++ show (mode config) ++ ", LLVM ready, target " ++ triple)
-            _ -> jitLog "unexpected runtime facts; the JIT is off"
-        _ -> jitLog "unexpected Ctx layout; the JIT is off"
+              pure (Right ("mode " ++ show (mode config) ++ ", LLVM " ++ version ++ " from " ++ path ++ ", target " ++ triple))
+            _ -> pure (Left ["unexpected runtime facts; the JIT is off"])
+        _ -> pure (Left ["unexpected Ctx layout; the JIT is off"])
+
+-- | The oldest LLVM the shim works with (why: cbits/jit_llvm.c).
+minLLVM :: Int
+minLLVM = 20
 
 -- | Compiles a freshly loaded top-level definition, in eager mode.
 jitCompileGroup :: Bool -> Reference -> Word64 -> MCombs -> IO ()
@@ -226,7 +257,8 @@ groupDeps :: Word64 -> MCombs -> [Word64]
 groupDeps g cmbs = Set.toList (Set.delete g (Set.fromList [d | (_, c) <- EC.mapToList cmbs, d <- combDeps c]))
 
 -- | Serves requests, forever. LLVM is only ever used from this thread (in
--- @on@ mode), and is started by the first request.
+-- @on@ mode); it is normally loaded at startup already, and if not, by the
+-- first request.
 --
 -- A definition that got hot is compiled as soon as its request comes up.
 -- Requests for re-entry functions are held instead, and compiled together
@@ -270,7 +302,7 @@ compileThread = do
   where
     withState initialized k = do
       ready <- readIORef initialized
-      unless ready (initJIT >> writeIORef initialized True)
+      unless ready (void initJIT >> writeIORef initialized True)
       readIORef jitState >>= \case
         Nothing -> pure ()
         Just st -> do

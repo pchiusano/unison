@@ -29,10 +29,6 @@ flag dumpcore
   manual: True
   default: False
 
-flag jit
-  manual: True
-  default: False
-
 flag optchecks
   manual: True
   default: False
@@ -131,6 +127,8 @@ library
   ghc-options: -fmax-worker-args=100 -Wall -funbox-strict-fields -O2
   c-sources:
       cbits/i2d.c
+      cbits/jit_llvm.c
+      cbits/jit_rt.c
   build-depends:
       asn1-encoding
     , asn1-types
@@ -206,14 +204,6 @@ library
     ghc-options: -DCODE_SERIAL_CHECK
   if flag(dumpcore)
     ghc-options: -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-coercions -dsuppress-idinfo -dsuppress-module-prefixes -ddump-str-signatures -ddump-simpl-stats
-  if flag(jit)
-    cpp-options: -DUNISON_JIT
-    c-sources:
-        cbits/jit_llvm.c
-        cbits/jit_rt.c
-    extra-libraries:
-        LLVM
-    ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
   if !os(windows)
     c-sources:
         cbits/signals.c
@@ -311,14 +301,6 @@ test-suite runtime-tests
     ghc-options: -DCODE_SERIAL_CHECK
   if flag(dumpcore)
     ghc-options: -ddump-simpl -ddump-stg-final -ddump-to-file -dsuppress-coercions -dsuppress-idinfo -dsuppress-module-prefixes -ddump-str-signatures -ddump-simpl-stats
-  if flag(jit)
-    cpp-options: -DUNISON_JIT
-    c-sources:
-        cbits/jit_llvm.c
-        cbits/jit_rt.c
-    extra-libraries:
-        LLVM
-    ld-options: -Wl,-rpath,/opt/homebrew/opt/llvm/lib
   if !os(windows)
     c-sources:
         tests/cbits/signals.c

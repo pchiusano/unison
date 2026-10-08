@@ -9,10 +9,8 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE PatternSynonyms #-}
 
-#ifdef UNISON_JIT
 -- See the note in Stack.hs: the JIT relies on GCombInfo's optimized layout.
 {-# OPTIONS_GHC -O2 -funbox-strict-fields #-}
-#endif
 
 module Unison.Runtime.MCode
   ( Args' (..),

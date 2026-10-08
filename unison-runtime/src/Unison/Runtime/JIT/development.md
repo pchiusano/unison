@@ -6,27 +6,33 @@ past runs are in [benchmarks/](benchmarks/).
 
 ## Building
 
-- The JIT is behind the package flag `jit` in `unison-runtime/package.yaml`, off by default.
-  With it off nothing links against LLVM and `Unison.Runtime.JIT.LLVM` exports stubs that
-  report the JIT isn't built in. Every build command for JIT work needs
-  `--flag unison-runtime:jit`, otherwise Stack reconfigures the package without it and
-  rebuilds.
-- LLVM is linked dynamically, at one pinned major version: 23 (23.1.2 from Homebrew,
-  `brew install llvm`). It is keg-only, so it isn't on the PATH; `stack.yaml` has its
-  `extra-lib-dirs` and `extra-include-dirs`, and `/opt/homebrew/opt/llvm/bin/llvm-config`
-  says where it is. Textual IR changes between LLVM majors, so a range isn't supported.
+- The JIT is always built in, and building needs no LLVM: nothing links against it, and
+  `cbits/jit_llvm.c` carries its own copies of the few C API declarations it uses. LLVM is
+  loaded with `dlopen` when the JIT is turned on (`--jit on`), at ucm's startup, and every
+  function used is looked up with `dlsym`. Before the switch to loading at run time
+  (2026-10-07) the JIT was behind a package flag and linked against one pinned LLVM.
+- Any LLVM 20 or newer works (`brew install llvm`; 23.1.2 is what development uses). The
+  shim looks in `UNISON_LLVM_LIB` (a path to the library) first, then on the dynamic
+  loader's search path, then in Homebrew's `llvm` and `llvm@N` kegs, newest first, under
+  `/opt/homebrew/opt` and `/usr/local/opt`, then MacPorts; on Linux in `/usr/lib/llvm-N`
+  and the usual library directories. The oldest version accepted is 20 because
+  `LLVMOrcCreateNewThreadSafeContextFromLLVMContext` appeared there; the IR generated uses
+  nothing newer than opaque pointers (15) and `LLVMRunPasses` (17). Other versions than 23
+  haven't been run yet: `UNISON_LLVM_LIB=/opt/homebrew/opt/llvm@20/lib/libLLVM.dylib` and
+  the test transcript would be the check. When no usable LLVM is found ucm says so at
+  startup, lists where it looked, and runs everything on the interpreter.
 - Only macOS arm64 is built and tested so far. Nothing in the code generator is written
   per platform; what does vary is finding LLVM, reading the thread's C stack bounds for the
   stack guard, and whether LLVM guarantees tail calls on the target (it does on arm64 and
   x86-64).
-- Iterate with `stack build --fast --flag unison-runtime:jit`. **Benchmark only on an
+- Iterate with `stack build --fast`. **Benchmark only on an
   optimized build, and keep it in its own work dir:** Stack does not rebuild when only the
   optimization level changes, so after a `--fast` build a plain `stack build` leaves the
   unoptimized binary in place. `.stack-work` is the fast tree and `.stack-work-opt` the
   optimized one:
 
   ```
-  stack build --work-dir .stack-work-opt --flag unison-runtime:jit
+  stack build --work-dir .stack-work-opt
   stack exec --work-dir .stack-work-opt unison -- ...
   ```
 
@@ -34,17 +40,16 @@ past runs are in [benchmarks/](benchmarks/).
   switching rebuilds nothing. On an optimized build "Count to 1 million" in `suite` takes
   about 40 ms; on a fast build about 3 s, which is the quickest way to tell them apart.
 - A third tree holds the debug RTS for heap sanity checking, built once with
-  `stack build --fast --flag unison-runtime:jit --ghc-options=-debug --work-dir .stack-work-debug`
+  `stack build --fast --ghc-options=-debug --work-dir .stack-work-debug`
   (`unison +RTS --info` then says `rts_thr_debug`). Run anything through it with
   `+RTS -DS -RTS` at the end of the command line: the RTS checks every heap object at every
   GC, which catches a bad info pointer, a wrong tag or a missed write barrier near its cause.
   About 10× slower. Some bugs only exist at `-O2` (GHC's optimized code trusts strict fields
   without checking tags), so there is also `.stack-work-optdebug`, the same over the
   optimized build.
-- `Stack.hs` and `MCode.hs` carry `{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}` under
-  `#ifdef UNISON_JIT`, and `Deque.Internal`, `Rope`, `Util.Text` and `Util.Bytes` carry it in
-  every build, because the closure layouts the generator and the C helpers rely on only exist
-  in optimized code. Without it a fast build makes the layout probe turn the JIT off, which
+- `Stack.hs`, `MCode.hs`, `Deque.Internal`, `Rope`, `Util.Text` and `Util.Bytes` carry
+  `{-# OPTIONS_GHC -O2 -funbox-strict-fields #-}` in every build, because the closure
+  layouts the generator and the C helpers rely on only exist in optimized code. Without it a fast build makes the layout probe turn the JIT off, which
   is correct, and the probe's log line says so.
 - Stack ignores `lib/unison-util-rope/package.yaml` (the checked-in `.cabal` was generated
   by a newer hpack), so a new module, test or benchmark there goes into the `.cabal` file by
@@ -65,7 +70,9 @@ past runs are in [benchmarks/](benchmarks/).
   `UNISON_JIT=eager` compiles every definition as it is loaded, synchronously, with no
   counters (for testing: deterministic, and it compiles code that never gets hot in a short
   run); `off` is the default. `unison --jit on|eager` is the same thing from the command
-  line and overrides the variable.
+  line and overrides the variable. Either mode loads LLVM and runs the startup checks
+  before anything else, and ucm prints one line saying the JIT is activated, or why not;
+  `UNISON_JIT_LOG=1` adds the version and path loaded.
 - Every other setting is an environment variable, parsed and documented in
   [Config.hs](Config.hs): the threshold and batch size, the copy and re-entry-batch limits,
   the exit and entry costs, `UNISON_JIT_DISABLE` (features turned off for bisecting a bug)
@@ -150,10 +157,10 @@ corruption, so the debug RTS checks the heap.
   an error about `unison.sqlite3-wal` or `credentials.json.lock` (the codebase copy racing
   another run's), so run that one again.
 - The rope library has its own tests and benchmarks:
-  `stack build --fast --flag unison-runtime:jit --test unison-util-rope` compares the Deque
+  `stack build --fast --test unison-util-rope` compares the Deque
   with `Data.Sequence` and the rope with a string model, checking the structures' invariants
   (`valid`) after every step (about a minute);
-  `stack build --work-dir .stack-work-opt --flag unison-runtime:jit --bench unison-util-rope`
+  `stack build --work-dir .stack-work-opt --bench unison-util-rope`
   runs the benchmarks (about 6 minutes; `--ba "--csv FILE"` for the numbers).
 - Re-measure `off` whenever `enter`, `apply` or `yield` change: the interpreter's hot-count
   test is on the path of every call, and a version that compared with a configured threshold
