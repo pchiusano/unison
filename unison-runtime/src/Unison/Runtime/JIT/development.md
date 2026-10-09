@@ -184,6 +184,10 @@ corruption, so the debug RTS checks the heap.
 - `UNISON_JIT_DUMP_MCODE=1` dumps the MCode as it is loaded. To look at a site named in the
   statistics (`CIx ... <group> <n>`): run with `UNISON_JIT=off` and this, kill it once
   loading is done, and search the dump for `<group>:<n>:`.
+- `UNISON_JIT_PASSES` is the LLVM pipeline a module is optimized with (`default<O2>`; empty
+  runs none) and `UNISON_JIT_CODEGEN_LEVEL` (0 to 3) the level of the JIT's target machine,
+  both for measuring what the optimizer and the backend cost and buy
+  ([2026-10-09 O0](benchmarks/2026-10-09-o0.md)); full O0 with workers crashes, see there.
 - `UNISON_JIT_STATS=1` prints exit counts per site after each evaluation, with the compile
   totals first (modules, functions, auxiliary functions, re-entry functions generated on
   demand and never asked for, IR size, time, and the time split into generating the IR,

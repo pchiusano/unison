@@ -428,7 +428,7 @@ compileUnits st types modName lazy candidates = do
         then jitDump (UT.unpack annotated)
         else TIO.writeFile (dir </> modName ++ ".ll") (UT.toText annotated)
     tGen <- getMonotonicTimeNSec
-    r <- addModule (isJust (dumpIR config)) "default<O2>" (UT.toText ir)
+    r <- addModule (isJust (dumpIR config)) (passes config) (UT.toText ir)
     tOpt <- getMonotonicTimeNSec
     case r of
       -- a module that doesn't compile or link is a bug in the generator: say so even without the log

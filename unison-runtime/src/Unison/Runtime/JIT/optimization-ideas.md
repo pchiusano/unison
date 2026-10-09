@@ -100,16 +100,30 @@ than deleting it.
      no risk; large change to the generator). After 1 to 3 the suite's 1.38 s splits into
      generating the IR 0.10 s, LLVM's parse and `O2` 0.68 s (of which the parse is about a
      tenth by the offline numbers), and LLVM's code generation 0.59 s, measured 2026-10-09
-     with the phase split in the stats line. The 64 modules under 50 KB take 0.62 s between
-     them, 8 ms median, so about 45% of the time is the per-module fixed cost of a pass
-     pipeline and an ORC materialization on a tiny module: fewer, larger re-entry batches
-     (a longer `UNISON_JIT_REENTRY_WAIT`) or a lighter pipeline below some size would attack
-     that; the two largest modules take 0.69 s and are the per-slot traffic.
+     with the phase split in the stats line. A C harness driving `jit_llvm.c` in-process on
+     dumped modules (same day) shows the cost is nearly all proportional to the IR: the
+     parse is 0.2 ms for 11 KB and 6 ms for 560 KB (about 1% overall), `O2` about 0.13 ms
+     per KB and code generation plus linking about 0.11 ms per KB, with a fixed cost per
+     module of about 2 ms (0.6 ms to build the `O2` pipeline, the rest in the code
+     generator's setup and the link), which over 69 modules is 10%. The C API builds the
+     pass pipeline anew in every `LLVMRunPasses`; keeping a pass manager across modules
+     needs the C++ API, which the run-time loading rules out. A function-level pipeline
+     (`mem2reg,sroa,early-cse,simplifycfg,instcombine,gvn,dse,simplifycfg`) costs a quarter
+     of `O2` and makes code generation 10 to 15% cheaper, but has no inliner and no loop
+     passes; with `cgscc(inline)` between two such function passes it would be the thing
+     to measure against the suite, since the generated code's quality is what is at stake.
   5. Tiered: the trigger alone first in a small module, the batch later with direct calls
      (cuts the latency of the hot loop running interpreted, not the CPU; no risk).
   6. Several compile threads in LLJIT (`LLVMOrcLLJITBuilderSetNumCompileThreads`): wall
      clock only, and only across modules, when the time is in two or three big ones.
   7. `O1` or a hand-picked pipeline instead of `default<O2>`: 50 ms here, some risk; last.
+     Measured 2026-10-09, [O0](benchmarks/2026-10-09-o0.md): the passes and the backend are
+     each about half of a module's time, and each is worth 5× or more at run time on the
+     loop benchmarks, so neither can be dropped; `UNISON_JIT_PASSES` and
+     `UNISON_JIT_CODEGEN_LEVEL` exist for such measurements. The experiment still open is a
+     light pipeline with the inliner,
+     `function(mem2reg,sroa,early-cse,simplifycfg,instcombine),cgscc(inline),function(sroa,early-cse,gvn,instcombine,dse,simplifycfg)`,
+     a quarter of `O2`'s cost in the harness, against the suite's timings.
 
 ## Batching tweaks
 

@@ -49,6 +49,11 @@ data Config = Config
     -- so that a large definition needs proportionally more calls across its
     -- edges to join a batch (@UNISON_JIT_SIZE_UNIT@). See JIT.formBatch.
     sizeUnit :: Int,
+    -- | the LLVM pass pipeline a module is optimized with
+    -- (@UNISON_JIT_PASSES@, @default<O2>@; the empty string runs none).
+    -- For measurement, with @UNISON_JIT_CODEGEN_LEVEL@, which jit_llvm.c
+    -- reads itself.
+    passes :: String,
     -- | with 'On': a compiled callee of a definition being compiled is
     -- compiled again as a private copy in the new module, so that calls to
     -- it are direct and LLVM can inline it, when the callee's estimated
@@ -133,6 +138,7 @@ config = unsafePerformIO $ do
   batchSize <- lookupEnv "UNISON_JIT_BATCH"
   gate <- lookupEnv "UNISON_JIT_BATCH_GATE"
   sizeU <- lookupEnv "UNISON_JIT_SIZE_UNIT"
+  pipeline <- lookupEnv "UNISON_JIT_PASSES"
   copyB <- lookupEnv "UNISON_JIT_COPY"
   reWait <- lookupEnv "UNISON_JIT_REENTRY_WAIT"
   cost <- lookupEnv "UNISON_JIT_EXIT_COST"
@@ -152,6 +158,7 @@ config = unsafePerformIO $ do
         batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
         batchGate = max 1 (fromMaybe (max 1 (fromMaybe 100 (thresh >>= readMaybe)) `div` 4) (gate >>= readMaybe)),
         sizeUnit = max 1 (fromMaybe 500 (sizeU >>= readMaybe)),
+        passes = fromMaybe "default<O2>" pipeline,
         copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
         reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),

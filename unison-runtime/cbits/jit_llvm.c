@@ -34,6 +34,7 @@ typedef struct LLVMOpaqueTargetMachine *LLVMTargetMachineRef;
 typedef struct LLVMOpaquePassBuilderOptions *LLVMPassBuilderOptionsRef;
 typedef struct LLVMOrcOpaqueLLJIT *LLVMOrcLLJITRef;
 typedef struct LLVMOrcOpaqueLLJITBuilder *LLVMOrcLLJITBuilderRef;
+typedef struct LLVMOrcOpaqueJITTargetMachineBuilder *LLVMOrcJITTargetMachineBuilderRef;
 typedef struct LLVMOrcOpaqueJITDylib *LLVMOrcJITDylibRef;
 typedef struct LLVMOrcOpaqueThreadSafeContext *LLVMOrcThreadSafeContextRef;
 typedef struct LLVMOrcOpaqueThreadSafeModule *LLVMOrcThreadSafeModuleRef;
@@ -101,6 +102,11 @@ enum { LLVMCodeModelJITDefault = 1 };
     (LLVMModuleRef, const char *, LLVMTargetMachineRef, LLVMPassBuilderOptionsRef))            \
   X(LLVMParseCommandLineOptions, void, (int, const char *const *, const char *))              \
   X(LLVMOrcCreateLLJIT, LLVMErrorRef, (LLVMOrcLLJITRef *, LLVMOrcLLJITBuilderRef))             \
+  X(LLVMOrcCreateLLJITBuilder, LLVMOrcLLJITBuilderRef, (void))                                 \
+  X(LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine, LLVMOrcJITTargetMachineBuilderRef,  \
+    (LLVMTargetMachineRef))                                                                    \
+  X(LLVMOrcLLJITBuilderSetJITTargetMachineBuilder, void,                                       \
+    (LLVMOrcLLJITBuilderRef, LLVMOrcJITTargetMachineBuilderRef))                               \
   X(LLVMOrcLLJITGetTripleString, const char *, (LLVMOrcLLJITRef))                              \
   X(LLVMOrcLLJITGetMainJITDylib, LLVMOrcJITDylibRef, (LLVMOrcLLJITRef))                        \
   X(LLVMOrcLLJITAddLLVMIRModule, LLVMErrorRef,                                                 \
@@ -347,10 +353,10 @@ int unison_jit_init(void) {
     LLVMParseCommandLineOptions(3, argv, NULL);
   }
 
-  LLVMErrorRef e = LLVMOrcCreateLLJIT(&jit, NULL);
-  if (e) return fail("create LLJIT", e);
-
-  // A target machine of our own, used only to run the optimization passes.
+  // A target machine of our own, used only to run the optimization passes,
+  // and with UNISON_JIT_CODEGEN_LEVEL=0..3 (for measurement) a second one
+  // at that level for the JIT itself, which otherwise builds its own at
+  // the default level.
   char *triple = LLVMGetDefaultTargetTriple();
   char *cpu = LLVMGetHostCPUName();
   char *features = LLVMGetHostCPUFeatures();
@@ -364,9 +370,22 @@ int unison_jit_init(void) {
   machine = LLVMCreateTargetMachine(target, triple, cpu, features,
                                     LLVMCodeGenLevelDefault, LLVMRelocDefault,
                                     LLVMCodeModelJITDefault);
+  LLVMOrcLLJITBuilderRef builder = NULL;
+  const char *level = getenv("UNISON_JIT_CODEGEN_LEVEL");
+  if (level && level[0] >= '0' && level[0] <= '3') {
+    LLVMTargetMachineRef jtm = LLVMCreateTargetMachine(target, triple, cpu, features,
+                                                       level[0] - '0', LLVMRelocDefault,
+                                                       LLVMCodeModelJITDefault);
+    builder = LLVMOrcCreateLLJITBuilder();
+    LLVMOrcLLJITBuilderSetJITTargetMachineBuilder(
+        builder, LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine(jtm));
+  }
   LLVMDisposeMessage(triple);
   LLVMDisposeMessage(cpu);
   LLVMDisposeMessage(features);
+
+  LLVMErrorRef e = LLVMOrcCreateLLJIT(&jit, builder);
+  if (e) return fail("create LLJIT", e);
   return 0;
 }
 
