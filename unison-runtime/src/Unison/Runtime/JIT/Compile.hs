@@ -228,11 +228,16 @@ data CompileTotals = CompileTotals
     -- would mostly exit (see JIT.Estimate)
     ctNotWorthIt :: !Int,
     ctIRBytes :: !Int,
-    ctNanoseconds :: !Word64
+    -- | time spent in all, and of that: generating the IR (judging the
+    -- units, both passes of the generator, the text), in LLVM's parser
+    -- and optimizer (@addModule@), and in its code generator (the
+    -- lookups, since LLJIT compiles a module when its first symbol is
+    -- looked up)
+    ctNanoseconds, ctGenerate, ctOptimize, ctCodegen :: !Word64
   }
 
 totals :: IORef CompileTotals
-totals = unsafePerformIO (newIORef (CompileTotals 0 0 0 0 0 0 0 0 0))
+totals = unsafePerformIO (newIORef (CompileTotals 0 0 0 0 0 0 0 0 0 0 0 0))
 {-# NOINLINE totals #-}
 
 compileTotals :: IO CompileTotals
@@ -422,7 +427,9 @@ compileUnits st types modName lazy candidates = do
       if dir == "-"
         then jitDump (UT.unpack annotated)
         else TIO.writeFile (dir </> modName ++ ".ll") (UT.toText annotated)
+    tGen <- getMonotonicTimeNSec
     r <- addModule (isJust (dumpIR config)) "default<O2>" (UT.toText ir)
+    tOpt <- getMonotonicTimeNSec
     case r of
       -- a module that doesn't compile or link is a bug in the generator: say so even without the log
       Left e -> hPutStrLn stderr ("[jit] " ++ modName ++ ": " ++ e)
@@ -443,6 +450,10 @@ compileUnits st types modName lazy candidates = do
           atomicModifyIORef' rootMemos (\m -> let !m' = MapS.insertWith MapS.union (uRoot u) memo m in (m', ()))
           forM_ (fnDeferred f) (addPending . deferredUnit u)
         let described = [(uName u, takeWhile (/= '\n') (drop 2 (dropWhile (/= '=') (uDescribe u)))) | (u, _) <- compiled]
+        -- the first lookup compiles the module; time it apart from the installs
+        tCode <- case compiled of
+          (u, f) : _ | not (uCopy u) -> lookupSymbol (UT.unpack (fnName f)) >> getMonotonicTimeNSec
+          _ -> getMonotonicTimeNSec
         forM_ compiled $ \(u, f) -> do
           forM_ (fnNotes f) $ \note -> jitLog (UT.unpack (fnName f) ++ ": partly interpreted: " ++ UT.unpack note)
           forM_ ((if uCopy u then [] else [(UT.unpack (fnName f), fnCell f)]) ++ [(UT.unpack sym, cell) | Pair sym cell <- toList (fnAux f)]) $ \(sym, cell) ->
@@ -464,7 +475,10 @@ compileUnits st types modName lazy candidates = do
                 ctAuxiliary = ctAuxiliary t + sum (map (length . fnAux) fns),
                 ctOnDemand = ctOnDemand t + onDemand,
                 ctIRBytes = ctIRBytes t + UT.size ir,
-                ctNanoseconds = ctNanoseconds t + (t1 - t0)
+                ctNanoseconds = ctNanoseconds t + (t1 - t0),
+                ctGenerate = ctGenerate t + (tGen - t0),
+                ctOptimize = ctOptimize t + (tOpt - tGen),
+                ctCodegen = ctCodegen t + (tCode - tOpt)
               },
             ()
           )
@@ -475,4 +489,7 @@ compileUnits st types modName lazy candidates = do
               ++ show (sum (map (length . fnDeferred) fns)) ++ " left for later, "
               ++ show (sum counts) ++ " exits, " ++ show (UT.size ir `div` 1024) ++ " KB of IR, in "
               ++ show (fromIntegral (t1 - t0) / 1e6 :: Double) ++ " ms"
+              ++ " (generate " ++ ms (tGen - t0) ++ ", parse and optimize " ++ ms (tOpt - tGen) ++ ", code " ++ ms (tCode - tOpt) ++ ")"
           )
+  where
+    ms ns = show (fromIntegral ns / 1e6 :: Double)

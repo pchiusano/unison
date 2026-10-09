@@ -186,7 +186,9 @@ corruption, so the debug RTS checks the heap.
   loading is done, and search the dump for `<group>:<n>:`.
 - `UNISON_JIT_STATS=1` prints exit counts per site after each evaluation, with the compile
   totals first (modules, functions, auxiliary functions, re-entry functions generated on
-  demand and never asked for, IR size, time) and how often the trampoline entered each
+  demand and never asked for, IR size, time, and the time split into generating the IR,
+  LLVM's parse and optimization, and LLVM's code generation; the per-module log line under
+  `UNISON_JIT_LOG` has the same split) and how often the trampoline entered each
   native function; `UNISON_JIT_STATS=each` prints the exits taken since the program last
   wrote output, after each write, which gives per-benchmark exits for a suite that prints a
   line per benchmark; `UNISON_JIT_STATS_EVERY=N` also prints every N exits, for evaluations

@@ -477,6 +477,7 @@ printJITStats = when (stats config) $ do
         ++ " re-entry functions on demand (" ++ show (ctPending t) ++ " never asked for); "
         ++ show (ctNotWorthIt t) ++ " left interpreted by the exit rule; "
         ++ show (ctIRBytes t `div` 1024) ++ " KB of IR, " ++ show (fromIntegral (ctNanoseconds t) / 1e6 :: Double) ++ " ms"
+        ++ " (generate " ++ show (fromIntegral (ctGenerate t) / 1e6 :: Double) ++ ", parse and optimize " ++ show (fromIntegral (ctOptimize t) / 1e6 :: Double) ++ ", code " ++ show (fromIntegral (ctCodegen t) / 1e6 :: Double) ++ ")"
     )
   printExits maxBound
   when (statsEach config) resetExitCounts

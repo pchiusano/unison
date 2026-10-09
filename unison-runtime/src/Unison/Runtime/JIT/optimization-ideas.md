@@ -96,8 +96,15 @@ than deleting it.
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
      call sites, none on exits).
-  4. Build the module through the C API or as bitcode instead of text (saves the parse,
-     about 17%; no risk; large change to the generator).
+  4. Build the module through the C API or as bitcode instead of text (saves the parse;
+     no risk; large change to the generator). After 1 to 3 the suite's 1.38 s splits into
+     generating the IR 0.10 s, LLVM's parse and `O2` 0.68 s (of which the parse is about a
+     tenth by the offline numbers), and LLVM's code generation 0.59 s, measured 2026-10-09
+     with the phase split in the stats line. The 64 modules under 50 KB take 0.62 s between
+     them, 8 ms median, so about 45% of the time is the per-module fixed cost of a pass
+     pipeline and an ORC materialization on a tiny module: fewer, larger re-entry batches
+     (a longer `UNISON_JIT_REENTRY_WAIT`) or a lighter pipeline below some size would attack
+     that; the two largest modules take 0.69 s and are the per-slot traffic.
   5. Tiered: the trigger alone first in a small module, the batch later with direct calls
      (cuts the latency of the hot loop running interpreted, not the CPU; no risk).
   6. Several compile threads in LLJIT (`LLVMOrcLLJITBuilderSetNumCompileThreads`): wall
