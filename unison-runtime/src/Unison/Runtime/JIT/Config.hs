@@ -43,6 +43,12 @@ data Config = Config
     -- being formed that make it join the batch (@UNISON_JIT_BATCH_GATE@;
     -- a quarter of the threshold by default). See JIT.formBatch.
     batchGate :: Int,
+    -- | with 'On': the size of a typical definition, in units of its frame
+    -- size times its call sites (the generated code grows with both). A
+    -- candidate's estimated calls are divided by its size in these units,
+    -- so that a large definition needs proportionally more calls across its
+    -- edges to join a batch (@UNISON_JIT_SIZE_UNIT@). See JIT.formBatch.
+    sizeUnit :: Int,
     -- | with 'On': a compiled callee of a definition being compiled is
     -- compiled again as a private copy in the new module, so that calls to
     -- it are direct and LLVM can inline it, when the callee's estimated
@@ -126,6 +132,7 @@ config = unsafePerformIO $ do
   thresh <- lookupEnv "UNISON_JIT_THRESHOLD"
   batchSize <- lookupEnv "UNISON_JIT_BATCH"
   gate <- lookupEnv "UNISON_JIT_BATCH_GATE"
+  sizeU <- lookupEnv "UNISON_JIT_SIZE_UNIT"
   copyB <- lookupEnv "UNISON_JIT_COPY"
   reWait <- lookupEnv "UNISON_JIT_REENTRY_WAIT"
   cost <- lookupEnv "UNISON_JIT_EXIT_COST"
@@ -144,6 +151,7 @@ config = unsafePerformIO $ do
         threshold = max 1 (fromMaybe 100 (thresh >>= readMaybe)),
         batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
         batchGate = max 1 (fromMaybe (max 1 (fromMaybe 100 (thresh >>= readMaybe)) `div` 4) (gate >>= readMaybe)),
+        sizeUnit = max 1 (fromMaybe 500 (sizeU >>= readMaybe)),
         copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
         reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),

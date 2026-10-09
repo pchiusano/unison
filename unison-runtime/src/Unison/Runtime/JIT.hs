@@ -287,6 +287,15 @@ edgeCalls cmbs d = fmap sum . forM (EC.mapToList cmbs) $ \(_, c) -> case c of
         pure (fromIntegral (max 0 (n + threshold config)) * fromIntegral sites)
   _ -> pure 0
 
+-- | A group's size, as a proxy for the code generated for it: for each
+-- combinator, its frame size times its call sites. On the suite the IR
+-- grows with both (the slots live across a call are written to the stack
+-- around it): the suite's own body, 183 lines of MCode with a frame of 128
+-- slots and 56 sites, was 55k lines of IR, and a typical hot function
+-- under 500 (2026-10-09).
+groupSize :: MCombs -> Int
+groupSize cmbs = sum [f * length (combDeps c) | (_, c@(Comb (LamI _ f _ _))) <- EC.mapToList cmbs]
+
 -- | Serves requests, forever. LLVM is only ever used from this thread (in
 -- @on@ mode); it is normally loaded at startup already, and if not, by the
 -- first request.
@@ -393,12 +402,15 @@ compileThread = do
                     n <- readIORef seq0
                     writeIORef seq0 (n + 1)
                     pure (Map.insertWith (\(w', _) (w0, s0) -> (w0 + w', s0)) v (w, n) cs)
-          -- whether a candidate may join now
-          passes v (w, _) = case EC.lookup v cache >>= entryCell of
-            Nothing -> pure False
-            Just cell -> do
+          -- whether a candidate may join now: hot on its own, or enough
+          -- estimated calls for its size (a large candidate costs more to
+          -- compile, so cutting an edge into it has to save more calls)
+          passes v (w, _) = case EC.lookup v cache of
+            Just cmbs | Just cell <- entryCell cmbs -> do
               hot <- nativeCellRequested cell
-              pure (hot || w >= fromIntegral (batchGate config))
+              let scale = max 1 (fromIntegral (groupSize cmbs) / fromIntegral (sizeUnit config))
+              pure (hot || w / scale >= fromIntegral (batchGate config))
+            _ -> pure False
           -- the candidate with the most weight, then the earliest seen
           best = Map.foldlWithKey' (\acc v (w, n) -> case acc of
                                       Just (_, (w', n')) | (w', negate n') >= (w, negate n) -> acc

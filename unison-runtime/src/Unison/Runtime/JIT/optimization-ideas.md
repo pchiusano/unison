@@ -82,12 +82,14 @@ than deleting it.
   loads, 20k GEPs, 18k stores and 17k adds against 600 branches and 277 calls: nearly all
   of it is slot traffic to and from the real stack around call sites and exits, in a few
   very long basic blocks, which is what makes the schedulers (superlinear in block length)
-  the dominant cost. Ranked ideas, with the risk that each slows the generated code:
-  1. Switch the machine schedulers off through `LLVMParseCommandLineOptions` at init (large
-     gain, about 40% of a big module; low risk on out-of-order cores, measure the suite).
-  2. A size term in the batch weight, or a per-function IR cap for members that are not hot
-     on their own count (large gain on this module: the two giants are called once and ten
-     times; low risk, since a function hot by its own count still compiles).
+  the dominant cost. Ranked ideas, with the risk that each slows the generated code
+  (1 and 2 done the same day: the suite's compile time halved, from 3.5 s to 1.75 s, and
+  the timings didn't move, [2026-10-09](benchmarks/2026-10-09-compile-time.md)):
+  1. Done: the machine schedulers are switched off through `LLVMParseCommandLineOptions`
+     after LLVM is loaded (`UNISON_JIT_SCHED=1` keeps them). A third of what remained.
+  2. Done: a candidate's estimated calls are divided by its size (`groupSize`, frame size
+     times call sites, in units of `UNISON_JIT_SIZE_UNIT`) before the gate; the two giants,
+     called once and ten times, stay interpreted, and a third of the suite's IR with them.
   3. Less slot traffic per call site and exit: shared write-back blocks (below under Code
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
@@ -143,10 +145,10 @@ than deleting it.
   first reached after its caller is hot runs 3× faster,
   [2026-10-08](benchmarks/2026-10-08-weighted-batches.md). Still open from the discussion: a
   penalty term in the weight for the callee's size, so that cutting an edge into a large
-  callee counts for less; a bound on a module's size in IR rather than in definitions, since
-  on the suite the rule still makes one module of 35 functions that takes 1.2 s, during which
-  its trigger runs interpreted (compiling the trigger alone first, tiered, would remove that
-  wait); and the lag below.) At N/2 calls a definition is warm;
+  callee counts for less (done 2026-10-09, see Compile time below: the 35-function module
+  was the suite's own body joining on its 56 call sites); a bound on a module's size in IR
+  rather than in definitions, with the trigger compiled alone first (tiered) so that it
+  doesn't wait on the batch; and the lag below.) At N/2 calls a definition is warm;
   anything that calls a warm definition is warm, and anything a warm definition calls is warm
   once it has N/4 calls. When any warm definition reaches N, every warm definition is hot and
   they are compiled together: no clock, and the window from warm to hot is time for callers

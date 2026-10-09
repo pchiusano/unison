@@ -99,6 +99,7 @@ enum { LLVMCodeModelJITDefault = 1 };
   X(LLVMDisposePassBuilderOptions, void, (LLVMPassBuilderOptionsRef))                          \
   X(LLVMRunPasses, LLVMErrorRef,                                                               \
     (LLVMModuleRef, const char *, LLVMTargetMachineRef, LLVMPassBuilderOptionsRef))            \
+  X(LLVMParseCommandLineOptions, void, (int, const char *const *, const char *))              \
   X(LLVMOrcCreateLLJIT, LLVMErrorRef, (LLVMOrcLLJITRef *, LLVMOrcLLJITBuilderRef))             \
   X(LLVMOrcLLJITGetTripleString, const char *, (LLVMOrcLLJITRef))                              \
   X(LLVMOrcLLJITGetMainJITDylib, LLVMOrcJITDylibRef, (LLVMOrcLLJITRef))                        \
@@ -333,6 +334,18 @@ int unison_jit_init(void) {
   TARGET_FN(TargetMC)();
   TARGET_FN(AsmPrinter)();
   TARGET_FN(AsmParser)();
+
+  // The backend's two instruction schedulers (before and after register
+  // allocation) were 73% of code generation time on the suite's largest
+  // module (2026-10-09): our functions are long straight-line blocks of
+  // stack slot traffic, and the schedulers' dependency graphs grow
+  // superlinearly with block length. On an out-of-order core the hardware
+  // reorders at run time anyway, so they are off; UNISON_JIT_SCHED=1 keeps
+  // them, for comparison. Must come before any target machine is created.
+  if (!getenv("UNISON_JIT_SCHED")) {
+    const char *argv[] = {"unison", "-enable-misched=false", "-enable-post-misched=false"};
+    LLVMParseCommandLineOptions(3, argv, NULL);
+  }
 
   LLVMErrorRef e = LLVMOrcCreateLLJIT(&jit, NULL);
   if (e) return fail("create LLJIT", e);
