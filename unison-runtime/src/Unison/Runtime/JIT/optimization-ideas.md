@@ -66,6 +66,40 @@ than deleting it.
   is judged by its entry combinator only. Neither rule has been argued for against the
   other; noted as open in M5.
 
+## Compile time
+
+- **Where a module's compile time goes** (measured 2026-10-09 on the suite's largest module,
+  `unison_839`: 35 definitions, 72 functions, 3.8 MB and 96k lines of IR, 1.2 s in the
+  runtime; re-run offline with Homebrew's `opt`/`llc` 23 on the dumped text).
+  Parsing the text: 0.24 s. `default<O2>`: 0.21 s (O1: 0.16 s). Backend at the default
+  level: 0.94 s, of which the pre-RA machine scheduler is 44% and the post-RA scheduler
+  29%; instruction selection is 12%, register allocation 4%. With both schedulers off
+  (`-enable-misched=false -enable-post-misched=false`) the backend takes 0.36 s; the backend
+  at O0 takes 0.10 s but with the fast register allocator. Two functions are 85% of the
+  module: `jitSuite`'s own body (185 lines of MCode, frame size 128, 24 `printTime` rows)
+  is 55k lines of IR, and the harness's row function 27k; the suite body runs once and
+  joined the batch through its 23 call sites to a hot callee. The instruction mix is 33k
+  loads, 20k GEPs, 18k stores and 17k adds against 600 branches and 277 calls: nearly all
+  of it is slot traffic to and from the real stack around call sites and exits, in a few
+  very long basic blocks, which is what makes the schedulers (superlinear in block length)
+  the dominant cost. Ranked ideas, with the risk that each slows the generated code:
+  1. Switch the machine schedulers off through `LLVMParseCommandLineOptions` at init (large
+     gain, about 40% of a big module; low risk on out-of-order cores, measure the suite).
+  2. A size term in the batch weight, or a per-function IR cap for members that are not hot
+     on their own count (large gain on this module: the two giants are called once and ten
+     times; low risk, since a function hot by its own count still compiles).
+  3. Less slot traffic per call site and exit: shared write-back blocks (below under Code
+     size), saving only the slots live across the call, or a helper call for a frame spill
+     (medium to large gain across all three phases, and smaller code; medium risk at hot
+     call sites, none on exits).
+  4. Build the module through the C API or as bitcode instead of text (saves the parse,
+     about 17%; no risk; large change to the generator).
+  5. Tiered: the trigger alone first in a small module, the batch later with direct calls
+     (cuts the latency of the hot loop running interpreted, not the CPU; no risk).
+  6. Several compile threads in LLJIT (`LLVMOrcLLJITBuilderSetNumCompileThreads`): wall
+     clock only, and only across modules, when the time is in two or three big ones.
+  7. `O1` or a hand-picked pipeline instead of `default<O2>`: 50 ms here, some risk; last.
+
 ## Batching tweaks
 
 - **The lag between a request and its batch** (measured and settled 2026-10-09,
