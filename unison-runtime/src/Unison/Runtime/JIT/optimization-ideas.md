@@ -68,7 +68,21 @@ than deleting it.
 
 ## Batching tweaks
 
-- **Two-stage batching**. The idea here is when a function becomes hot, add it to a pending compilation batch along with (breadth-first) traversal of up to D of its transitive dependencies. Then wait for the pending batch to reach size B (or perhaps up to 30s if pending batch stops growing). Compile those ~ B definitions together. The idea is this forms better batches which include related collections of callers and callees, better than compiling batches more eagerly. I also wonder if this approach can be used when lazily compiling re-entry points. If the re-entry functions are added to the pending batch, then there's an opportunity for multiple re-entry points to get compiled together.
+- **The batch forms about a millisecond after the trigger.** The compile thread blocks on
+  the request queue; the interpreter's `writeTBQueue` makes it runnable, and it then runs
+  only when a capability schedules it, which for the interpreter's own capability is its
+  next yield (a heap check that finds the context-switch flag set, or a GC), since the
+  interpreter's loop has no other scheduling point. Measured 2026-10-08 while building the
+  benchmark in [2026-10-08](benchmarks/2026-10-08-weighted-batches.md): on the optimized
+  build the benchmark had to keep its callee unreached for 20,000 iterations for the batch
+  to see it uncalled, where 1,000 wasn't enough; on the fast build the batch formed about 40
+  calls after the trigger. Two consequences: every count-based gate judges counts that are a
+  thousand calls ahead of the trigger, and first-install latency has this as a floor, before
+  the compile itself. Things to try: `forkOn` a capability other than the interpreter's for
+  the compile thread, and measuring the lag directly (a timestamp in the request, compared
+  at batch time). It may also be part of the two timing regimes.
+
+- **Two-stage batching** (superseded 2026-10-08 by the weighted batch rule, below). The idea here is when a function becomes hot, add it to a pending compilation batch along with (breadth-first) traversal of up to D of its transitive dependencies. Then wait for the pending batch to reach size B (or perhaps up to 30s if pending batch stops growing). Compile those ~ B definitions together. The idea is this forms better batches which include related collections of callers and callees, better than compiling batches more eagerly. I also wonder if this approach can be used when lazily compiling re-entry points. If the re-entry functions are added to the pending batch, then there's an opportunity for multiple re-entry points to get compiled together.
 
   Reply (2026-10-04): agree, with two cautions and one addition. (1) The wait is paid by a hot
   loop running interpreted; `on` currently matches `eager` on the suite and a second delay on
@@ -87,7 +101,18 @@ than deleting it.
   quality if the wait turns out to hurt. First measurement to take: the fixed cost of a trivial
   module, and the module count `on` produces on the suite (193 in the last run).
 
-- **Warm definitions, hot together.** (Paul, 2026-10-08.) At N/2 calls a definition is warm;
+- **Warm definitions, hot together.** (Paul, 2026-10-08; done the same day as the weighted
+  batch rule: `formBatch` is Prim's algorithm over the call graph with edges weighted by
+  estimated calls, gated at N/4, [design](design.md#what-gets-compiled-and-when). On the suite
+  it halves total compile time (the breadth-first walk made one 6-definition module that took
+  1.4 s; weighted compiles that definition alone in 10 ms) and a benchmark whose callee is
+  first reached after its caller is hot runs 3× faster,
+  [2026-10-08](benchmarks/2026-10-08-weighted-batches.md). Still open from the discussion: a
+  penalty term in the weight for the callee's size, so that cutting an edge into a large
+  callee counts for less; a bound on a module's size in IR rather than in definitions, since
+  on the suite the rule still makes one module of 35 functions that takes 1.2 s, during which
+  its trigger runs interpreted (compiling the trigger alone first, tiered, would remove that
+  wait); and the lag below.) At N/2 calls a definition is warm;
   anything that calls a warm definition is warm, and anything a warm definition calls is warm
   once it has N/4 calls. When any warm definition reaches N, every warm definition is hot and
   they are compiled together: no clock, and the window from warm to hot is time for callers

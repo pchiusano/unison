@@ -353,38 +353,19 @@ compileThread = do
               dropPending u
     -- The definitions to compile together with one that got hot, so that
     -- calls between them are direct and LLVM can inline across them. The
-    -- batch grows from the hot definition one neighbour at a time, a
-    -- callee or a caller of something already in it, up to the batch
-    -- size; a definition already in a batch (or compiled) can't join, and
-    -- one whose own request is waiting in the queue always does (it got
-    -- hot while this one waited; its request is dropped when it comes
-    -- up). The rule decides which neighbour comes next and when to stop:
-    --
-    -- * 'Breadth': in the order found (callees of each member, then its
-    --   callers), a callee taken if it has been called at least half the
-    --   threshold, a caller if called at all; one that fails is not
-    --   looked at again.
-    -- * 'Weighted': the neighbour with the most estimated calls across
-    --   its edges to the batch so far (every static call site of a
-    --   combinator is taken to run once per call of that combinator, so
-    --   the count of the combinator holding the site is the estimate, and
-    --   a site inside a local loop counts the loop's own calls), taken
-    --   once those calls reach the gate. One that falls short stays a
-    --   candidate: a later member may bring it more edges.
-    --
-    -- A callee usually gets hot before its callers do (it is called at
-    -- least as often), so the callers are what a batch mostly gains.
+    -- batch grows from the hot definition one neighbour at a time (Prim's
+    -- algorithm): the candidate with the most estimated calls across its
+    -- edges to the batch so far joins next, once those calls reach the
+    -- gate, up to the batch size. See design.md for more.
     formBatch cache callers grp = do
       seq0 <- newIORef (0 :: Int)
       let full taken = length taken >= batch config
           -- the neighbours of g, with the role g plays for each
           around g = map ((,) Callee) (maybe [] (groupDeps g) (EC.lookup g cache)) ++ map ((,) Caller) (Set.toList (Map.findWithDefault Set.empty g callers))
-          -- what joining the batch through this edge is worth
-          weight role g v = case batchRule config of
-            Breadth -> pure 1
-            Weighted -> case role of
-              Callee -> maybe (pure 0) (`edgeCalls` v) (EC.lookup g cache)
-              Caller -> maybe (pure 0) (`edgeCalls` g) (EC.lookup v cache)
+          -- the estimated calls across the edge between g and v
+          weight role g v = case role of
+            Callee -> maybe (pure 0) (`edgeCalls` v) (EC.lookup g cache)
+            Caller -> maybe (pure 0) (`edgeCalls` g) (EC.lookup v cache)
           -- adds g's neighbours to the candidates, or more weight to ones already there
           expand g (seen, cands) = foldM add cands (around g)
             where
@@ -394,52 +375,36 @@ compileThread = do
                     w <- weight role g v
                     n <- readIORef seq0
                     writeIORef seq0 (n + 1)
-                    pure (Map.insertWith (\(w', _, _) (w0, s0, r0) -> (w0 + w', s0, r0)) v (w, n, role) cs)
+                    pure (Map.insertWith (\(w', _) (w0, s0) -> (w0 + w', s0)) v (w, n) cs)
           -- whether a candidate may join now
-          passes v (w, _, role) = case EC.lookup v cache >>= entryCell of
+          passes v (w, _) = case EC.lookup v cache >>= entryCell of
             Nothing -> pure False
             Just cell -> do
               hot <- nativeCellRequested cell
-              when (logging config) $ do
-                n <- readNativeCount cell
-                jitLog ("  candidate " ++ show v ++ (case role of Callee -> " (callee)"; Caller -> " (caller)") ++ ": " ++ show (n + threshold config) ++ " calls, weight " ++ show w ++ (if hot then ", requested" else ""))
-              if hot
-                then pure True
-                else case batchRule config of
-                  Breadth -> do
-                    -- counts start at minus the threshold
-                    n <- readNativeCount cell
-                    let enough = case role of
-                          Callee -> max 1 (threshold config `div` 2)
-                          Caller -> 1
-                    pure (n + threshold config >= enough)
-                  Weighted -> pure (w >= fromIntegral (batchGate config))
-          -- the next candidate to look at: most weight, then earliest seen
-          best = Map.foldlWithKey' (\acc v (w, n, r) -> case acc of
-                                      Just (_, (w', n', _)) | (w', negate n') >= (w, negate n) -> acc
-                                      _ -> Just (v, (w, n, r))) Nothing
+              pure (hot || w >= fromIntegral (batchGate config))
+          -- the candidate with the most weight, then the earliest seen
+          best = Map.foldlWithKey' (\acc v (w, n) -> case acc of
+                                      Just (_, (w', n')) | (w', negate n') >= (w, negate n) -> acc
+                                      _ -> Just (v, (w, n))) Nothing
           go taken seen cands
-            | full taken = pure (reverse taken)
-            | otherwise = case batchRule config of
-                Breadth -> case best cands of
-                  Nothing -> pure (reverse taken)
-                  Just (v, c) -> do
-                    ok <- passes v c
-                    claim taken seen (Map.delete v cands) v ok
-                Weighted -> do
-                  passing <- Map.traverseMaybeWithKey (\v c -> (\ok -> if ok then Just c else Nothing) <$> passes v c) cands
-                  case best passing of
-                    Nothing -> pure (reverse taken)
-                    Just (v, _) -> claim taken seen (Map.delete v cands) v True
-          claim taken seen cands v ok = do
-            claimed <- if ok then maybe (pure False) takeNativeCell (EC.lookup v cache >>= entryCell) else pure False
-            let seen' = Set.insert v seen
-            if claimed
-              then expand v (seen', cands) >>= go (v : taken) seen'
-              else go taken seen' cands
+            | full taken = pure (reverse taken, cands)
+            | otherwise = do
+                passing <- Map.traverseMaybeWithKey (\v c -> (\ok -> if ok then Just c else Nothing) <$> passes v c) cands
+                case best passing of
+                  Nothing -> pure (reverse taken, cands)
+                  Just (v, (w, _)) -> do
+                    claimed <- maybe (pure False) takeNativeCell (EC.lookup v cache >>= entryCell)
+                    let seen' = Set.insert v seen
+                        cands' = Map.delete v cands
+                    if claimed
+                      then do
+                        jitLog ("  " ++ show v ++ " joins the batch for " ++ show grp ++ ", weight " ++ show w)
+                        expand v (seen', cands') >>= go (v : taken) seen'
+                      else go taken seen' cands'
       cands0 <- expand grp (Set.singleton grp, Map.empty)
-      members <- go [grp] (Set.singleton grp) cands0
-      when (length members > 1) $ jitLog ("batch for " ++ show grp ++ ": " ++ unwords (map show members))
+      (members, left) <- go [grp] (Set.singleton grp) cands0
+      when (logging config && not (Map.null left)) $
+        jitLog ("  left out of the batch for " ++ show grp ++ ": " ++ unwords [show v ++ " (weight " ++ show w ++ ")" | (v, (w, _)) <- Map.toList left])
       pure members
     -- The compiled callees of the batch that are worth a private copy in
     -- its module (see 'copyUnits'): those where a call is a real share of

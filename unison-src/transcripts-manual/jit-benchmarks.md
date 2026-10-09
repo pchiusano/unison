@@ -209,13 +209,13 @@ hashLoop n =
 -- A callee that is first reached after its caller is hot: the first 20000
 -- iterations take the other branch (the batch forms on the compile thread
 -- about a millisecond after the trigger, a thousand or so iterations, so
--- the phase has to be long). The breadth batch rule judges a callee
--- by its own count, zero here, so the caller is compiled without it; when
--- the callee is reached it exits to the interpreter until its own count
--- makes it hot, and is then compiled alone and called through its cell
--- from the caller's native code for the rest of the run. The weighted rule
--- weighs the edge by the caller's count (one site, once per call) and
--- takes the callee along, so the call is direct and LLVM inlines it.
+-- the phase has to be long). A batch rule that judged a callee by its own
+-- count, zero here, compiled the caller without it; the callee then exited
+-- to the interpreter until its own count made it hot, was compiled alone,
+-- and was called through its cell from the caller's native code for the
+-- rest of the run: 3x slower. The batch rule weighs the edge by the
+-- caller's count (one site, once per call) and takes the callee along, so
+-- the call is direct and LLVM inlines it.
 oneInThree : Nat -> Nat
 oneInThree x = x * 7 + 3
 
