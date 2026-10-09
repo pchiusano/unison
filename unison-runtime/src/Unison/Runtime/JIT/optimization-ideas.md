@@ -90,7 +90,9 @@ than deleting it.
   2. Done: a candidate's estimated calls are divided by its size (`groupSize`, frame size
      times call sites, in units of `UNISON_JIT_SIZE_UNIT`) before the gate; the two giants,
      called once and ten times, stay interpreted, and a third of the suite's IR with them.
-  3. Less slot traffic per call site and exit: shared write-back blocks (below under Code
+  3. Done the same day for exits and unwinds: shared write-back blocks, live slots only,
+     [2026-10-09 write-back](benchmarks/2026-10-09-write-back.md), IR 6.9 → 3.8 MB and
+     1.75 → 1.26 s. Call sites still write their arguments to the stack. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
      call sites, none on exits).
@@ -282,11 +284,20 @@ than deleting it.
   a counter says it is used. Still generated with the function: the continuation of a call-out
   with no fast path, which could be counted too.
 
-- **Shared frame write-back for exits.** Every exit block stores every live slot back to the
-  Unison stack, so a function with many exits and a large frame is mostly exit code
-  (`Duration.toText`: one function, 37 exits, 398 KB of IR). Exits at the same depth could
-  share one write-back block that takes the exit index as a phi, or the write-back could be
-  a loop over the allocas. Smaller IR means less LLVM time. Noted 2026-09-30.
+- **Shared frame write-back for exits.** Done 2026-10-09, in two parts
+  ([internals](internals.md#the-generator), "Write-back"): exits and unwinds that write the
+  same thing share one block with the status as a phi, and only the slots the interpreter
+  will read are written (`liveAt`, a walk of the resumed section). Sharing alone took the
+  suite's IR from 6.9 to 5.7 MB but compile time by only 5%: the re-entry functions of a
+  chain of `Let`s exit at a different depth each, so little was shared. The live sets took
+  it to 3.8 MB and the compile time to 1.26 s, with `fib` 15% faster on top (fewer values
+  kept across calls for the exit paths), [2026-10-09 write-back](benchmarks/2026-10-09-write-back.md).
+  (Originally: every exit block stores every slot back to the Unison stack,
+  so a function with many exits and a large frame is mostly exit code; `Duration.toText`,
+  one function, 37 exits, 398 KB of IR. Noted 2026-09-30.) Still open: the live sets of the
+  rope and decode code are 15 of 25 slots, since deep `VArgN` reads keep early slots alive,
+  so the remaining write-back is real; what is left per slot is a load, an address and a
+  store on each stack.
 
 - **Fallback: tail-call the body function at the end of an inline binding.** If lazy generation
   turns out not to be enough, an inline binding could end with a `musttail` call to the body

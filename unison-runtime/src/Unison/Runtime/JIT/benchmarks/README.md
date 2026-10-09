@@ -26,3 +26,4 @@ against.
 | [2026-10-08 weighted batches](2026-10-08-weighted-batches.md) | the weighted batch rule against the breadth-first walk, and the benchmark that separates them |
 | [2026-10-09 compile thread wake-up](2026-10-09-compile-thread-wake-up.md) | request-to-batch lag, with the compile thread on its own capability |
 | [2026-10-09 compile time](2026-10-09-compile-time.md) | where a module's compile time goes; LLVM's machine schedulers off and a size term in the batch rule halve it |
+| [2026-10-09 write-back](2026-10-09-write-back.md) | exits share write-back blocks and write only live slots: IR 6.9 → 3.8 MB, compile time 1.75 → 1.26 s |

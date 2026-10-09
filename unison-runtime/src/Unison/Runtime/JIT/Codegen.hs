@@ -60,6 +60,7 @@ import Unison.Runtime.TypeTags qualified as TT
 import Unison.Builtin.Decls qualified as Ty (eitherRef, optionalRef, pairRef, seqViewRef, unitRef)
 import Data.Map.Strict qualified as Map
 import Data.IntMap.Strict qualified as IM
+import Data.IntSet qualified as IS
 import Unison.Runtime.MCode hiding (Env)
 import Unison.Runtime.MCode qualified as MCode (GRef (Env))
 import Unison.Runtime.Machine.Types (MCombs, MRef, MSection)
@@ -359,8 +360,26 @@ data GS = GS
     -- | the function being generated is a worker: it doesn't load the
     -- addresses of the Unison stacks at entry (it only needs them where
     -- it exits), so each use loads them from @Ctx@
-    gsWorker :: !Bool
+    gsWorker :: !Bool,
+    -- | the shared write-back blocks of the function being generated
+    -- (see 'joinShared'), by what they write; generated at the end
+    gsShared :: !(Map.Map SharedKey Shared)
   }
+
+-- | What a write-back block does, which is all that exits and unwinds
+-- differ in besides the status they return: the depth (an exit records
+-- the stack pointer from it), the slots written (the live ones, see
+-- 'liveAt'), whether the stack pointers are recorded in @Ctx@ (an exit)
+-- or not (an unwind, where the callee that exited has recorded them),
+-- the frame record for the binding being unwound (its index and depth),
+-- and the enclosing inline bindings (index and base of each).
+data SharedKey = SharedKey !Int ![Int] !Bool !(Maybe (Int, Int)) ![(Int, Int)]
+  deriving (Eq, Ord)
+
+-- | A shared write-back block: its label, the environment it is generated
+-- in (its enclosing bindings are those of the key), and the blocks that
+-- branch to it, each with the status it returns.
+data Shared = Shared !Text !FnEnv !(Deque (Pair Text Text))
 
 -- | The registers 'closureCallee' leaves for 'copyCaptured': the two
 -- segment arrays and the element count.
@@ -397,7 +416,8 @@ initialState maxK cells known worker =
       gsMaxPool = -1,
       gsDeferred = D.empty,
       gsNotWorker = False,
-      gsWorker = worker
+      gsWorker = worker,
+      gsShared = Map.empty
     }
 
 -- | Gives up on the function (or on what 'attempt' is trying).
@@ -659,8 +679,131 @@ data Enclosing = Enclosing
     -- | label of the body block
     enBody :: !Text,
     -- | number of results the body expects
-    enResults :: !Int
+    enResults :: !Int,
+    -- | the slots the body reads once it runs (see 'liveAt')
+    enLive :: !(Maybe IS.IntSet)
   }
+
+-- | The slots the bodies of the enclosing bindings read once they run,
+-- which an exit or unwind inside a binding has to write back as well as
+-- what the resumed code itself reads.
+enclosingLive :: FnEnv -> Maybe IS.IntSet
+enclosingLive fe = foldr (\e acc -> enLive e <+> acc) (Just IS.empty) (feEnclosing fe)
+
+-- | The union of two slot sets, where Nothing (every slot) absorbs.
+(<+>) :: Maybe IS.IntSet -> Maybe IS.IntSet -> Maybe IS.IntSet
+a <+> b = IS.union <$> a <*> b
+
+infixr 5 <+>
+
+-- | The slots (frame offsets, 1 and up) the interpreter reads when it
+-- runs @sect@ at depth @d@ with the frame base at offset @base@, and in
+-- whatever of the same frame runs after it; Nothing when that can't be
+-- told statically, and every slot then has to count. Only these need to
+-- be on the Unison stack when native code exits there: the others are
+-- never read again (a slot dead here is dead at every later point of the
+-- same path; a continuation captured later copies the frame as it is,
+-- dead slots included, and never reads them either). Depths follow
+-- 'genSection': MCode's "slot @i@ from the top" is offset @d - i@, an
+-- instruction pushes 'pushCount' values, a @Let@'s body starts at its
+-- combinator's arity, a data match arm pushes the constructor's fields.
+-- An offset of 0 or below is the caller's (a pending argument), not ours.
+liveAt :: Env -> Int -> Int -> MSection -> Maybe IS.IntSet
+liveAt env base = go
+  where
+    go d = \case
+      App _ r args -> refReads d r <+> argReads base d args
+      Call _ _ _ args -> argReads base d args
+      Jump i args -> slotAt d i <+> argReads base d args
+      Match i br -> slotAt d i <+> arms d br
+      NMatch _ i br -> slotAt d i <+> arms d br
+      DMatch mr i br -> slotAt d i <+> dataArms d (mr >>= \r -> Map.lookup r (envTypes env)) br
+      RMatch {} -> Nothing
+      Yield args -> argReads base d args
+      Ins i rest -> instrReads base d i <+> (pushCount i >>= \n -> go (d + n) rest)
+      Let b (CIx _ _ w) _ body _ -> case EC.lookup w (envCombs env) of
+        Just (Comb (LamI bodyArity _ _ _)) | bodyArity >= d -> go d b <+> go bodyArity body
+        _ -> Nothing
+      Die _ -> Just IS.empty
+      Exit -> Just IS.empty
+    refReads d = \case
+      Stk i -> slotAt d i
+      _ -> Just IS.empty
+    -- the arms of a match that pushes nothing
+    arms d = \case
+      Test1 _ a b -> go d a <+> go d b
+      Test2 _ a _ b c -> go d a <+> go d b <+> go d c
+      TestW df m -> foldr (\(_, a) acc -> go d a <+> acc) (go d df) (EC.mapToList m)
+      TestT df m -> foldr (\a acc -> go d a <+> acc) (go d df) (Map.elems m)
+      TestY df m -> foldr (\a acc -> go d a <+> acc) (go d df) (Map.elems m)
+    -- the arms of a data match: constructor u's arm runs with u's fields
+    -- pushed, the default arm with nothing pushed
+    dataArms d arities = \case
+      Test1 u a df -> ctor d arities u a <+> go d df
+      Test2 u a v b df -> ctor d arities u a <+> ctor d arities v b <+> go d df
+      TestW df m -> foldr (\(u, a) acc -> ctor d arities u a <+> acc) (go d df) (EC.mapToList m)
+      _ -> Nothing
+    ctor d arities u a = case arities of
+      Just as | Just n <- D.lookup (fromIntegral u) as -> go (d + n) a
+      _ -> Nothing
+
+-- | The slots an instruction reads (see 'liveAt').
+instrReads :: Int -> Int -> GInstr comb -> Maybe IS.IntSet
+instrReads base d = \case
+  Prim1 _ i -> slotAt d i
+  Prim2 _ i j -> slotAt d i <+> slotAt d j
+  RefCAS i j k -> slotAt d i <+> slotAt d j <+> slotAt d k
+  ForeignCall _ _ args -> argReads base d args
+  DLLCall -> Nothing
+  SetAff _ i j -> slotAt d i <+> slotAt d j
+  Capture _ -> Nothing
+  Discard _ -> Nothing
+  Name r args -> (case r of Stk i -> slotAt d i; _ -> Just IS.empty) <+> argReads base d args
+  Info _ -> Just IS.empty
+  Pack _ _ args -> argReads base d args
+  Lit _ -> Just IS.empty
+  Print i -> slotAt d i
+  Reset _ i mi -> slotAt d i <+> maybe (Just IS.empty) (slotAt d) mi
+  InLocal i -> slotAt d i
+  Fork i -> slotAt d i
+  Atomically i -> slotAt d i
+  Seq args -> argReads base d args
+  TryForce i -> slotAt d i
+  SandboxingFailure _ -> Nothing
+  KeepAlive i -> slotAt d i
+  NewForeignPtr i j -> slotAt d i <+> slotAt d j
+  AddFinalizer i j -> slotAt d i <+> slotAt d j
+
+-- | The slots an argument list reads, as 'argSources' resolves them.
+argReads :: Int -> Int -> Args -> Maybe IS.IntSet
+argReads base d = \case
+  ZArgs -> Just IS.empty
+  VArg1 i -> slotAt d i
+  VArg2 i j -> slotAt d i <+> slotAt d j
+  VArgR i l -> Just (IS.fromList [d - i - k | k <- [0 .. l - 1], d - i - k >= 1])
+  VArgN v -> Just (IS.fromList [d - i | i <- primArrayToList v, d - i >= 1])
+  VArgV i -> Just (IS.fromList [d - k | k <- [0 .. (d - base) - i - 1], d - k >= 1])
+
+-- | Slot @i@ from the top at depth @d@, if it is one of ours.
+slotAt :: Int -> Int -> Maybe IS.IntSet
+slotAt d i
+  | d - i >= 1 = Just (IS.singleton (d - i))
+  | otherwise = Just IS.empty
+
+-- | The slots that have to be on the Unison stack when this exit is
+-- taken at depth @d@: what the interpreter reads when it carries on from
+-- there, and what the enclosing bindings' bodies read afterwards.
+-- Nothing for an exit that calls the function again from its entry
+-- (every slot).
+exitLive :: FnEnv -> Int -> Exit -> Maybe IS.IntSet
+exitLive fe d = \case
+  Resume _ sect -> liveAt env base d sect <+> enclosingLive fe
+  CallOut _ instr rest n _ -> instrReads base d instr <+> liveAt env base (d + n) rest <+> enclosingLive fe
+  Named _ e -> exitLive fe d e
+  _ -> Nothing
+  where
+    env = feEnv fe
+    base = currentBase fe
 
 -- | The frame base the interpreter would see: @fp@ for the function's own
 -- frame, or the innermost inline binding's base.
@@ -731,15 +874,27 @@ addFrame env f = do
   modify' (\s -> s {gsFrames = gsFrames s |> f, gsNFrames = n + 1})
   pure (envFrameBase env + n)
 
--- | Writes slots 1..d back to the Unison stack.
-writeFrame :: Int -> Gen ()
-writeFrame d =
-  forM_ [1 .. d] $ \k -> do
+-- | Writes the given slots back to the Unison stack.
+writeSlots :: [Int] -> Gen ()
+writeSlots [] = pure ()
+writeSlots slots = do
+  -- the frame's address on each stack once, then constant offsets
+  f <- fpPlus 0
+  ustk <- stackReg "%ustk"
+  ub <- fresh "ufr"
+  emit (ub <> " = getelementptr i64, ptr " <> ustk <> ", i64 " <> f)
+  bstk <- stackReg "%bstk"
+  bb <- fresh "bfr"
+  emit (bb <> " = getelementptr ptr, ptr " <> bstk <> ", i64 " <> f)
+  forM_ slots $ \k -> do
+    useK k
     u <- loadU k
-    ua <- stackAddrU k
+    ua <- fresh "ua"
+    emit (ua <> " = getelementptr i64, ptr " <> ub <> ", i64 " <> tshow k)
     emit ("store i64 " <> u <> ", ptr " <> ua)
     b <- loadB k
-    ba <- stackAddrB k
+    ba <- fresh "ba"
+    emit (ba <> " = getelementptr ptr, ptr " <> bb <> ", i64 " <> tshow k)
     emit ("store ptr " <> b <> ", ptr " <> ba)
 
 -- | A stress-mode countdown on a pair of Ctx fields; gives an i1 that is
@@ -790,22 +945,72 @@ exitBlock = exitBlockNamed "exit"
 
 exitBlockNamed :: Text -> FnEnv -> Int -> Exit -> Gen Text
 exitBlockNamed base fe d e = do
-  let env = feEnv fe
-  ix <- addExit env e
-  sideBlock base $ do
-    writeFrame d
-    b <- frameBase fe
-    ap <- ctxField env oAp
-    emit ("store i64 " <> (if null (feEnclosing fe) then "%ap" else b) <> ", ptr " <> ap)
-    fp <- ctxField env oFp
-    emit ("store i64 " <> b <> ", ptr " <> fp)
-    sp <- ctxField env oSp
-    f <- fpPlus d
-    emit ("store i64 " <> f <> ", ptr " <> sp)
-    -- a worker's entry doesn't raise the high-water mark; its exits do
-    when (feWorker fe) (markWritten env f)
-    unwindEnclosing fe
-    retStatus fe (tshow ix)
+  ix <- addExit (feEnv fe) e
+  sideBlock base (joinShared fe d (exitLive fe d e) True Nothing (tshow ix))
+
+-- | Ends the current block by branching to the function's write-back
+-- block for the given key (see 'SharedKey'), which returns @status@ for
+-- this path. One such block serves every exit and unwind that writes the
+-- same thing, with the status as a phi: the write-back is most of a
+-- function's code otherwise (a slot is a load, an address and a store on
+-- each stack, for every slot at every exit; 72% of the lines of the
+-- suite's largest module on 2026-10-09). LLVM's mem2reg turns the slot
+-- loads of the shared block into phis of their own.
+--
+-- Only the slots in @live@ are written (every slot up to @d@ when it is
+-- Nothing): the rest are never read again, see 'liveAt'.
+--
+-- A slot holding a boolean as an i1 register has no value in its
+-- allocas; the shared block can't know which paths those are, so the
+-- closure is built and stored here, on the cold path, before the branch.
+joinShared :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()
+joinShared fe d live isExit ownFrame status = do
+  let slots = maybe [1 .. d] (filter (<= d) . IS.toAscList) live
+  kinds <- gets gsKinds
+  forM_ (IM.keys kinds) $ \k -> when (k `elem` slots) $ do
+    b <- loadB k
+    emit ("store i64 -1, ptr " <> uSlot k)
+    emit ("store ptr " <> b <> ", ptr " <> bSlot k)
+  let key = SharedKey d slots isExit (fmap (\(Pair ix fd) -> (ix, fd)) ownFrame) [(enIndex e, enBase e) | e <- D.toList (feEnclosing fe)]
+  from <- curLabel
+  shared <- gets gsShared
+  label <- case Map.lookup key shared of
+    Just (Shared l _ _) -> pure l
+    Nothing -> freshLabel "wb"
+  let pred_ = Pair status from
+      entry = case Map.lookup key shared of
+        Just (Shared l fe0 preds) -> Shared l fe0 (preds |> pred_)
+        Nothing -> Shared label fe (D.singleton pred_)
+  modify' (\s -> s {gsShared = Map.insert key entry (gsShared s)})
+  emit ("br label %" <> label)
+
+-- | Generates the function's shared write-back blocks (see 'joinShared').
+flushShared :: Gen ()
+flushShared = do
+  shared <- gets gsShared
+  modify' (\s -> s {gsKinds = IM.empty})
+  forM_ (Map.toList shared) $ \(SharedKey d slots isExit ownFrame _, Shared label fe preds) ->
+    sideBlockNamed label $ do
+      let env = feEnv fe
+      st <- fresh "st"
+      emit (st <> " = phi i64 " <> intercalateT ", " (fmap (\(Pair v from) -> "[ " <> v <> ", %" <> from <> " ]") preds))
+      writeSlots slots
+      when isExit $ do
+        b <- frameBase fe
+        ap <- ctxField env oAp
+        emit ("store i64 " <> (if null (feEnclosing fe) then "%ap" else b) <> ", ptr " <> ap)
+        fp <- ctxField env oFp
+        emit ("store i64 " <> b <> ", ptr " <> fp)
+        sp <- ctxField env oSp
+        f <- fpPlus d
+        emit ("store i64 " <> f <> ", ptr " <> sp)
+        -- a worker's entry doesn't raise the high-water mark; its exits do
+        when (feWorker fe) (markWritten env f)
+      forM_ ownFrame $ \(ix, fdepth) -> case feEnclosing fe of
+        Empty -> writeRecord env ix (fdepth - feBase fe) Nothing
+        e :<| _ -> writeRecord env ix (fdepth - enBase e) (Just "0")
+      unwindEnclosing fe
+      retStatus fe st
 
 -- | Terminates the current block with a resume exit at this section.
 exitResume :: FnEnv -> Int -> MSection -> Gen ()
@@ -1006,6 +1211,7 @@ genFunctionText fe body = do
     Nothing -> genHead fe body
     Just _ -> genSection fe arity body
   startBlock "unreachable"
+  flushShared
   gs <- get
   let block (Pair l is)
         | l == "unreachable" = D.empty
@@ -1034,7 +1240,7 @@ genFunctionText fe body = do
 genFastEntry :: FnEnv -> MSection -> Gen Text
 genFastEntry fe body = do
   s <- get
-  let gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = feArity fe, gsKinds = IM.empty, gsCaptured = Nothing, gsMaxPool = -1}
+  let gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = feArity fe, gsKinds = IM.empty, gsCaptured = Nothing, gsMaxPool = -1, gsShared = Map.empty}
       !(text, gs) = runState (genFunctionText fe body) gs0
   put
     s
@@ -1235,7 +1441,7 @@ genAuxFunction later fe loaded base body = do
       let name = feName fe <> "_r" <> tshow (gsNAux s)
           known = Pair name cell
           fe' = fe {feName = name, feArity = loaded, feCell = cell, feHead = Nothing, feBase = base, feEnclosing = D.empty, feWorker = False, feFast = Nothing, feSym = name, feInternal = False}
-          gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1, gsWorker = False}
+          gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1, gsWorker = False, gsShared = Map.empty}
           !(text, gs) = runState (genFunctionText fe' body) gs0
       case gsFailed gs of
         Just why -> put s {gsNotes = gsNotes gs |> (name <> ": " <> why)} >> pure Nothing
@@ -1565,7 +1771,7 @@ genLet fe d binding bcix@(CIx _ _ w) f body cell sect = case EC.lookup w (envCom
               bcell <- bodyCell
               ix <- addFrame env (Frame bcix f body bcell)
               bodyL <- freshLabel "body"
-              let fe' = fe {feEnclosing = Enclosing ix d bodyL m <| feEnclosing fe}
+              let fe' = fe {feEnclosing = Enclosing ix d bodyL m (liveAt env (currentBase fe) (d + m) body) <| feEnclosing fe}
               ok <- attempt (withKinds (genSection fe' d binding))
               if ok
                 then do
@@ -1609,6 +1815,12 @@ loadResults base m =
 -- size) and those of the enclosing bindings are written, and the status is
 -- passed on. If the callee can't be called, the interpreter resumes at
 -- @sect@.
+-- | The slots to write back when a call made at @base@ unwinds: what the
+-- body that gets the callee's @m@ results reads, and the enclosing
+-- bindings' bodies after it (see 'liveAt').
+bodyLive :: FnEnv -> Int -> Int -> MSection -> Maybe IS.IntSet
+bodyLive fe base m body = liveAt (feEnv fe) (currentBase fe) (base + m) body <+> enclosingLive fe
+
 genNonTailCall :: FnEnv -> Int -> Int -> Ptr NativeCell -> Deque Int -> Int -> MSection -> Maybe (Pair Int Int) -> Gen () -> Gen ()
 genNonTailCall fe d base ccell srcs m sect ownFrame continue
   | m == 1,
@@ -1648,7 +1860,7 @@ genNonTailCallWith fe d base getCallee getTop srcs m sect ownFrame continue = do
   emit (ok <> " = icmp eq i64 " <> r <> ", 0")
   -- the callee is exiting: record the frames the interpreter would have
   -- pushed, and pass the status along
-  unwind <- sideBlock "unwind" (unwindWith fe base ownFrame r)
+  unwind <- sideBlock "unwind" (unwindWith fe base (bodyLive fe base m sect) ownFrame r)
   contL <- freshLabel "cont"
   emit ("br i1 " <> ok <> ", label %" <> contL <> ", label %" <> unwind <> likely)
   startBlock contL
@@ -1681,15 +1893,8 @@ cStackGuard fe slow = do
 -- register @r@, which isn't OK: write the slots up to @base@ back to the
 -- stack, write the frame record for this @Let@ (if given) and those of
 -- the enclosing bindings, and return the status.
-unwindWith :: FnEnv -> Int -> Maybe (Pair Int Int) -> Text -> Gen ()
-unwindWith fe base ownFrame r = do
-  let env = feEnv fe
-  writeFrame base
-  forM_ ownFrame $ \(Pair ix fdepth) -> case feEnclosing fe of
-    Empty -> writeRecord env ix (fdepth - feBase fe) Nothing
-    e :<| _ -> writeRecord env ix (fdepth - enBase e) (Just "0")
-  unwindEnclosing fe
-  retStatus fe r
+unwindWith :: FnEnv -> Int -> Maybe IS.IntSet -> Maybe (Pair Int Int) -> Text -> Gen ()
+unwindWith fe base live ownFrame r = joinShared fe base live False ownFrame r
 
 -- | A call to a function of this module that has a worker, expecting one
 -- result: the arguments go in registers and the result comes back in
@@ -1760,7 +1965,7 @@ genWorkerCall fe d base wname srcs sect ownFrame continue = do
   sideBlockNamed unwindL $ do
     status <- fresh "status"
     emit (status <> " = phi i64 [ " <> st <> ", %" <> notOkL <> " ], [ " <> r2 <> ", %" <> tailL <> " ]")
-    unwindWith fe base ownFrame status
+    unwindWith fe base (bodyLive fe base 1 sect) ownFrame status
   startBlock contL
   u <- fresh "u"
   emit (u <> " = phi i64 [ " <> ru <> ", %" <> callL <> " ], [ " <> u2 <> ", %" <> tailOkL <> " ]")
