@@ -87,6 +87,27 @@ than deleting it.
   quality if the wait turns out to hurt. First measurement to take: the fixed cost of a trivial
   module, and the module count `on` produces on the suite (193 in the last run).
 
+- **Warm definitions, hot together.** (Paul, 2026-10-08.) At N/2 calls a definition is warm;
+  anything that calls a warm definition is warm, and anything a warm definition calls is warm
+  once it has N/4 calls. When any warm definition reaches N, every warm definition is hot and
+  they are compiled together: no clock, and the window from warm to hot is time for callers
+  and callees to join.
+
+  Reply (2026-10-08): the goals are the right ones, callers in the batch and no clock, and the
+  callee gate at N/4 is worth trying by itself. But the warm state adds nothing: the call graph
+  is static (the reverse index exists already) and the counts keep accumulating in the cells,
+  so at the moment a definition reaches N, a walk from it over the static graph, taking callees
+  with N/4 and callers by their count, finds exactly the set the warm marking would have
+  built. The one thing warmth could add is dynamic edges (closures, handlers), which the static
+  graph misses and which cost a write per call to record. Two changes to the rule: callers need
+  a count too (unconditional propagation, applied transitively, warms the whole program up to
+  `main` through any widely used helper; a caller called once with a hot loop is covered by the
+  loop's own counter), and the batch should be the component reached from the trigger, capped
+  at B, not one global warm set. So: `formBatch` with the callee gate at N/4, an explicit
+  caller gate, and the walk made transitive in both directions. What it doesn't fix: the two
+  timing regimes, which come from whether a neighbour is already compiled when the batch forms;
+  private copies are the remedy there.
+
 - **Recompile recently compiled callees with the callers that arrive later.** (Paul,
   2026-10-04.) Keep recently compiled definitions in the compile thread for a while (LRU or
   `SemispaceCache`); when a new caller enters the pending set and depends on one, include

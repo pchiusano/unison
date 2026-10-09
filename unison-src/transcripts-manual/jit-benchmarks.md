@@ -206,6 +206,30 @@ hashLoop n =
   go acc i = if i == n then acc else go (acc Nat.+ ##Universal.murmurHashUntyped (Some (i, "x"))) (i Nat.+ 1)
   go 0 0
 
+-- A callee that is first reached after its caller is hot: the first 20000
+-- iterations take the other branch (the batch forms on the compile thread
+-- about a millisecond after the trigger, a thousand or so iterations, so
+-- the phase has to be long). The breadth batch rule judges a callee
+-- by its own count, zero here, so the caller is compiled without it; when
+-- the callee is reached it exits to the interpreter until its own count
+-- makes it hot, and is then compiled alone and called through its cell
+-- from the caller's native code for the rest of the run. The weighted rule
+-- weighs the edge by the caller's count (one site, once per call) and
+-- takes the callee along, so the call is direct and LLVM inlines it.
+oneInThree : Nat -> Nat
+oneInThree x = x * 7 + 3
+
+-- The call is not in tail position, which keeps Unison's own inliner
+-- from inlining the callee (ANF.Optimize: a body with bindings is only
+-- inlined at a tail call).
+mostlyInline : Nat -> Nat
+mostlyInline x = if x < 20000 then x + 1 else oneInThree x + 1
+
+branchCalls : Nat -> Nat
+branchCalls n =
+  go acc i = if i == n then acc else go (acc + mostlyInline i) (i + 1)
+  go 0 0
+
 jitSuite : '{IO, Exception} ()
 jitSuite = do
   printTime "Sum 0 to 1 million" 1 (n -> repeat n do sumTo 1000000)
@@ -223,6 +247,7 @@ jitSuite = do
   printTime "Apply a function argument 10000 times" 1 (n -> repeat n do applyN 10000 (x -> x + 3) 0)
   printTime "Mutate a Ref 10000 times" 1 (n -> repeat n do refLoop 10000)
   printTime "Calls across definitions: Collatz steps for 1 to 1000" 1 (n -> repeat n do collatzTotal 1000)
+  printTime "Calls across definitions: callee first reached once the caller is hot, 100000 iterations" 1 (n -> repeat n do branchCalls 100000)
   printTime "Text: append \"hi\" 10000 times" 1 (n -> repeat n do textAppend 10000)
   printTime "Text: drop 1, 100000 times" 1 let
     t = Text.repeat 100000 "a"

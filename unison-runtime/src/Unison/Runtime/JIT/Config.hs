@@ -3,6 +3,7 @@
 -- variable. How to use these is in development.md next to this module.
 module Unison.Runtime.JIT.Config
   ( Mode (..),
+    BatchRule (..),
     Config (..),
     config,
     jitLog,
@@ -31,6 +32,15 @@ data Mode
     Eager
   deriving (Show, Eq)
 
+-- | How the compile thread picks the definitions to compile together
+-- with one that got hot (JIT.formBatch).
+data BatchRule
+  = -- | breadth first over callees and callers, with count gates
+    Breadth
+  | -- | by estimated calls across the edge to the batch, with one gate
+    Weighted
+  deriving (Show, Eq)
+
 data Config = Config
   { mode :: Mode,
     -- | with 'On': interpreted calls before a definition is compiled
@@ -39,6 +49,13 @@ data Config = Config
     -- | with 'On': the most definitions compiled together as one module
     -- (@UNISON_JIT_BATCH@)
     batch :: Int,
+    -- | with 'On': how a batch is formed (@UNISON_JIT_BATCH_RULE@:
+    -- @breadth@ or @weighted@)
+    batchRule :: BatchRule,
+    -- | with the weighted rule: the estimated calls between a definition
+    -- and the batch that make it join (@UNISON_JIT_BATCH_GATE@; a quarter
+    -- of the threshold by default)
+    batchGate :: Int,
     -- | with 'On': a compiled callee of a definition being compiled is
     -- compiled again as a private copy in the new module, so that calls to
     -- it are direct and LLVM can inline it, when the callee's estimated
@@ -121,6 +138,8 @@ config = unsafePerformIO $ do
   every <- lookupEnv "UNISON_JIT_STATS_EVERY"
   thresh <- lookupEnv "UNISON_JIT_THRESHOLD"
   batchSize <- lookupEnv "UNISON_JIT_BATCH"
+  rule <- lookupEnv "UNISON_JIT_BATCH_RULE"
+  gate <- lookupEnv "UNISON_JIT_BATCH_GATE"
   copyB <- lookupEnv "UNISON_JIT_COPY"
   reWait <- lookupEnv "UNISON_JIT_REENTRY_WAIT"
   cost <- lookupEnv "UNISON_JIT_EXIT_COST"
@@ -138,6 +157,10 @@ config = unsafePerformIO $ do
           _ -> Off,
         threshold = max 1 (fromMaybe 100 (thresh >>= readMaybe)),
         batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
+        batchRule = case map toLower (fromMaybe "breadth" rule) of
+          "weighted" -> Weighted
+          _ -> Breadth,
+        batchGate = max 1 (fromMaybe (max 1 (fromMaybe 100 (thresh >>= readMaybe)) `div` 4) (gate >>= readMaybe)),
         copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
         reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),

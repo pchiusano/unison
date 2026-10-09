@@ -256,6 +256,23 @@ indexCallers cache (Callers seen callers) =
 groupDeps :: Word64 -> MCombs -> [Word64]
 groupDeps g cmbs = Set.toList (Set.delete g (Set.fromList [d | (_, c) <- EC.mapToList cmbs, d <- combDeps c]))
 
+-- | Which side of an edge a batch member is on.
+data Role = Callee | Caller
+
+-- | The estimated calls from a group's code to group @d@: for each of its
+-- combinators, the combinator's own call count times the static call
+-- sites of @d@ in it.
+edgeCalls :: MCombs -> Word64 -> IO Double
+edgeCalls cmbs d = fmap sum . forM (EC.mapToList cmbs) $ \(_, c) -> case c of
+  Comb (LamI _ _ _ cell)
+    | cell /= noNativeCell,
+      sites <- length (filter (== d) (combDeps c)),
+      sites > 0 -> do
+        -- counts start at minus the threshold
+        n <- readNativeCount cell
+        pure (fromIntegral (max 0 (n + threshold config)) * fromIntegral sites)
+  _ -> pure 0
+
 -- | Serves requests, forever. LLVM is only ever used from this thread (in
 -- @on@ mode); it is normally loaded at startup already, and if not, by the
 -- first request.
@@ -335,36 +352,95 @@ compileThread = do
               guarded (unitName u) (compileUnits st types ("unison_" ++ unitName u) True [u])
               dropPending u
     -- The definitions to compile together with one that got hot, so that
-    -- calls between them are direct and LLVM can inline across them:
-    -- breadth first over what it calls and what calls it, up to the batch
-    -- size. A callee usually gets hot before its callers do (it is called
-    -- at least as often), so the callers are what a batch mostly gains. A
-    -- definition is taken if it isn't in a batch already and it is in use:
-    -- its own request is waiting in the queue (it got hot while this one
-    -- waited; the request is dropped when it comes up), or, for a callee,
-    -- it has been called at least half the threshold, for a caller, once.
-    formBatch cache callers grp = go [grp] (Set.singleton grp) [grp]
-      where
-        full taken = length taken >= batch config
-        go taken _ [] = pure (reverse taken)
-        go taken seen (g : queue)
-          | full taken = pure (reverse taken)
-          | otherwise = do
-              let callees = maybe [] (groupDeps g) (EC.lookup g cache)
-                  around = map ((,) (max 1 (threshold config `div` 2))) callees ++ map ((,) 1) (Set.toList (Map.findWithDefault Set.empty g callers))
-              (taken', seen', new) <- foldM consider (taken, seen, []) around
-              go taken' seen' (queue ++ reverse new)
-        consider acc@(taken, seen, new) (enough, d)
-          | Set.member d seen || full taken = pure acc
-          | otherwise = do
-              claimed <- case EC.lookup d cache >>= entryCell of
-                Nothing -> pure False
-                Just cell -> do
-                  -- counts start at minus the threshold
-                  n <- readNativeCount cell
-                  hot <- nativeCellRequested cell
-                  if hot || n + threshold config >= enough then takeNativeCell cell else pure False
-              pure (if claimed then (d : taken, Set.insert d seen, d : new) else (taken, Set.insert d seen, new))
+    -- calls between them are direct and LLVM can inline across them. The
+    -- batch grows from the hot definition one neighbour at a time, a
+    -- callee or a caller of something already in it, up to the batch
+    -- size; a definition already in a batch (or compiled) can't join, and
+    -- one whose own request is waiting in the queue always does (it got
+    -- hot while this one waited; its request is dropped when it comes
+    -- up). The rule decides which neighbour comes next and when to stop:
+    --
+    -- * 'Breadth': in the order found (callees of each member, then its
+    --   callers), a callee taken if it has been called at least half the
+    --   threshold, a caller if called at all; one that fails is not
+    --   looked at again.
+    -- * 'Weighted': the neighbour with the most estimated calls across
+    --   its edges to the batch so far (every static call site of a
+    --   combinator is taken to run once per call of that combinator, so
+    --   the count of the combinator holding the site is the estimate, and
+    --   a site inside a local loop counts the loop's own calls), taken
+    --   once those calls reach the gate. One that falls short stays a
+    --   candidate: a later member may bring it more edges.
+    --
+    -- A callee usually gets hot before its callers do (it is called at
+    -- least as often), so the callers are what a batch mostly gains.
+    formBatch cache callers grp = do
+      seq0 <- newIORef (0 :: Int)
+      let full taken = length taken >= batch config
+          -- the neighbours of g, with the role g plays for each
+          around g = map ((,) Callee) (maybe [] (groupDeps g) (EC.lookup g cache)) ++ map ((,) Caller) (Set.toList (Map.findWithDefault Set.empty g callers))
+          -- what joining the batch through this edge is worth
+          weight role g v = case batchRule config of
+            Breadth -> pure 1
+            Weighted -> case role of
+              Callee -> maybe (pure 0) (`edgeCalls` v) (EC.lookup g cache)
+              Caller -> maybe (pure 0) (`edgeCalls` g) (EC.lookup v cache)
+          -- adds g's neighbours to the candidates, or more weight to ones already there
+          expand g (seen, cands) = foldM add cands (around g)
+            where
+              add cs (role, v)
+                | Set.member v seen = pure cs
+                | otherwise = do
+                    w <- weight role g v
+                    n <- readIORef seq0
+                    writeIORef seq0 (n + 1)
+                    pure (Map.insertWith (\(w', _, _) (w0, s0, r0) -> (w0 + w', s0, r0)) v (w, n, role) cs)
+          -- whether a candidate may join now
+          passes v (w, _, role) = case EC.lookup v cache >>= entryCell of
+            Nothing -> pure False
+            Just cell -> do
+              hot <- nativeCellRequested cell
+              when (logging config) $ do
+                n <- readNativeCount cell
+                jitLog ("  candidate " ++ show v ++ (case role of Callee -> " (callee)"; Caller -> " (caller)") ++ ": " ++ show (n + threshold config) ++ " calls, weight " ++ show w ++ (if hot then ", requested" else ""))
+              if hot
+                then pure True
+                else case batchRule config of
+                  Breadth -> do
+                    -- counts start at minus the threshold
+                    n <- readNativeCount cell
+                    let enough = case role of
+                          Callee -> max 1 (threshold config `div` 2)
+                          Caller -> 1
+                    pure (n + threshold config >= enough)
+                  Weighted -> pure (w >= fromIntegral (batchGate config))
+          -- the next candidate to look at: most weight, then earliest seen
+          best = Map.foldlWithKey' (\acc v (w, n, r) -> case acc of
+                                      Just (_, (w', n', _)) | (w', negate n') >= (w, negate n) -> acc
+                                      _ -> Just (v, (w, n, r))) Nothing
+          go taken seen cands
+            | full taken = pure (reverse taken)
+            | otherwise = case batchRule config of
+                Breadth -> case best cands of
+                  Nothing -> pure (reverse taken)
+                  Just (v, c) -> do
+                    ok <- passes v c
+                    claim taken seen (Map.delete v cands) v ok
+                Weighted -> do
+                  passing <- Map.traverseMaybeWithKey (\v c -> (\ok -> if ok then Just c else Nothing) <$> passes v c) cands
+                  case best passing of
+                    Nothing -> pure (reverse taken)
+                    Just (v, _) -> claim taken seen (Map.delete v cands) v True
+          claim taken seen cands v ok = do
+            claimed <- if ok then maybe (pure False) takeNativeCell (EC.lookup v cache >>= entryCell) else pure False
+            let seen' = Set.insert v seen
+            if claimed
+              then expand v (seen', cands) >>= go (v : taken) seen'
+              else go taken seen' cands
+      cands0 <- expand grp (Set.singleton grp, Map.empty)
+      members <- go [grp] (Set.singleton grp) cands0
+      when (length members > 1) $ jitLog ("batch for " ++ show grp ++ ": " ++ unwords (map show members))
+      pure members
     -- The compiled callees of the batch that are worth a private copy in
     -- its module (see 'copyUnits'): those where a call is a real share of
     -- the work per call, by the estimate's path saving, and that don't
