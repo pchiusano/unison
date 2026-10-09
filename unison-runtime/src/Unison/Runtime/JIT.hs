@@ -10,7 +10,7 @@ module Unison.Runtime.JIT
   )
 where
 
-import Control.Concurrent (forkIO)
+import Control.Concurrent (forkOn, getNumCapabilities, myThreadId, threadCapability, yield)
 import Control.Concurrent.STM (TBQueue, atomically, isFullTBQueue, newTBQueueIO, readTBQueue, readTVarIO, writeTBQueue)
 import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (foldM, forM, forM_, unless, void, when)
@@ -70,7 +70,12 @@ startCompiler = case mode config of
   Eager -> void initJIT
   On -> do
     first <- atomicModifyIORef' compileThreadStarted (\started -> (True, not started))
-    when first (void (forkIO compileThread))
+    -- On a capability other than this thread's, so that the compile
+    -- thread and the interpreter don't slow each other down.
+    when first $ do
+      (cap, _) <- threadCapability =<< myThreadId
+      n <- getNumCapabilities
+      void (forkOn ((cap + 1) `mod` n) compileThread)
 
 -- | Loads LLVM at startup, when the JIT is turned on, and says how it
 -- went: Nothing when the JIT is off, otherwise whether it is activated,
@@ -175,7 +180,7 @@ jitCompileGroup sandbox ref grp cmbs = case mode config of
 data Request
   = -- | compile this definition: its group number, and how to read the
     -- code cache (every group's combinators, and their references)
-    ReqGroup !Word64 !Bool (IO (EC.EnumMap Word64 MCombs, EC.EnumMap Word64 Reference))
+    ReqGroup !Word64 !Bool !Word64 (IO (EC.EnumMap Word64 MCombs, EC.EnumMap Word64 Reference))
   | -- | generate a re-entry function that was left for later
     ReqUnit Unit
 
@@ -217,10 +222,19 @@ jitRequestGroup cc (CIx _ grp _) cell
       forM_ (EC.lookup grp cache >>= entryCell) $ \entry -> do
         mine <- claimNativeCell entry
         when mine $ do
-          queued <- offer (ReqGroup grp (sandboxed cc) ((,) <$> readTVarIO (combs cc) <*> readTVarIO (combRefs cc)))
-          unless queued $ do
-            releaseNativeCell entry
-            writeNativeCount cell (-1024)
+          t0 <- getMonotonicTimeNSec
+          queued <- offer (ReqGroup grp (sandboxed cc) t0 ((,) <$> readTVarIO (combs cc) <*> readTVarIO (combRefs cc)))
+          if queued
+            then
+              -- Entering the scheduler is what hands a runnable thread to an
+              -- idle capability: without this the compile thread, if it is
+              -- on this capability, starts at this capability's next GC or
+              -- context-switch tick, a thousand interpreted calls later on
+              -- an optimized build (UNISON_JIT_LOG reports the lag).
+              yield
+            else do
+              releaseNativeCell entry
+              writeNativeCount cell (-1024)
 {-# NOINLINE jitRequestGroup #-}
 
 -- | Asks for the re-entry function that belongs in this cell to be
@@ -328,7 +342,10 @@ compileThread = do
     serve initialized callersRef req =
       withState initialized $ \st types -> do
           case req of
-            ReqGroup grp sandbox find -> do
+            ReqGroup grp sandbox t0 find -> do
+              when (logging config) $ do
+                t1 <- getMonotonicTimeNSec
+                jitLog ("request for " ++ show grp ++ " served after " ++ show ((t1 - t0) `div` 1000) ++ " us")
               (cache, refs) <- find
               -- a request whose definition went into an earlier batch is dropped
               mine <- maybe (pure False) takeNativeCell (EC.lookup grp cache >>= entryCell)

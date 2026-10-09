@@ -68,19 +68,19 @@ than deleting it.
 
 ## Batching tweaks
 
-- **The batch forms about a millisecond after the trigger.** The compile thread blocks on
-  the request queue; the interpreter's `writeTBQueue` makes it runnable, and it then runs
-  only when a capability schedules it, which for the interpreter's own capability is its
-  next yield (a heap check that finds the context-switch flag set, or a GC), since the
-  interpreter's loop has no other scheduling point. Measured 2026-10-08 while building the
-  benchmark in [2026-10-08](benchmarks/2026-10-08-weighted-batches.md): on the optimized
-  build the benchmark had to keep its callee unreached for 20,000 iterations for the batch
-  to see it uncalled, where 1,000 wasn't enough; on the fast build the batch formed about 40
-  calls after the trigger. Two consequences: every count-based gate judges counts that are a
-  thousand calls ahead of the trigger, and first-install latency has this as a floor, before
-  the compile itself. Things to try: `forkOn` a capability other than the interpreter's for
-  the compile thread, and measuring the lag directly (a timestamp in the request, compared
-  at batch time). It may also be part of the two timing regimes.
+- **The lag between a request and its batch** (measured and settled 2026-10-09,
+  [benchmarks](benchmarks/2026-10-09-compile-thread-wake-up.md)). A request carries its
+  time, and the log reports how long it waited. Idle compile thread: about 40 µs, on both
+  builds. But a thread woken on a busy capability runs only at that capability's next
+  scheduling point, and `forkIO` had put the compile thread on the capability of the thread
+  that started the runtime; when that was the interpreter's, the first request waited up to
+  1.2 ms, which is what made the batching benchmark need a 20,000-iteration warm-up. Now the
+  compile thread is forked with `forkOn` onto another capability and a request yields after
+  queuing, and the first request takes 36 µs every time. On the suite the distributions with
+  and without are the same (median 36 µs against 37), since there the two threads mostly
+  weren't sharing a capability anyway. What remains of the lag is the compile in progress: a
+  request that arrives during one waits for it, 10 ms to 1 s, which is the first-install
+  latency that matters and the argument for bounding a module's size.
 
 - **Two-stage batching** (superseded 2026-10-08 by the weighted batch rule, below). The idea here is when a function becomes hot, add it to a pending compilation batch along with (breadth-first) traversal of up to D of its transitive dependencies. Then wait for the pending batch to reach size B (or perhaps up to 30s if pending batch stops growing). Compile those ~ B definitions together. The idea is this forms better batches which include related collections of callers and callees, better than compiling batches more eagerly. I also wonder if this approach can be used when lazily compiling re-entry points. If the re-entry functions are added to the pending batch, then there's an opportunity for multiple re-entry points to get compiled together.
 

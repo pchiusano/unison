@@ -24,3 +24,4 @@ against.
 | [2026-10-05 every benchmark, end of M7](2026-10-05-every-benchmark-end-of-m7.md) | the closing tables of M7 |
 | [2026-10-07 LLVM loaded at run time](2026-10-07-llvm-loaded-at-run-time.md) | every benchmark after the switch to `dlopen`; unchanged from the end of M7 |
 | [2026-10-08 weighted batches](2026-10-08-weighted-batches.md) | the weighted batch rule against the breadth-first walk, and the benchmark that separates them |
+| [2026-10-09 compile thread wake-up](2026-10-09-compile-thread-wake-up.md) | request-to-batch lag, with the compile thread on its own capability |
