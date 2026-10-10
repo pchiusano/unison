@@ -367,7 +367,7 @@ compileUnits st types modName lazy candidates = do
       -- a private copy gets internal linkage, so that LLVM drops it once it
       -- is inlined at every call
       env local workers u (base, fbase, cells) =
-        CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) (uCombs u) poolIxs (jsRts st) typeArities cells disabledD lazy (Map.findWithDefault Map.empty (uRoot u) memos) local workers (uSandboxed u) (uCopy u)
+        CG.Env (jsLayouts st) (jsCtx st) base fbase (stressPoll config > 0) (stressCallee config > 0) (exitCall config) (uCombs u) poolIxs (jsRts st) typeArities cells disabledD lazy (Map.findWithDefault Map.empty (uRoot u) memos) local workers (uSandboxed u) (uCopy u)
       -- The functions that get a worker: calls to them from this module
       -- pass arguments and results in registers (design.md, "Workers").
       workersOf us

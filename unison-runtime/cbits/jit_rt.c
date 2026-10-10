@@ -12,6 +12,7 @@
 #include <limits.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdarg.h>
 
 // Field offsets, so the Haskell side can check that its picture of Ctx matches this one.
 // The order matches the fields of UnisonJitCtx.
@@ -106,6 +107,7 @@ static int64_t bump_alloc = 1;
 // (GHC links with -dead_strip), so each is referred to here, from a function
 // that is certainly kept.
 void *unison_jit_alloc_words(UnisonJitCtx *ctx, int64_t n);
+int64_t unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *desc, int64_t status, int64_t fp, int64_t ap, ...);
 void unison_jit_write_mutvar(UnisonJitCtx *ctx, StgMutVar *mv, StgClosure *v);
 int64_t unison_jit_list_size(void *list);
 void *unison_jit_list_view(UnisonJitCtx *ctx, void *list, void *empty, int64_t elem_tag, int64_t left);
@@ -195,7 +197,7 @@ void *unison_jit_helpers[] = {
     (void *)&unison_jit_barray_from_bytes, (void *)&unison_jit_barray_new,     (void *)&unison_jit_barray_contents,
     (void *)&unison_jit_parray_new,      (void *)&unison_jit_parray_copy,      (void *)&unison_jit_parray_freeze,
     (void *)&unison_jit_ref_new,         (void *)&unison_jit_ref_read_for_cas, (void *)&unison_jit_ref_cas,
-    (void *)&unison_jit_murmur,
+    (void *)&unison_jit_murmur,         (void *)&unison_jit_exit_frame,
 };
 
 void unison_jit_configure(int64_t poll_every, int64_t callee_every, int64_t cstack, int64_t alloc,
@@ -3932,3 +3934,52 @@ int64_t unison_jit_probe(StgClosure **elems, int64_t n, int64_t *out) {
 
 // For tracing: the current value of HpLim, as native code would see it.
 int64_t unison_jit_hplim_value(void) { return (int64_t)*unison_jit_hplim_address(); }
+
+// ---- Exits
+//
+// Where native code hands a frame back to the interpreter (an exit, or an
+// unwind after a callee exited), it calls this with the frame's live slots
+// as variadic arguments instead of writing them itself: one call
+// instruction per site, where the generated stores were most of a
+// function's code (see "Write-back" in internals.md). What to do with them
+// is a constant descriptor in the module, built by Codegen.joinCall:
+//
+//   [flags, base, fbase, depth, nslots, nrecs, slot offsets..., records...]
+//
+// flags bit 0: an exit, so record ap, fp and sp in the context (fp + base
+// is the interpreter's frame base, fp + depth its stack pointer); bit 1:
+// the code is not inside an inline binding, so ap is the ap argument,
+// otherwise it is the frame base. Each slot is a word and a pointer, in
+// the argument order of the offsets. Each record is three words (frame
+// table index, frame size, pending arguments), written after the frame
+// records already there; a negative pending count means fp + fbase - ap,
+// the count of the outermost frame. Returns the status, so that the call
+// is the site's last instruction but the return.
+int64_t unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *d, int64_t status, int64_t fp, int64_t ap, ...) {
+  int64_t flags = d[0], base = d[1], fbase = d[2], depth = d[3], nslots = d[4], nrecs = d[5];
+  const int64_t *slots = d + 6, *recs = slots + nslots;
+  int64_t *ustk = ctx->ustk;
+  void **bstk = ctx->bstk;
+  va_list va;
+  va_start(va, ap);
+  for (int64_t i = 0; i < nslots; i++) {
+    int64_t k = fp + slots[i];
+    ustk[k] = va_arg(va, int64_t);
+    bstk[k] = va_arg(va, void *);
+  }
+  va_end(va);
+  if (flags & 1) {
+    ctx->ap = (flags & 2) ? ap : fp + base;
+    ctx->fp = fp + base;
+    ctx->sp = fp + depth;
+    if (fp + depth > ctx->max_sp) ctx->max_sp = fp + depth;
+  }
+  int64_t *fr = ctx->frames + 3 * ctx->n_frames;
+  for (int64_t i = 0; i < nrecs; i++, recs += 3, fr += 3) {
+    fr[0] = recs[0];
+    fr[1] = recs[1];
+    fr[2] = recs[2] < 0 ? fp + fbase - ap : recs[2];
+  }
+  ctx->n_frames += nrecs;
+  return status;
+}

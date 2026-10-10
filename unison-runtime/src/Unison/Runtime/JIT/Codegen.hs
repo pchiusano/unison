@@ -103,6 +103,8 @@ data Env = Env
     envStressPoll :: !Bool,
     -- | emit the stress-mode "callee not compiled" countdown
     envStressCallee :: !Bool,
+    -- | exits write the frame back through a call (see 'joinCall')
+    envExitCall :: !Bool,
     -- | the group being compiled, for the arity of Let body combinators
     envCombs :: !MCombs,
     -- | pool index of every constant this group uses
@@ -242,6 +244,7 @@ modulePrelude =
       "declare i64 @unison_jit_ref_cas(ptr, ptr, ptr, i64, ptr)",
       "declare { i64, i64 } @unison_jit_murmur(i64, ptr)",
       "declare ptr @unison_jit_alloc_words(ptr, i64)",
+      "declare i64 @unison_jit_exit_frame(ptr, ptr, i64, i64, i64, ...)",
       "declare void @unison_jit_write_mutvar(ptr, ptr, ptr)",
       "declare i64 @unison_jit_list_size(ptr)",
       "declare ptr @unison_jit_list_view(ptr, ptr, ptr, i64, i64)",
@@ -363,7 +366,11 @@ data GS = GS
     gsWorker :: !Bool,
     -- | the shared write-back blocks of the function being generated
     -- (see 'joinShared'), by what they write; generated at the end
-    gsShared :: !(Map.Map SharedKey Shared)
+    gsShared :: !(Map.Map SharedKey Shared),
+    -- | the exit descriptors of the function being generated (see
+    -- 'joinCall'): the global's name by its contents, and the globals
+    gsDescs :: !(Map.Map Text Text),
+    gsDescText :: !(Deque Text)
   }
 
 -- | What a write-back block does, which is all that exits and unwinds
@@ -417,7 +424,9 @@ initialState maxK cells known worker =
       gsDeferred = D.empty,
       gsNotWorker = False,
       gsWorker = worker,
-      gsShared = Map.empty
+      gsShared = Map.empty,
+      gsDescs = Map.empty,
+      gsDescText = D.empty
     }
 
 -- | Gives up on the function (or on what 'attempt' is trying).
@@ -964,8 +973,66 @@ exitBlockNamed base fe d e = do
 -- allocas; the shared block can't know which paths those are, so the
 -- closure is built and stored here, on the cold path, before the branch.
 joinShared :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()
-joinShared fe d live isExit ownFrame status = do
-  let slots = maybe [1 .. d] (filter (<= d) . IS.toAscList) live
+joinShared fe d live isExit ownFrame status
+  | envExitCall (feEnv fe) = joinCall fe d live isExit ownFrame status
+  | otherwise = joinBlock fe d live isExit ownFrame status
+
+-- | The slots a write-back writes: the live ones up to the depth.
+liveSlots :: Int -> Maybe IS.IntSet -> [Int]
+liveSlots d live = maybe [1 .. d] (filter (<= d) . IS.toAscList) live
+
+-- | Ends the current block with the write-back as one call to the C
+-- routine @unison_jit_exit_frame@ (jit_rt.c), the live slots as its
+-- variadic arguments and the rest (what to do with them: the offsets, the
+-- depth, the frame records) as a constant descriptor of the module, then
+-- returns the status it gives back. The site is then one instruction
+-- where the blocks of 'joinBlock' are six per slot; LLVM spills each
+-- argument to the outgoing area, the same stores the blocks made, and
+-- nothing else of the write-back goes through the optimizer or the
+-- backend. The default since 2026-10-09 (@UNISON_JIT_EXITS@).
+joinCall :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()
+joinCall fe d live isExit ownFrame status = do
+  let slots = liveSlots d live
+      base = feBase fe
+      -- the records, as 'flushShared' writes them: the binding being
+      -- unwound, then the enclosing bindings innermost first; a pending
+      -- count of -1 is "fpb - ap", computed by the routine
+      own = case (ownFrame, feEnclosing fe) of
+        (Nothing, _) -> []
+        (Just (Pair ix fdepth), Empty) -> [[ix, fdepth - base, -1]]
+        (Just (Pair ix fdepth), e :<| _) -> [[ix, fdepth - enBase e, 0]]
+      enclosing = go (feEnclosing fe)
+        where
+          go Empty = []
+          go (e :<| outer) = case outer of
+            Empty -> [enIndex e, enBase e - base, -1] : go outer
+            o :<| _ -> [enIndex e, enBase e - enBase o, 0] : go outer
+      recs = own ++ enclosing
+      flags = (if isExit then 1 else 0) + (if null (feEnclosing fe) then 2 else 0) :: Int
+      header = [flags, currentBase fe, base, d, length slots, length recs]
+      contents = intercalateT ", " (D.fromList (map (("i64 " <>) . tshow) (header ++ slots ++ concat recs)))
+  when isExit (useK d)
+  vals <- forM slots $ \k -> useK k >> (Pair <$> loadU k <*> loadB k)
+  descs <- gets gsDescs
+  name <- case Map.lookup contents descs of
+    Just n -> pure n
+    Nothing -> do
+      let n = "@" <> feSym fe <> ".x" <> tshow (Map.size descs)
+          n' = tshow (length header + length slots + 3 * length recs)
+      modify' $ \s ->
+        s
+          { gsDescs = Map.insert contents n descs,
+            gsDescText = gsDescText s |> (n <> " = private unnamed_addr constant [" <> n' <> " x i64] [" <> contents <> "]")
+          }
+      pure n
+  r <- fresh "st"
+  emit (r <> " = call i64 (ptr, ptr, i64, i64, i64, ...) @unison_jit_exit_frame(ptr %ctx, ptr " <> name <> ", i64 " <> status <> ", i64 %fp, i64 %ap" <> argList (D.fromList vals) <> ")")
+  retStatus fe r
+
+-- | 'joinShared' with generated write-back blocks (@UNISON_JIT_EXITS=blocks@).
+joinBlock :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()
+joinBlock fe d live isExit ownFrame status = do
+  let slots = liveSlots d live
   kinds <- gets gsKinds
   forM_ (IM.keys kinds) $ \k -> when (k `elem` slots) $ do
     b <- loadB k
@@ -1233,14 +1300,14 @@ genFunctionText fe body = do
               <> ") {"
         | otherwise = "define " <> (if feInternal fe then "internal " else "") <> "i64 @" <> feSym fe <> "(ptr %ctx, i64 %ap, i64 %fp.in, i64 %sp) {"
   pure . unlinesT $
-    (header <| entry) <> foldMap block (gsBlocks gs) |> "}"
+    gsDescText gs <> (header <| entry) <> foldMap block (gsBlocks gs) |> "}"
 
 -- | Generates a worker's fast entry (see 'feFast') as a function of its
 -- own. Its exits (there are none that can be taken) join the function's.
 genFastEntry :: FnEnv -> MSection -> Gen Text
 genFastEntry fe body = do
   s <- get
-  let gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = feArity fe, gsKinds = IM.empty, gsCaptured = Nothing, gsMaxPool = -1, gsShared = Map.empty}
+  let gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = feArity fe, gsKinds = IM.empty, gsCaptured = Nothing, gsMaxPool = -1, gsShared = Map.empty, gsDescs = Map.empty, gsDescText = D.empty}
       !(text, gs) = runState (genFunctionText fe body) gs0
   put
     s
@@ -1441,7 +1508,7 @@ genAuxFunction later fe loaded base body = do
       let name = feName fe <> "_r" <> tshow (gsNAux s)
           known = Pair name cell
           fe' = fe {feName = name, feArity = loaded, feCell = cell, feHead = Nothing, feBase = base, feEnclosing = D.empty, feWorker = False, feFast = Nothing, feSym = name, feInternal = False}
-          gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1, gsWorker = False, gsShared = Map.empty}
+          gs0 = s {gsFresh = 0, gsBlocks = D.empty, gsCur = Pair "head" D.empty, gsMaxK = loaded, gsKinds = IM.empty, gsFailed = Nothing, gsCells = cells, gsNAux = gsNAux s + 1, gsCaptured = Nothing, gsMaxPool = -1, gsWorker = False, gsShared = Map.empty, gsDescs = Map.empty, gsDescText = D.empty}
           !(text, gs) = runState (genFunctionText fe' body) gs0
       case gsFailed gs of
         Just why -> put s {gsNotes = gsNotes gs |> (name <> ": " <> why)} >> pure Nothing

@@ -55,6 +55,12 @@ data Config = Config
     -- code; @default<O2>@ itself and @UNISON_JIT_CODEGEN_LEVEL@ (which
     -- jit_llvm.c reads itself) are there for comparison.
     passes :: String,
+    -- | exits and unwinds write the frame back through one call to the C
+    -- routine @unison_jit_exit_frame@ per site, the live slots as its
+    -- arguments, rather than through generated write-back blocks
+    -- (@UNISON_JIT_EXITS=call@, the default, or @blocks@). See
+    -- Codegen.joinShared.
+    exitCall :: Bool,
     -- | with 'On': a compiled callee of a definition being compiled is
     -- compiled again as a private copy in the new module, so that calls to
     -- it are direct and LLVM can inline it, when the callee's estimated
@@ -140,6 +146,7 @@ config = unsafePerformIO $ do
   gate <- lookupEnv "UNISON_JIT_BATCH_GATE"
   sizeU <- lookupEnv "UNISON_JIT_SIZE_UNIT"
   pipeline <- lookupEnv "UNISON_JIT_PASSES"
+  exits <- lookupEnv "UNISON_JIT_EXITS"
   copyB <- lookupEnv "UNISON_JIT_COPY"
   reWait <- lookupEnv "UNISON_JIT_REENTRY_WAIT"
   cost <- lookupEnv "UNISON_JIT_EXIT_COST"
@@ -160,6 +167,7 @@ config = unsafePerformIO $ do
         batchGate = max 1 (fromMaybe (max 1 (fromMaybe 100 (thresh >>= readMaybe)) `div` 4) (gate >>= readMaybe)),
         sizeUnit = max 1 (fromMaybe 500 (sizeU >>= readMaybe)),
         passes = fromMaybe defaultPasses pipeline,
+        exitCall = fmap (map toLower) exits /= Just "blocks",
         copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
         reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),
