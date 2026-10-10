@@ -107,7 +107,12 @@ static int64_t bump_alloc = 1;
 // (GHC links with -dead_strip), so each is referred to here, from a function
 // that is certainly kept.
 void *unison_jit_alloc_words(UnisonJitCtx *ctx, int64_t n);
-int64_t unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *desc, int64_t status, int64_t fp, int64_t ap, ...);
+#if defined(__clang__)
+#define EXIT_FRAME_CC __attribute__((preserve_most))
+#else
+#error "unison_jit_exit_frame needs the preserve_most attribute; see Codegen.joinCall"
+#endif
+EXIT_FRAME_CC void unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *desc, int64_t fp, int64_t ap, ...);
 void unison_jit_write_mutvar(UnisonJitCtx *ctx, StgMutVar *mv, StgClosure *v);
 int64_t unison_jit_list_size(void *list);
 void *unison_jit_list_view(UnisonJitCtx *ctx, void *list, void *empty, int64_t elem_tag, int64_t left);
@@ -3953,9 +3958,14 @@ int64_t unison_jit_hplim_value(void) { return (int64_t)*unison_jit_hplim_address
 // the argument order of the offsets. Each record is three words (frame
 // table index, frame size, pending arguments), written after the frame
 // records already there; a negative pending count means fp + fbase - ap,
-// the count of the outermost frame. Returns the status, so that the call
-// is the site's last instruction but the return.
-int64_t unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *d, int64_t status, int64_t fp, int64_t ap, ...) {
+// the count of the outermost frame. The site returns the status itself
+// (a constant there, which LLVM would lose if this handed it back).
+//
+// preserve_most: generated code calls this with that convention (every
+// register but x0-x8 and x16-x18 preserved by the callee), so that a site
+// keeps the caller's live values in scratch registers across it; see
+// Codegen.joinCall. GCC has no such attribute (Linux is skipped for now).
+EXIT_FRAME_CC void unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *d, int64_t fp, int64_t ap, ...) {
   int64_t flags = d[0], base = d[1], fbase = d[2], depth = d[3], nslots = d[4], nrecs = d[5];
   const int64_t *slots = d + 6, *recs = slots + nslots;
   int64_t *ustk = ctx->ustk;
@@ -3981,5 +3991,4 @@ int64_t unison_jit_exit_frame(UnisonJitCtx *ctx, const int64_t *d, int64_t statu
     fr[2] = recs[2] < 0 ? fp + fbase - ap : recs[2];
   }
   ctx->n_frames += nrecs;
-  return status;
 }

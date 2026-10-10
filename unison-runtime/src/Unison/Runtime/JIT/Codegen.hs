@@ -244,7 +244,7 @@ modulePrelude =
       "declare i64 @unison_jit_ref_cas(ptr, ptr, ptr, i64, ptr)",
       "declare { i64, i64 } @unison_jit_murmur(i64, ptr)",
       "declare ptr @unison_jit_alloc_words(ptr, i64)",
-      "declare i64 @unison_jit_exit_frame(ptr, ptr, i64, i64, i64, ...)",
+      "declare preserve_mostcc void @unison_jit_exit_frame(ptr, ptr, i64, i64, ...)",
       "declare void @unison_jit_write_mutvar(ptr, ptr, ptr)",
       "declare i64 @unison_jit_list_size(ptr)",
       "declare ptr @unison_jit_list_view(ptr, ptr, ptr, i64, i64)",
@@ -985,11 +985,16 @@ liveSlots d live = maybe [1 .. d] (filter (<= d) . IS.toAscList) live
 -- routine @unison_jit_exit_frame@ (jit_rt.c), the live slots as its
 -- variadic arguments and the rest (what to do with them: the offsets, the
 -- depth, the frame records) as a constant descriptor of the module, then
--- returns the status it gives back. The site is then one instruction
+-- returns the status. The site is then one instruction
 -- where the blocks of 'joinBlock' are six per slot; LLVM spills each
 -- argument to the outgoing area, the same stores the blocks made, and
 -- nothing else of the write-back goes through the optimizer or the
--- backend. The default since 2026-10-09 (@UNISON_JIT_EXITS@).
+-- backend. The routine has the @preserve_most@ convention: a callee's
+-- exit inlined into its caller is followed by the caller's unwind, two
+-- calls in a row with the caller's live values across the first, and
+-- under the C convention those would need callee-saved registers, which
+-- the function then saves at every entry (Collatz 4% slower). The
+-- default since 2026-10-09 (@UNISON_JIT_EXITS@).
 joinCall :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()
 joinCall fe d live isExit ownFrame status = do
   let slots = liveSlots d live
@@ -1025,9 +1030,11 @@ joinCall fe d live isExit ownFrame status = do
             gsDescText = gsDescText s |> (n <> " = private unnamed_addr constant [" <> n' <> " x i64] [" <> contents <> "]")
           }
       pure n
-  r <- fresh "st"
-  emit (r <> " = call i64 (ptr, ptr, i64, i64, i64, ...) @unison_jit_exit_frame(ptr %ctx, ptr " <> name <> ", i64 " <> status <> ", i64 %fp, i64 %ap" <> argList (D.fromList vals) <> ")")
-  retStatus fe r
+  -- the routine doesn't hand the status back: returning what was passed
+  -- keeps it a constant here, so that LLVM still knows the function's
+  -- range of statuses (a caller folds its checks of them with it)
+  emit ("call preserve_mostcc void (ptr, ptr, i64, i64, ...) @unison_jit_exit_frame(ptr %ctx, ptr " <> name <> ", i64 %fp, i64 %ap" <> argList (D.fromList vals) <> ")")
+  retStatus fe status
 
 -- | 'joinShared' with generated write-back blocks (@UNISON_JIT_EXITS=blocks@).
 joinBlock :: FnEnv -> Int -> Maybe IS.IntSet -> Bool -> Maybe (Pair Int Int) -> Text -> Gen ()

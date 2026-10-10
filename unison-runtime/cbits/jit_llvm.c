@@ -348,9 +348,22 @@ int unison_jit_init(void) {
   // superlinearly with block length. On an out-of-order core the hardware
   // reorders at run time anyway, so they are off; UNISON_JIT_SCHED=1 keeps
   // them, for comparison. Must come before any target machine is created.
-  if (!getenv("UNISON_JIT_SCHED")) {
-    const char *argv[] = {"unison", "-enable-misched=false", "-enable-post-misched=false"};
-    LLVMParseCommandLineOptions(3, argv, NULL);
+  // UNISON_JIT_INLINE_THRESHOLD=N sets the inliner's threshold (LLVM's
+  // default is 225), for measurement.
+  {
+    const char *argv[4] = {"unison"};
+    int argc = 1;
+    if (!getenv("UNISON_JIT_SCHED")) {
+      argv[argc++] = "-enable-misched=false";
+      argv[argc++] = "-enable-post-misched=false";
+    }
+    static char inl[64];
+    const char *t = getenv("UNISON_JIT_INLINE_THRESHOLD");
+    if (t && *t) {
+      snprintf(inl, sizeof inl, "-inline-threshold=%d", atoi(t));
+      argv[argc++] = inl;
+    }
+    if (argc > 1) LLVMParseCommandLineOptions(argc, argv, NULL);
   }
 
   // A target machine of our own, used only to run the optimization passes,
