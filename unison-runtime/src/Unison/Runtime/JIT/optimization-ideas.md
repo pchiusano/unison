@@ -104,8 +104,11 @@ than deleting it.
      from 1.06 to 1.04 s: the union is nearly every slot, and after `mem2reg` the shared
      block's phis cost the backend the same copies on the incoming edges as the stores
      they replaced. And `Cons.map` ran 25% slower in every run (13 → 16 µs), the hot loop
-     paying for the extra values kept live into the cold edges. The remaining write-back
-     cost is real: the live slots at these exits. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
+     paying for the extra values kept live into the cold edges. Done 2026-10-10 instead:
+     one call per site to a C routine with the live slots as variadic arguments and a
+     constant descriptor, [2026-10-09 exit call](benchmarks/2026-10-09-exit-call.md):
+     IR 3.8 → 2.9 MB, compile time 1.03–1.14 → 0.88–0.93 s (parse and optimize 0.39–0.49 → 0.27–0.30 s; the backend unchanged), lookups 10% and Collatz 4% faster, murmur 3% slower since its worker is no longer inlined (the inliner charges for the call at each site; `UNISON_JIT_INLINE_THRESHOLD=300` recovers it, left at the default for now). Not `llvm.experimental.deoptimize`: its runtime routine has to pop
+     the frame itself (assembly), see the file. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
      call sites, none on exits).
@@ -331,8 +334,14 @@ than deleting it.
   so a function with many exits and a large frame is mostly exit code; `Duration.toText`,
   one function, 37 exits, 398 KB of IR. Noted 2026-09-30.) Still open: the live sets of the
   rope and decode code are 15 of 25 slots, since deep `VArgN` reads keep early slots alive,
-  so the remaining write-back is real; what is left per slot is a load, an address and a
-  store on each stack.
+  so the remaining write-back is real. Since 2026-10-10 what is left per slot is one
+  argument of the call to `unison_jit_exit_frame` (a spill by the backend); the IR carries
+  nothing per slot but the operand. Still open, if ever worth it: `preserve_most` leaves the
+  spills in place; passing the values' *locations* instead (a stack map) would remove them,
+  but LLVM's only portable way of doing that is `llvm.experimental.deoptimize`, whose runtime
+  routine has to pop the frame and restore callee-saved registers itself, assembly per
+  platform. Not worth it: the backend's share of the compile time didn't move when the
+  stores became arguments, so the spills are not where its time goes.
 
 - **Fallback: tail-call the body function at the end of an inline binding.** If lazy generation
   turns out not to be enough, an inline binding could end with a `musttail` call to the body

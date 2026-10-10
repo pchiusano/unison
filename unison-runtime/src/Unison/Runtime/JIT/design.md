@@ -61,6 +61,8 @@ typedef STATUS (*UnisonNativeFn)(Ctx *ctx, int64_t ap, int64_t fp, int64_t sp);
 
 `STATUS` is an `int64_t`: `OK = 0` means the function returned normally; `EXIT_ERROR = -1` means it returned with an error, details stashed in `Ctx` (other negative values are reserved); positive values are an exit, a 1-based index into the global `Exit` table.
 
+Before it returns an exit, native code puts the frame back on the Unison stack, since the interpreter continues from there: the slots the resumed code will read (a liveness walk decides which), and the stack pointers into `Ctx`. The site does this with one call to a C routine in the runtime, passing the live values as arguments and a constant descriptor saying where they go; generating the stores themselves made the exit paths most of a function's code, and nearly none of them ever run. See "Write-back" in [internals](internals.md#the-generator).
+
 The exits table tells the interpreter what to do when native code returns an exit. It is an ordinary Haskell structure, since an `Exit` holds Haskell heap objects (`RSection`, `GInstr`). Native code never reads it: it only returns an index into it, as a constant baked into the generated code. (Each supercombinator has a fixed number of possible exits, known at compilation time, so it's no problem to give each supercombinator a range in the global exits table.)
 
 ```haskell

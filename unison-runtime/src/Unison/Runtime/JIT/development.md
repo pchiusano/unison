@@ -190,6 +190,15 @@ corruption, so the debug RTS checks the heap.
   empty runs none) and `UNISON_JIT_CODEGEN_LEVEL` (0 to 3) the level of the JIT's target
   machine, for measuring what the optimizer and the backend cost and buy
   ([2026-10-09 O0](benchmarks/2026-10-09-o0.md)); full O0 with workers crashes, see there.
+- `UNISON_JIT_EXITS=blocks` makes exits and unwinds write the frame back through generated
+  blocks instead of the one call per site to `unison_jit_exit_frame` that is the default
+  ([internals](internals.md#the-generator), "Write-back";
+  [2026-10-09 exit call](benchmarks/2026-10-09-exit-call.md)). For comparison, and the
+  fallback should the call form misbehave somewhere.
+- `UNISON_JIT_INLINE_THRESHOLD=N` sets LLVM's inliner threshold (default 225), for
+  measurement; `UNISON_JIT_SCHED=1` keeps LLVM's machine schedulers on (off by default,
+  [2026-10-09 compile time](benchmarks/2026-10-09-compile-time.md)). Both go through
+  `LLVMParseCommandLineOptions` at startup, in `jit_llvm.c`.
 - `UNISON_JIT_STATS=1` prints exit counts per site after each evaluation, with the compile
   totals first (modules, functions, auxiliary functions, re-entry functions generated on
   demand and never asked for, IR size, time, and the time split into generating the IR,
