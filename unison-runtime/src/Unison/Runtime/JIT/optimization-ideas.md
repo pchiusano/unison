@@ -96,12 +96,16 @@ than deleting it.
      this idea, but they are about 1% of the largest module's lines (338 of 26,650), so there
      is nothing there. The write-back blocks are still 75% of that module after the live
      sets: 193 blocks for 204 sites (the sites differ in depth), 15 live slots each, 6 lines
-     a slot. The lever left is one block per function for the exits, with the union of
-     their live sets and the stack pointer as a phi: writing a slot above an exit's depth is
-     harmless there (the stack above the frame is free, and within the room checked at
-     entry), so the union costs a few cold stores, and the count of blocks would drop by
-     an order of magnitude. Unwinds can't join it, since slots above an unwind's base hold
-     the callee's frame; they are a quarter of the sites. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
+     a slot. Tried the same day and reverted: one block per function for the exits, with
+     the depth as a phi and the union of the live sets written (every slot initialized at
+     entry, so that a slot above a shallow exit's depth holds a defined pointer; harmless
+     to write, since the stack above the frame is free). It took the largest module from
+     193 to 60 blocks and the suite's IR from 3.8 to 3.0 MB, but the compile time only
+     from 1.06 to 1.04 s: the union is nearly every slot, and after `mem2reg` the shared
+     block's phis cost the backend the same copies on the incoming edges as the stores
+     they replaced. And `Cons.map` ran 25% slower in every run (13 → 16 µs), the hot loop
+     paying for the extra values kept live into the cold edges. The remaining write-back
+     cost is real: the live slots at these exits. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
      call sites, none on exits).
