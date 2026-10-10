@@ -176,7 +176,7 @@ corruption, so the debug RTS checks the heap.
   `DIR`, with the MCode of each function as a comment above its IR and a line for each
   combinator that wasn't compiled and why; `-` prints to stderr. Two versions of each module
   are written: `unison_<n>.ll` is the text handed to LLVM and `unison_<n>.opt.ll` the module
-  after the `default<O2>` pipeline, which is what runs. For the arm64 assembly:
+  after the optimization passes, which is what runs. For the arm64 assembly:
   `/opt/homebrew/opt/llvm/bin/llc -O2 unison_<n>.opt.ll -o out.s`. For example:
   `stack exec unison -- --jit eager --jit-dump-ir - -C jit_codebase transcript.fork t.md 2> t.ll`.
   Two dumps from different binaries differ in the info-pointer addresses baked into the IR;
@@ -184,9 +184,11 @@ corruption, so the debug RTS checks the heap.
 - `UNISON_JIT_DUMP_MCODE=1` dumps the MCode as it is loaded. To look at a site named in the
   statistics (`CIx ... <group> <n>`): run with `UNISON_JIT=off` and this, kill it once
   loading is done, and search the dump for `<group>:<n>:`.
-- `UNISON_JIT_PASSES` is the LLVM pipeline a module is optimized with (`default<O2>`; empty
-  runs none) and `UNISON_JIT_CODEGEN_LEVEL` (0 to 3) the level of the JIT's target machine,
-  both for measuring what the optimizer and the backend cost and buy
+- `UNISON_JIT_PASSES` is the LLVM pipeline a module is optimized with (the default is
+  `defaultPasses` in `Config.hs`, the parts of `default<O2>` our code uses,
+  [2026-10-09 pipeline](benchmarks/2026-10-09-pipeline.md); `default<O2>` for comparison;
+  empty runs none) and `UNISON_JIT_CODEGEN_LEVEL` (0 to 3) the level of the JIT's target
+  machine, for measuring what the optimizer and the backend cost and buy
   ([2026-10-09 O0](benchmarks/2026-10-09-o0.md)); full O0 with workers crashes, see there.
 - `UNISON_JIT_STATS=1` prints exit counts per site after each evaluation, with the compile
   totals first (modules, functions, auxiliary functions, re-entry functions generated on

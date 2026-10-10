@@ -92,7 +92,16 @@ than deleting it.
      called once and ten times, stay interpreted, and a third of the suite's IR with them.
   3. Done the same day for exits and unwinds: shared write-back blocks, live slots only,
      [2026-10-09 write-back](benchmarks/2026-10-09-write-back.md), IR 6.9 → 3.8 MB and
-     1.75 → 1.26 s. Call sites still write their arguments to the stack. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
+     1.75 → 1.26 s. The argument stores of calls through the stack were the other half of
+     this idea, but they are about 1% of the largest module's lines (338 of 26,650), so there
+     is nothing there. The write-back blocks are still 75% of that module after the live
+     sets: 193 blocks for 204 sites (the sites differ in depth), 15 live slots each, 6 lines
+     a slot. The lever left is one block per function for the exits, with the union of
+     their live sets and the stack pointer as a phi: writing a slot above an exit's depth is
+     harmless there (the stack above the frame is free, and within the room checked at
+     entry), so the union costs a few cold stores, and the count of blocks would drop by
+     an order of magnitude. Unwinds can't join it, since slots above an unwind's base hold
+     the callee's frame; they are a quarter of the sites. Originally: less slot traffic per call site and exit: shared write-back blocks (below under Code
      size), saving only the slots live across the call, or a helper call for a frame spill
      (medium to large gain across all three phases, and smaller code; medium risk at hot
      call sites, none on exits).
@@ -120,10 +129,11 @@ than deleting it.
      Measured 2026-10-09, [O0](benchmarks/2026-10-09-o0.md): the passes and the backend are
      each about half of a module's time, and each is worth 5× or more at run time on the
      loop benchmarks, so neither can be dropped; `UNISON_JIT_PASSES` and
-     `UNISON_JIT_CODEGEN_LEVEL` exist for such measurements. The experiment still open is a
-     light pipeline with the inliner,
-     `function(mem2reg,sroa,early-cse,simplifycfg,instcombine),cgscc(inline),function(sroa,early-cse,gvn,instcombine,dse,simplifycfg)`,
-     a quarter of `O2`'s cost in the harness, against the suite's timings.
+     `UNISON_JIT_CODEGEN_LEVEL` exist for such measurements. Done the same day,
+     [pipeline](benchmarks/2026-10-09-pipeline.md): `Config.defaultPasses` is `O2`'s shape
+     without the passes our code can't use, the same code on the suite at 60% of the pass
+     time, a fifth of the compile time. Lighter pipelines on the way each lost a row, and
+     the pass responsible was found by diffing the optimized IR.
 
 ## Batching tweaks
 

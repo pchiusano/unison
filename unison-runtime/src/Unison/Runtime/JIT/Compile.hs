@@ -434,10 +434,10 @@ compileUnits st types modName lazy candidates = do
       -- a module that doesn't compile or link is a bug in the generator: say so even without the log
       Left e -> hPutStrLn stderr ("[jit] " ++ modName ++ ": " ++ e)
       Right optimized -> do
-        -- the module after O2: what actually runs
+        -- the module after the passes: what actually runs
         forM_ ((,) <$> dumpIR config <*> optimized) $ \(dir, txt) ->
           if dir == "-"
-            then jitDump ("; module " ++ modName ++ " after O2\n" ++ txt)
+            then jitDump ("; module " ++ modName ++ " after the passes\n" ++ txt)
             else writeFile (dir </> modName ++ ".opt.ll") txt
         -- The re-entry functions left for later become pending before any
         -- code that can exit to them is installed, so that no request for

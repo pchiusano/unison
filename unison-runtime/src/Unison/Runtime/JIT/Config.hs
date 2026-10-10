@@ -50,9 +50,10 @@ data Config = Config
     -- edges to join a batch (@UNISON_JIT_SIZE_UNIT@). See JIT.formBatch.
     sizeUnit :: Int,
     -- | the LLVM pass pipeline a module is optimized with
-    -- (@UNISON_JIT_PASSES@, @default<O2>@; the empty string runs none).
-    -- For measurement, with @UNISON_JIT_CODEGEN_LEVEL@, which jit_llvm.c
-    -- reads itself.
+    -- (@UNISON_JIT_PASSES@; the empty string runs none). The default is
+    -- 'defaultPasses', the parts of @default<O2>@ that matter for our
+    -- code; @default<O2>@ itself and @UNISON_JIT_CODEGEN_LEVEL@ (which
+    -- jit_llvm.c reads itself) are there for comparison.
     passes :: String,
     -- | with 'On': a compiled callee of a definition being compiled is
     -- compiled again as a private copy in the new module, so that calls to
@@ -158,7 +159,7 @@ config = unsafePerformIO $ do
         batch = max 1 (fromMaybe 32 (batchSize >>= readMaybe)),
         batchGate = max 1 (fromMaybe (max 1 (fromMaybe 100 (thresh >>= readMaybe)) `div` 4) (gate >>= readMaybe)),
         sizeUnit = max 1 (fromMaybe 500 (sizeU >>= readMaybe)),
-        passes = fromMaybe "default<O2>" pipeline,
+        passes = fromMaybe defaultPasses pipeline,
         copyBound = max 0 (fromMaybe 40 (copyB >>= readMaybe)),
         reentryWait = max 0 (fromMaybe 20 (reWait >>= readMaybe)),
         exitCost = max 0 (fromMaybe 7 (cost >>= readMaybe)),
@@ -207,3 +208,21 @@ outputHook = unsafePerformIO (newIORef (pure ()))
 -- | Called by the runtime after the program has written to a handle.
 noteOutput :: IO ()
 noteOutput = when (statsEach config) (join (readIORef outputHook))
+
+-- | The pass pipeline, in LLVM's syntax. @default<O2>@ with the parts our
+-- code can't use left out: it is the same shape (function simplification,
+-- then the inliner over the call graph with the simplification again
+-- inside it, then a clean-up), and on the suite the code it produces runs
+-- the same, at 60% of @O2@'s pass time (2026-10-09, see
+-- benchmarks/2026-10-09-pipeline.md for what the lighter pipelines on the
+-- way lost: without @ipsccp@ and @function-attrs@ the inlined callees'
+-- attributes, without @jump-threading@ and @loop-rotate@ the status
+-- switch after an inlined call and the loop shape, without @loop-unroll@
+-- the peeled first iteration of a loop that calls a closure).
+defaultPasses :: String
+defaultPasses =
+  "function(mem2reg,sroa,early-cse,simplifycfg,instcombine),ipsccp,"
+    ++ "cgscc(inline,function-attrs,function(sroa,early-cse<memssa>,simplifycfg,instcombine,"
+    ++ "jump-threading,correlated-propagation,loop-mssa(loop-rotate,licm,simple-loop-unswitch),"
+    ++ "simplifycfg,instcombine,gvn,sccp,dse,loop-unroll,instcombine,adce,simplifycfg)),"
+    ++ "function(simplifycfg),globaldce"

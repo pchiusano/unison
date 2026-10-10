@@ -74,4 +74,7 @@ Correctness: the test transcript is idempotent in every mode and stress combinat
 Takeaways. The suite's compile time is now about 1.26 s against 3.5 s this morning, with the
 same functions compiled and the hot code as fast or faster. The remaining cost is spread
 over modules of 150 to 500 ms; the next levers are the IR text itself (parsing was 17%) and
-the slot traffic at call sites.
+the write-back blocks themselves, which are still three quarters of the largest module
+(one block per exit site, since the sites differ in depth; see [optimization-ideas](../optimization-ideas.md#code-size)).
+The argument stores at call sites, the other half of the original idea, turned out to be 1%
+of the lines.

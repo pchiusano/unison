@@ -28,3 +28,4 @@ against.
 | [2026-10-09 compile time](2026-10-09-compile-time.md) | where a module's compile time goes; LLVM's machine schedulers off and a size term in the batch rule halve it |
 | [2026-10-09 write-back](2026-10-09-write-back.md) | exits share write-back blocks and write only live slots: IR 6.9 → 3.8 MB, compile time 1.75 → 1.26 s |
 | [2026-10-09 O0](2026-10-09-o0.md) | the optimization passes and the backend each cost about half the compile time, and each is worth 5× or more at run time |
+| [2026-10-09 pipeline](2026-10-09-pipeline.md) | a pass pipeline that produces the same code as `default<O2>` on the suite in 60% of the pass time; what each left-out pass turned out to do |
